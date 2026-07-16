@@ -8,6 +8,7 @@ private let chatCellHoldDebugLogs = false
 private let chatCellReactionDebugLogs = false
 private let chatCellMediaDebugLogs = false
 private let chatCellInlineVideoDebugLogs = false
+private let chatCellBubbleFlickerDebugLogs = false
 private let bubbleBoldRegex = try! NSRegularExpression(pattern: "\\*\\*(.+?)\\*\\*")
 private let chatMediaImageCache: NSCache<NSString, UIImage> = {
   let cache = NSCache<NSString, UIImage>()
@@ -17,6 +18,29 @@ private let chatMediaImageCache: NSCache<NSString, UIImage> = {
 }()
 private let chatMediaNaturalSizeCache = NSCache<NSString, NSValue>()
 private let chatMediaAudioAvailabilityCache = NSCache<NSString, NSNumber>()
+
+/// BubbleShape still carries the legacy 18pt geometry from the row payload. Rebase each
+/// corner onto the appearance radius so grouped corners retain their relative tightening.
+private func chatAppearanceBubbleShape(
+  _ shape: BubbleShape,
+  appearance: ChatListAppearance
+) -> BubbleShape {
+  let legacyPrimaryRadius: CGFloat = 18.0
+  let primaryRadius = max(0.0, appearance.messageCornerRadius)
+  func resolvedRadius(_ legacyRadius: CGFloat) -> CGFloat {
+    guard legacyRadius > 0.0 else { return 0.0 }
+    let proportion = min(1.0, legacyRadius / legacyPrimaryRadius)
+    return min(primaryRadius, max(min(2.0, primaryRadius), primaryRadius * proportion))
+  }
+  return BubbleShape(
+    isMe: shape.isMe,
+    showTail: shape.showTail,
+    borderTopLeftRadius: resolvedRadius(shape.borderTopLeftRadius),
+    borderTopRightRadius: resolvedRadius(shape.borderTopRightRadius),
+    borderBottomLeftRadius: resolvedRadius(shape.borderBottomLeftRadius),
+    borderBottomRightRadius: resolvedRadius(shape.borderBottomRightRadius)
+  )
+}
 
 /// Drop decoded chat media under memory pressure (called from AppDelegate).
 func chatMediaImageCachePurgeForMemoryWarning() {
@@ -155,6 +179,11 @@ private func chatMediaDecodedImage(
 }
 
 private func chatMediaImage(fromBase64 value: String?) -> UIImage? {
+  chatMediaImageFromBase64Public(value)
+}
+
+/// Shared base64 → UIImage decode (used by list cells + native image open).
+func chatMediaImageFromBase64Public(_ value: String?) -> UIImage? {
   guard let value else { return nil }
   let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
   guard !trimmed.isEmpty else { return nil }
@@ -453,6 +482,11 @@ final class BubbleBackgroundView: UIView {
   private var shape = BubbleShape(
     isMe: false, showTail: false, borderTopLeftRadius: 18, borderTopRightRadius: 18,
     borderBottomLeftRadius: 18, borderBottomRightRadius: 18)
+  /// Last chrome signature we logged — only emit when fill/grad/wallpaper path flips
+  /// (group list flicker investigation).
+  private var lastChromeFlickerSignature: String = ""
+  /// Optional identity stamped by ChatListCell so logs can name the row.
+  var debugRowId: String = ""
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -526,11 +560,16 @@ final class BubbleBackgroundView: UIView {
 
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    applyBubbleChrome(isMe: isMe, hidden: hidden)
+    applyBubbleChrome(isMe: isMe, hidden: hidden, reason: "configure")
     CATransaction.commit()
 
     if shapeOnlyChange {
       // Animate the shape path transition smoothly (matching Telegram's feel).
+      logBubbleFlicker(
+        event: "shapeAnimate",
+        detail:
+          "isMe=\(isMe ? "Y" : "N") tail=\(shape.showTail ? "Y" : "N") hidden=\(hidden ? "Y" : "N")"
+      )
       CATransaction.begin()
       CATransaction.setAnimationDuration(0.25)
       CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
@@ -546,65 +585,26 @@ final class BubbleBackgroundView: UIView {
   }
 
   func applyAgentStyle(appearance: ChatListAppearance, isMe: Bool, accent accentOverride: UIColor? = nil) {
-    // Agent bubble: subtle purple tint with border. While a turn is in flight the cell
-    // passes a per-task `accentOverride` so the bubble reads as a distinct "working"
-    // color; when the run finishes the override drops and it settles back to purple.
+    // Agent chrome = accent BORDER only. Fill/blur come from applyBubbleChrome so a
+    // configure → wallpaperOn → agentStyle sequence does not thrash three plate colors
+    // (#252936 solid → #181C26 wallpaper → #191E27 agent wash). Logs proved that cascade
+    // was the group-list flicker.
     let agentColor =
       accentOverride
       ?? appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
-    let hasWallpaperBackdrop =
-      wallpaperSnapshot != nil
-      && wallpaperContainerSize.width > 1.0
-      && wallpaperContainerSize.height > 1.0
-      && appearance.backgroundMode != "transparent"
+    let prevFill =
+      chatCellBubbleFlickerDebugLogs ? Self.debugColorHex(fillLayer.fillColor) : nil
     CATransaction.begin()
     CATransaction.setDisableActions(true)
 
-    // For agent messages (!isMe), we make the fill translucent them-color
-    if !isMe {
-      if hasWallpaperBackdrop {
-        gradientLayer.isHidden = true
-        gradientLayer.opacity = 0.0
-        let plateColor = appearance.agentWallpaperPlateColor(
-          isMe: false,
-          sampleRect: wallpaperSampleRect,
-          containerSize: wallpaperContainerSize,
-          accent: agentColor
-        )
-        fillLayer.fillColor = plateColor.withAlphaComponent(appearance.incomingPlateFillOpacity).cgColor
-        blurView.alpha = 0.0
-      } else {
-        gradientLayer.isHidden = false
-        gradientLayer.colors = [
-          agentColor.withAlphaComponent(0.18).cgColor,
-          agentColor.withAlphaComponent(0.06).cgColor,
-        ]
-        gradientLayer.opacity = 0.62
-        fillLayer.fillColor =
-          appearance.bubbleThemColor.withAlphaComponent(appearance.isDark ? 0.86 : 1.0).cgColor
-        blurView.alpha = 0.38
-      }
-    } else {
-      // For my agent mentions, just add the glowing border and a slight tint
-      if hasWallpaperBackdrop {
-        gradientLayer.isHidden = true
-        gradientLayer.opacity = 0.0
-        let plateColor = appearance.agentWallpaperPlateColor(
-          isMe: true,
-          sampleRect: wallpaperSampleRect,
-          containerSize: wallpaperContainerSize,
-          accent: agentColor
-        )
-        fillLayer.fillColor = plateColor.withAlphaComponent(appearance.outgoingPlateFillOpacity).cgColor
-      } else {
-        gradientLayer.isHidden = false
-        gradientLayer.colors = appearance.bubbleMeGradient.map { $0.cgColor }
-        gradientLayer.opacity = 0.82
-      }
+    if isMe {
+      // Agent mention on me side: shared me gradient must stay visible (clear fill).
+      fillLayer.fillColor = UIColor.clear.cgColor
+      applySharedMeGradient(opacity: 1.0)
       blurView.alpha = 0.0
     }
+    // them-side agent: leave fill/gradient/blur alone (stable them plate from chrome).
 
-    // Agent border
     if agentBorderLayer.superlayer == nil {
       layer.addSublayer(agentBorderLayer)
     }
@@ -613,14 +613,32 @@ final class BubbleBackgroundView: UIView {
     agentBorderLayer.lineWidth = 1.5
     applyAgentBorderPath()
     CATransaction.commit()
+    if let prevFill {
+      let nextFill = Self.debugColorHex(fillLayer.fillColor)
+      guard prevFill != nextFill else { return }
+      logBubbleFlicker(
+        event: "agentStyle",
+        detail:
+          "path=borderOnly isMe=\(isMe ? "Y" : "N") fill \(prevFill)->\(nextFill) "
+          + "accent=\(Self.debugColorHex(agentColor.cgColor)) override=\(accentOverride != nil ? "Y" : "N")"
+      )
+    }
   }
 
   func clearAgentStyle() {
+    let hadBorder =
+      chatCellBubbleFlickerDebugLogs
+      && (agentBorderLayer.path != nil
+        || (agentBorderLayer.strokeColor != nil
+          && agentBorderLayer.strokeColor != UIColor.clear.cgColor))
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     agentBorderLayer.path = nil
     agentBorderLayer.strokeColor = UIColor.clear.cgColor
     CATransaction.commit()
+    if hadBorder {
+      logBubbleFlicker(event: "clearAgentStyle", detail: "borderCleared")
+    }
   }
 
   func applyWallpaperBackdrop(
@@ -628,15 +646,76 @@ final class BubbleBackgroundView: UIView {
     containerSize: CGSize,
     sampleRect: CGRect
   ) {
+    let prevHas =
+      wallpaperSnapshot != nil
+      && wallpaperContainerSize.width > 1.0
+      && wallpaperContainerSize.height > 1.0
+    let nextHas =
+      snapshot != nil
+      && containerSize.width > 1.0
+      && containerSize.height > 1.0
+    // Presence unchanged → only sample geometry moved (scroll). Re-running chrome/agent
+    // plate math every frame was rewriting fill and looking like a color transition.
+    let sampleOnly = prevHas == nextHas
     wallpaperSnapshot = snapshot
     wallpaperContainerSize = containerSize
     wallpaperSampleRect = sampleRect
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    applyBubbleChrome(isMe: shape.isMe, hidden: isHidden)
-    applyWallpaperBackdropLayer()
+    if sampleOnly {
+      // Me gradient endpoints track list-space sample rect; them plate hue is fixed.
+      if shape.isMe, !gradientLayer.isHidden {
+        applySharedMeGradient(opacity: gradientLayer.opacity)
+      }
+      applyWallpaperBackdropLayer()
+    } else {
+      applyBubbleChrome(
+        isMe: shape.isMe,
+        hidden: isHidden,
+        reason: nextHas ? "wallpaperOn" : "wallpaperOff"
+      )
+      applyWallpaperBackdropLayer()
+    }
     CATransaction.commit()
-    setNeedsLayout()
+    if !sampleOnly {
+      setNeedsLayout()
+    }
+  }
+
+  private static func debugColorHex(_ cgColor: CGColor?) -> String {
+    guard let cgColor, let color = UIColor(cgColor: cgColor).cgColor.components else {
+      return "nil"
+    }
+    let r: CGFloat
+    let g: CGFloat
+    let b: CGFloat
+    let a: CGFloat
+    if color.count >= 4 {
+      r = color[0]
+      g = color[1]
+      b = color[2]
+      a = color[3]
+    } else if color.count >= 2 {
+      r = color[0]
+      g = color[0]
+      b = color[0]
+      a = color[1]
+    } else {
+      return "unk"
+    }
+    return String(
+      format: "#%02X%02X%02X@%.2f",
+      Int((r * 255.0).rounded()),
+      Int((g * 255.0).rounded()),
+      Int((b * 255.0).rounded()),
+      a
+    )
+  }
+
+  private func logBubbleFlicker(event: String, detail: String) {
+    guard chatCellBubbleFlickerDebugLogs else { return }
+    let id = debugRowId.isEmpty ? "—" : debugRowId
+    NSLog("[BubbleFlicker] %@ id=%@ %@", event, id, detail)
   }
 
   /// nil = no integrated tail; otherwise the side flag passed to `bubblePath`.
@@ -698,6 +777,10 @@ final class BubbleBackgroundView: UIView {
     gradientLayer.mask = nil
     fillLayer.frame = bounds
     fillLayer.path = path.cgPath
+    // Endpoints depend on gradient layer bounds — refresh shared me mapping after frame set.
+    if !gradientLayer.isHidden, shape.isMe {
+      applySharedMeGradient(opacity: gradientLayer.opacity)
+    }
   }
 
   override func layoutSubviews() {
@@ -732,12 +815,22 @@ final class BubbleBackgroundView: UIView {
     )
   }
 
-  private func applyBubbleChrome(isMe: Bool, hidden: Bool) {
+  private func applyBubbleChrome(isMe: Bool, hidden: Bool, reason: String = "chrome") {
     let hasWallpaperBackdrop =
       wallpaperSnapshot != nil
       && wallpaperContainerSize.width > 1.0
       && wallpaperContainerSize.height > 1.0
       && appearance.backgroundMode != "transparent"
+
+    let previousChrome: (
+      fill: String, gradientHidden: Bool, gradientOpacity: Float, blurAlpha: CGFloat
+    )? =
+      chatCellBubbleFlickerDebugLogs
+      ? (
+        Self.debugColorHex(fillLayer.fillColor), gradientLayer.isHidden,
+        gradientLayer.opacity, blurView.alpha
+      )
+      : nil
 
     isHidden = hidden
     wallpaperLayer.isHidden = hidden || !hasWallpaperBackdrop
@@ -748,33 +841,102 @@ final class BubbleBackgroundView: UIView {
     )
     blurView.isHidden = hidden
     blurView.effect = UIBlurEffect(style: isMe ? .systemThinMaterialDark : .systemMaterialDark)
+    // Them plate is near-opaque and theme-stable — same fill with or without wallpaper
+    // snapshot so configure→bindWallpaper never flashes #252936 → #181C26.
+    // Me still uses a light material wash only when there is no wallpaper sample.
     let materialAlpha: CGFloat
     if hasWallpaperBackdrop {
       materialAlpha = 0.0
     } else if isMe {
       materialAlpha = 0.34
     } else {
-      materialAlpha = appearance.isDark ? 0.44 : 0.0
+      materialAlpha = 0.0
     }
     blurView.alpha = materialAlpha
-    if hasWallpaperBackdrop {
+    let platePath: String
+    // Them: one fixed plate color always (wallpaperPlateColor ignores sample hue).
+    // Me: clear fill under shared list-space theme gradient.
+    if isMe {
+      fillLayer.fillColor = UIColor.clear.cgColor
+      applySharedMeGradient(opacity: 1.0)
+      platePath = hasWallpaperBackdrop ? "wallpaper+meGradient" : "noWall+meGradient"
+    } else {
+      let plateSample =
+        wallpaperSampleRect.width > 1 && wallpaperSampleRect.height > 1
+        ? wallpaperSampleRect
+        : CGRect(x: 0, y: 0, width: 1, height: 1)
+      let plateContainer =
+        wallpaperContainerSize.width > 1 && wallpaperContainerSize.height > 1
+        ? wallpaperContainerSize
+        : CGSize(width: 1, height: 1)
+      let plateColor = appearance.wallpaperPlateColor(
+        isMe: false,
+        sampleRect: plateSample,
+        containerSize: plateContainer
+      )
+      fillLayer.fillColor = plateColor.withAlphaComponent(appearance.incomingPlateFillOpacity)
+        .cgColor
       gradientLayer.isHidden = true
       gradientLayer.opacity = 0.0
-      let plateColor = appearance.wallpaperPlateColor(
-        isMe: isMe,
-        sampleRect: wallpaperSampleRect,
-        containerSize: wallpaperContainerSize
+      gradientLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
+      gradientLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
+      platePath = hasWallpaperBackdrop ? "wallpaper+themPlate" : "noWall+themPlate"
+    }
+
+    guard let previousChrome else { return }
+    let nextFill = Self.debugColorHex(fillLayer.fillColor)
+    // Signature ignores sample rect so scroll-driven rebinds only log real chrome flips.
+    let signature =
+      "\(platePath)|me=\(isMe ? "Y" : "N")|hid=\(hidden ? "Y" : "N")|"
+      + "wall=\(hasWallpaperBackdrop ? "Y" : "N")|fill=\(nextFill)|"
+      + "gradH=\(gradientLayer.isHidden ? "Y" : "N")@\(String(format: "%.2f", gradientLayer.opacity))|"
+      + "blur=\(String(format: "%.2f", blurView.alpha))|"
+      + "dark=\(appearance.isDark ? "Y" : "N")|mode=\(appearance.backgroundMode)"
+    let colorChanged =
+      previousChrome.fill != nextFill
+      || previousChrome.gradientHidden != gradientLayer.isHidden
+      || abs(previousChrome.gradientOpacity - gradientLayer.opacity) > 0.01
+      || abs(previousChrome.blurAlpha - blurView.alpha) > 0.01
+    if signature != lastChromeFlickerSignature || colorChanged {
+      lastChromeFlickerSignature = signature
+      logBubbleFlicker(
+        event: "chrome",
+        detail:
+          "reason=\(reason) \(signature) prevFill=\(previousChrome.fill) sample=(\(Int(wallpaperSampleRect.minX)),\(Int(wallpaperSampleRect.minY)),\(Int(wallpaperSampleRect.width))x\(Int(wallpaperSampleRect.height)))"
       )
-      let plateAlpha = isMe ? appearance.outgoingPlateFillOpacity : appearance.incomingPlateFillOpacity
-      fillLayer.fillColor = plateColor.withAlphaComponent(plateAlpha).cgColor
+    }
+  }
+
+  /// Positions `gradientLayer` as a slice of one chat-list-wide me gradient.
+  /// When sample/container geometry is missing, falls back to a soft local diagonal
+  /// (still one theme palette — not wallpaper-sampled per cell).
+  private func applySharedMeGradient(opacity: Float) {
+    let colors = appearance.bubbleMeGradient.map(\.cgColor)
+    guard !colors.isEmpty else {
+      gradientLayer.isHidden = true
+      gradientLayer.opacity = 0.0
+      return
+    }
+    gradientLayer.isHidden = false
+    gradientLayer.colors = colors
+    gradientLayer.locations = nil
+    gradientLayer.opacity = opacity
+    let layerBounds =
+      gradientLayer.bounds.width > 1 && gradientLayer.bounds.height > 1
+      ? gradientLayer.bounds
+      : (bounds.width > 1 ? bounds : CGRect(x: 0, y: 0, width: 1, height: 1))
+    if let points = appearance.sharedBubbleGradientUnitPoints(
+      sampleRectInContainer: wallpaperSampleRect,
+      containerSize: wallpaperContainerSize,
+      layerBounds: layerBounds
+    ) {
+      gradientLayer.startPoint = points.start
+      gradientLayer.endPoint = points.end
     } else {
-      gradientLayer.isHidden = !isMe
-      gradientLayer.colors = appearance.bubbleMeGradient.map(\.cgColor)
-      gradientLayer.opacity = Float(isMe ? 0.88 : 0.0)
-      fillLayer.fillColor =
-        isMe
-        ? UIColor.clear.cgColor
-        : appearance.bubbleThemColor.withAlphaComponent(appearance.isDark ? 0.86 : 1.0).cgColor
+      // Local fallback: diagonal but slightly compressed so tall cells don't
+      // dump the entire palette top→bottom as harshly as 0,0→1,1 full stretch.
+      gradientLayer.startPoint = CGPoint(x: 0.05, y: 0.0)
+      gradientLayer.endPoint = CGPoint(x: 0.95, y: 1.15)
     }
   }
 
@@ -1114,6 +1276,161 @@ private func pixelAlignedRect(_ rect: CGRect) -> CGRect {
   return CGRect(x: minX, y: minY, width: max(0.0, maxX - minX), height: max(0.0, maxY - minY))
 }
 
+// MARK: - Outer tall-bubble glass toggle (hosted by ChatListView, not the cell)
+
+/// Real template-vector assets for the tall-bubble glass chip. The asset catalog keeps
+/// the SVG path data, while `.alwaysTemplate` lets each bubble side/theme supply tint.
+enum ChatTallToggleGlyph {
+  /// `collapsed == true` → outward-corner expand glyph.
+  /// `collapsed == false` → inward-corner collapse glyph supplied by design.
+  static func image(collapsed: Bool) -> UIImage? {
+    let assetName = collapsed ? "TallBubbleExpand" : "TallBubbleCollapse"
+    if let asset = UIImage(named: assetName) {
+      return asset.withRenderingMode(.alwaysTemplate)
+    }
+    // Defensive fallback for development builds whose asset catalog is stale.
+    let symbolName = collapsed ? "chevron.down" : "chevron.up"
+    return UIImage(
+      systemName: symbolName,
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 13.0, weight: .semibold)
+    )?.withRenderingMode(.alwaysTemplate)
+  }
+}
+
+/// Floating glass expand/collapse control — sits OUTSIDE the list cell, over the
+/// wallpaper, so Liquid Glass can sample the chat backdrop cleanly.
+final class ChatTallBubbleGlassToggleView: UIView {
+  var onTap: (() -> Void)?
+  private(set) var messageId: String = ""
+  private(set) var isCollapsed: Bool = true
+
+  private let glassView: UIVisualEffectView
+  private let iconView = UIImageView()
+  private let button = UIButton(type: .custom)
+
+  override init(frame: CGRect) {
+    if #available(iOS 26.0, *) {
+      let effect = UIGlassEffect(style: .regular)
+      effect.isInteractive = true
+      glassView = UIVisualEffectView(effect: effect)
+    } else {
+      glassView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
+    }
+    super.init(frame: frame)
+
+    backgroundColor = .clear
+    isOpaque = false
+    clipsToBounds = false
+
+    glassView.translatesAutoresizingMaskIntoConstraints = false
+    glassView.clipsToBounds = true
+    glassView.layer.cornerCurve = .continuous
+    if #available(iOS 26.0, *) {
+      // UIGlassEffect owns the shape via the button chrome; still clip for fallback.
+    }
+    addSubview(glassView)
+
+    iconView.translatesAutoresizingMaskIntoConstraints = false
+    iconView.contentMode = .scaleAspectFit
+    iconView.isUserInteractionEnabled = false
+    glassView.contentView.addSubview(iconView)
+
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.backgroundColor = .clear
+    button.accessibilityTraits = .button
+    button.addTarget(self, action: #selector(handleTap), for: .touchUpInside)
+    addSubview(button)
+
+    let glassSize = tallBubbleGlassToggleSize
+    NSLayoutConstraint.activate([
+      glassView.centerXAnchor.constraint(equalTo: centerXAnchor),
+      glassView.centerYAnchor.constraint(equalTo: centerYAnchor),
+      glassView.widthAnchor.constraint(equalToConstant: glassSize),
+      glassView.heightAnchor.constraint(equalToConstant: glassSize),
+      iconView.centerXAnchor.constraint(equalTo: glassView.contentView.centerXAnchor),
+      iconView.centerYAnchor.constraint(equalTo: glassView.contentView.centerYAnchor),
+      iconView.widthAnchor.constraint(equalToConstant: glassSize * 0.52),
+      iconView.heightAnchor.constraint(equalToConstant: glassSize * 0.52),
+      button.topAnchor.constraint(equalTo: topAnchor),
+      button.leadingAnchor.constraint(equalTo: leadingAnchor),
+      button.trailingAnchor.constraint(equalTo: trailingAnchor),
+      button.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+    glassView.layer.cornerRadius = glassSize * 0.5
+    applyIcon(collapsed: true, animated: false)
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    glassView.layer.cornerRadius = min(glassView.bounds.width, glassView.bounds.height) * 0.5
+  }
+
+  func configure(
+    messageId: String,
+    collapsed: Bool,
+    iconColor: UIColor,
+    animated: Bool
+  ) {
+    self.messageId = messageId
+    let stateChanged = self.isCollapsed != collapsed
+    self.isCollapsed = collapsed
+    iconView.tintColor = iconColor
+    button.accessibilityLabel = collapsed ? "Show more" : "Show less"
+    applyIcon(collapsed: collapsed, animated: animated && stateChanged)
+  }
+
+  private func applyIcon(collapsed: Bool, animated: Bool) {
+    let image = ChatTallToggleGlyph.image(collapsed: collapsed)
+    if animated {
+      // One image view avoids the old parent-alpha bug (the incoming icon was a child of
+      // the outgoing icon, so fading the parent hid both). The distinct SVGs dissolve.
+      UIView.transition(
+        with: iconView,
+        duration: 0.20,
+        options: [.transitionCrossDissolve, .allowUserInteraction, .beginFromCurrentState],
+        animations: { self.iconView.image = image },
+        completion: nil
+      )
+    } else {
+      iconView.layer.removeAllAnimations()
+      iconView.image = image
+      iconView.alpha = 1.0
+      iconView.transform = .identity
+    }
+  }
+
+  @objc private func handleTap() {
+    // Keep feedback INSIDE the glass wrapper: only the vector glyph compresses and
+    // rebounds. Scaling the glass plate made the icon appear to animate outside it.
+    UIView.animate(
+      withDuration: 0.09,
+      delay: 0,
+      options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseIn],
+      animations: { self.iconView.transform = CGAffineTransform(scaleX: 0.76, y: 0.76) },
+      completion: { _ in
+        UIView.animate(
+          withDuration: 0.20,
+          delay: 0,
+          usingSpringWithDamping: 0.68,
+          initialSpringVelocity: 0.55,
+          options: [.allowUserInteraction, .beginFromCurrentState],
+          animations: { self.iconView.transform = .identity },
+          completion: nil)
+      })
+    onTap?()
+  }
+}
+
+/// Snapshot a cell exposes so ChatListView can place the outer glass toggle.
+struct ChatTallToggleAnchor {
+  let messageId: String
+  let bubbleFrameInCell: CGRect
+  let collapsed: Bool
+  let isMe: Bool
+}
+
 private func bubbleStatusCheckImage(double: Bool, color: UIColor) -> UIImage? {
   let size = CGSize(width: bubbleStatusSlotWidth, height: bubbleStatusSlotHeight)
   let renderer = UIGraphicsImageRenderer(size: size)
@@ -1181,11 +1498,14 @@ struct ChatMessageBubbleLayoutMetrics {
   // the full agent width. Defaulted so every existing call site is unaffected.
   var agentTurnCentered: Bool = false
   // Tall-content collapse — one shared rule for user text, agent text and settled
-  // agent-turn bubbles. `tallToggleVisible` means the bubble reserves the
-  // "Show more"/"Show less" bar; `tallCollapsed` means the content is currently capped
-  // to `tallBubbleCollapsedContentHeight`. Defaulted so existing call sites compile.
+  // agent-turn bubbles. `tallToggleVisible` means ChatListView should host an outer
+  // glass expand/collapse chip for this row; `tallCollapsed` means the content is
+  // currently capped to `tallBubbleCollapsedContentHeight`.
+  // `tallOuterToggleReserve` is leftover from the old bottom-chip layout (always 0 —
+  // the chip now sits on the bubble's top corner via ChatListView overlay).
   var tallToggleVisible: Bool = false
   var tallCollapsed: Bool = false
+  var tallOuterToggleReserve: CGFloat = 0.0
 }
 
 private struct ChatBubbleMetaWidths {
@@ -1232,18 +1552,23 @@ private func colorLuminance(_ color: UIColor) -> CGFloat {
   return 0.5
 }
 
+private func contrastingMediaForeground(for color: UIColor) -> UIColor {
+  colorLuminance(color) > 0.68
+    ? UIColor(white: 0.08, alpha: 0.96)
+    : UIColor(white: 1.0, alpha: 0.98)
+}
+
 private func resolvedIncomingVoiceButtonStyle(for appearance: ChatListAppearance)
   -> (fill: UIColor, accent: UIColor)
 {
+  let accent = appearance.accent.withAlphaComponent(0.98)
   if appearance.isDark {
-    let accent = appearance.bubbleThemColor.withAlphaComponent(0.98)
     let fill: UIColor =
       colorLuminance(appearance.bubbleThemColor) > 0.72
       ? UIColor(white: 0.08, alpha: 0.16)
       : UIColor(white: 1.0, alpha: 0.90)
     return (fill, accent)
   }
-  let accent = (appearance.bubbleMeGradient.first ?? UIColor.systemBlue).withAlphaComponent(0.98)
   let fill: UIColor =
     colorLuminance(appearance.bubbleThemColor) > 0.72
     ? accent.withAlphaComponent(0.14)
@@ -1783,8 +2108,20 @@ func chatMediaGridImageCount(_ row: ChatListRow) -> Int {
   guard row.kind == .message, row.visualKind == .media, row.messageType != "file" else {
     return 0
   }
-  let count = row.agentBridgeAttachmentsEnc.count
+  let count = max(row.agentBridgeAttachmentsEnc.count, row.attachmentThumbnailsB64.count)
+  // Multi-image grid only; a single sealed blob uses the hero mediaImageView path.
   return count > 1 ? count : 0
+}
+
+/// True when the row's only media source is sealed bridge image blob(s) or durable
+/// thumbs (no remote/local url) — common after agent-group send before/without CDN url.
+func chatRowHasBridgeImageBlobsOnly(_ row: ChatListRow) -> Bool {
+  let hasBlobs = !row.agentBridgeAttachmentsEnc.isEmpty || !row.attachmentThumbnailsB64.isEmpty
+  guard hasBlobs else { return false }
+  let media =
+    (row.localMediaUrl ?? row.mediaUrl)?
+    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  return media.isEmpty
 }
 
 private func chatMediaGridColumns(_ tiles: Int) -> Int {
@@ -1879,6 +2216,17 @@ func chatAgentTokenCountText(_ tokens: Int) -> String {
   return "\(tokens) tokens"
 }
 
+/// Wire MCP tool id stays `ask_fable`; user-facing copy is "ask advisor".
+func chatAgentPrettyMcpLabel(_ text: String) -> String {
+  guard !text.isEmpty else { return text }
+  var out = text
+  if let regex = try? NSRegularExpression(pattern: #"\bask\s+fable\b"#, options: .caseInsensitive) {
+    let range = NSRange(out.startIndex..<out.endIndex, in: out)
+    out = regex.stringByReplacingMatches(in: out, options: [], range: range, withTemplate: "ask advisor")
+  }
+  return out
+}
+
 func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String {
   guard let kind = node.kind, !kind.isEmpty else { return node.label }
   // Thinking rows read like the desktop CLI: "Thinking · N tokens" while the model is
@@ -1901,7 +2249,8 @@ func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String 
     if isRunning { return "Compacting conversation…" }
     return node.label.isEmpty ? "Compacted conversation" : node.label
   }
-  // MCP tools (Ask Fable, ask_user, …): "MCP · ask fable · 12s"
+  // MCP tools (Ask Advisor, ask_user, …): "MCP · ask advisor · 12s"
+  // Wire id stays ask_fable; rewrite residual "ask fable" labels for display.
   if kind == "mcp" {
     var base = node.label
     if base.isEmpty {
@@ -1911,6 +2260,7 @@ func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String 
         base = "MCP tool"
       }
     }
+    base = chatAgentPrettyMcpLabel(base)
     let isRunning = ["running", "streaming", "in_progress", "active"].contains(node.status.lowercased())
     if !isRunning, let ms = node.durationMs, ms >= 500 {
       return "\(base) · \(chatAgentThinkingDurationText(ms))"
@@ -2738,7 +3088,19 @@ private final class BubbleLinkPreviewView: UIView {
 /// nothing renderable in the feed yet (no tool/task steps, no narration text nodes, no
 /// answer body). This is the only state that should hug + center; the moment a step or
 /// prose arrives the bubble expands to the full agent width like every other turn.
+/// Cheap row-level equivalent of `chatMessage(from:).isStreaming`'s live gate: the full
+/// mapping reports a live turn only when `row.isStreamingText || <a running node>`
+/// (see `isLiveTurn` in `VibeAgentKitMap.chatMessage(from:)`). Hot per-row predicates
+/// use it to skip building the whole AgentKit message — which E2E-decrypts action
+/// details — for the settled rows that dominate a transcript. Keep in sync with
+/// `isLiveTurn`; a false positive here only costs the full (correct) check.
+private func agentTurnRowCouldBeLive(_ row: ChatListRow) -> Bool {
+  row.isStreamingText
+    || row.agentProgressNodes.contains { $0.status.lowercased() == "running" }
+}
+
 func agentTurnBubbleIsCompactThinking(_ row: ChatListRow) -> Bool {
+  guard agentTurnRowCouldBeLive(row) else { return false }
   let message = VibeAgentKitMap.chatMessage(from: row)
   guard message.isStreaming, !message.hasFinalResponseText else { return false }
   let hasRenderableProgress = message.progressItems.contains { item in
@@ -2778,6 +3140,9 @@ func isPlaceholderThinkingProgressItem(_ item: VibeAgentKitProgressItem) -> Bool
 /// would duplicate it. Must be passed identically to `measuredHeight` and
 /// `configure(row:)` or the measured bubble height won't match what renders.
 func agentTurnBubbleShowsWorkedSummary(_ row: ChatListRow) -> Bool {
+  // Settled row (see agentTurnRowCouldBeLive): isStreaming is false in the full
+  // mapping, so this is exactly `!(false && …)` without the per-row decrypt cost.
+  guard agentTurnRowCouldBeLive(row) else { return true }
   let message = VibeAgentKitMap.chatMessage(from: row)
   return !(message.isStreaming && !message.hasFinalResponseText)
 }
@@ -2908,16 +3273,17 @@ func measureMessageBubbleLayout(
     let bubbleWidth = max(bubbleMinWidth, contentWidth + (agentTurnHorizontalPadding * 2.0))
     // Same tall-content collapse as plain text bubbles, but only once the turn SETTLES —
     // a live feed keeps growing and pinning it to the cap would fight the stream (and the
-    // list's bottom pin). Collapsed content is clipped by the cell (clipsToBounds).
+    // list's bottom pin). Content stays full; plate height caps and soft-fades.
     let tallToggleVisible =
       previewHeight > tallBubbleCollapseTriggerHeight && agentTurnBubbleShowsWorkedSummary(row)
     let tallCollapsed = tallToggleVisible && !agentTurnState.tallExpanded
-    let contentHeight = tallCollapsed ? tallBubbleCollapsedContentHeight : previewHeight
-    let tallToggleReserve: CGFloat =
-      tallToggleVisible ? (tallBubbleToggleSpacing + tallBubbleToggleHeight) : 0.0
+    let contentHeight = previewHeight
+    let bubbleContentHeight =
+      tallCollapsed ? min(previewHeight, tallBubbleCollapsedContentHeight) : previewHeight
+    // Glass expand/collapse chip lives OUTSIDE the plate (list overlay).
     let bubbleHeight = max(
       44.0,
-      contentHeight + tallToggleReserve
+      bubbleContentHeight
         + agentTurnVerticalPadding + agentTurnVerticalPadding + reactionHeightOffset
     )
     // DIAGNOSTIC (live-turn empty-bubble): compare what the sizing pass measured against
@@ -2954,6 +3320,7 @@ func measureMessageBubbleLayout(
     )
     metrics.tallToggleVisible = tallToggleVisible
     metrics.tallCollapsed = tallCollapsed
+    metrics.tallOuterToggleReserve = 0.0
     return metrics
   }
 
@@ -3190,30 +3557,31 @@ func measureMessageBubbleLayout(
     : max(1.0, maxContentWidth - meta.total - bubbleMetaInlineSpacing)
   var (textWidth, fullTextHeight) = measureText(textMaxWidth)
   // One shared tall-content rule for user AND agent text bubbles: past the trigger the
-  // bubble collapses to the cap and gains a "Show more"/"Show less" bar (see the
+  // bubble collapses to the cap and gains a leading meta-row double-chevron (see the
   // tallBubble* constants). Typing placeholders and inline-attachment rows are exempt
-  // (the attachment body-height arm below doesn't reserve the bar).
+  // (the attachment body-height arm below doesn't reserve the control).
   let tallToggleVisible =
     fullTextHeight > tallBubbleCollapseTriggerHeight
     && row.messageType != "typing"
     && !showsInlineAttachment
   if tallToggleVisible && !usesBottomMetaLayout {
-    // A tall bubble puts its meta UNDER the toggle bar (bottom-meta layout) so the bar
-    // never fights the inline timestamp — re-measure at the full width that layout
-    // grants the text (the collapse decision can't flip: the trigger dwarfs the few
-    // points of width difference).
+    // A tall bubble puts meta under the body (bottom-meta layout) so the chevron can
+    // share the meta row without fighting an inline timestamp — re-measure at the full
+    // width that layout grants the text (the collapse decision can't flip: the trigger
+    // dwarfs the few points of width difference).
     usesBottomMetaLayout = true
     (textWidth, fullTextHeight) = measureText(maxContentWidth)
   }
   let tallCollapsed = tallToggleVisible && !agentTurnState.tallExpanded
-  // Cap to a whole line count so the truncated label (numberOfLines) fills the capped
-  // frame exactly instead of cutting a line mid-glyph.
-  let tallCollapsedLineCount = max(1.0, (tallBubbleCollapsedContentHeight / font.lineHeight).rounded(.down))
-  let textHeight = tallCollapsed
-    ? min(fullTextHeight, ceil(tallCollapsedLineCount * font.lineHeight))
-    : fullTextHeight
-  let tallToggleReserve: CGFloat =
-    tallToggleVisible ? (tallBubbleToggleSpacing + tallBubbleToggleHeight) : 0.0
+  // Content always lays out at full height so expand is pure Y reveal (no reflow).
+  // Bubble height alone uses the collapsed cap; soft fade mask shows "there's more".
+  let tallCollapsedLineCount = max(
+    1.0, (tallBubbleCollapsedContentHeight / font.lineHeight).rounded(.down))
+  let collapsedCapHeight = ceil(tallCollapsedLineCount * font.lineHeight)
+  let textHeight = fullTextHeight
+  let bubbleTextHeight =
+    tallCollapsed ? min(fullTextHeight, collapsedCapHeight) : fullTextHeight
+  let tallToggleReserve: CGFloat = 0.0
   let attachmentBodyHeight: CGFloat = showsInlineAttachment ? inlineAttachmentHeight : 0.0
   let desiredContentWidth: CGFloat
   let replyPreviewWidth: CGFloat
@@ -3264,15 +3632,16 @@ func measureMessageBubbleLayout(
     showsInlineAttachment || usesBottomMetaLayout
     ? max(1.0, contentWidth - appliedRTLTailSideReserve)
     : max(1.0, contentWidth - meta.total - bubbleMetaInlineSpacing)
+  // Plate height uses the (possibly capped) body; metrics.textHeight stays full.
   let bodyHeight =
     showsInlineAttachment
-    ? replyPreviewBlockHeight + max(textHeight, 0.0) + inlineAttachmentSpacing
+    ? replyPreviewBlockHeight + max(bubbleTextHeight, 0.0) + inlineAttachmentSpacing
       + attachmentBodyHeight + bubbleMetaTopSpacing + bubbleMetaHeight
     : usesBottomMetaLayout
-    ? replyPreviewBlockHeight + max(textHeight, 0.0) + tallToggleReserve
+    ? replyPreviewBlockHeight + max(bubbleTextHeight, 0.0) + tallToggleReserve
       + (previewHeight > 0.0 ? (bubbleLinkPreviewSpacing + previewHeight) : 0.0)
       + bubbleMetaTopSpacing + bubbleMetaHeight
-    : replyPreviewBlockHeight + max(textHeight, bubbleMetaHeight)
+    : replyPreviewBlockHeight + max(bubbleTextHeight, bubbleMetaHeight)
   let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
   let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
   let bubbleWidth = max(bubbleMinWidth, contentWidth + (bubbleHorizontalPadding * 2.0) - 4.0)
@@ -3299,6 +3668,7 @@ func measureMessageBubbleLayout(
   )
   metrics.tallToggleVisible = tallToggleVisible
   metrics.tallCollapsed = tallCollapsed
+  metrics.tallOuterToggleReserve = 0.0
   return metrics
 }
 
@@ -3355,14 +3725,19 @@ private func bubbleRoundedPath(
   return path
 }
 
+/// Media upload/download ring — Settings avatar spinner style (continuous rotating arc),
+/// with stroke fill tracking real byte progress until send/download finishes.
 final class BubbleUploadProgressView: UIView {
   private let fillLayer = CAShapeLayer()
   private let trackLayer = CAShapeLayer()
+  /// Hosts the progress arc so rotation is independent of stroke-end fills / path rebuilds.
+  private let spinHostLayer = CALayer()
   private let progressLayer = CAShapeLayer()
   private let iconView = UIImageView()
   private let uploadProgressAnimationKey = "media.upload.progress"
   private let uploadSpinAnimationKey = "media.upload.spin"
-  private let minimumUploadProgress: CGFloat = 0.027
+  /// Progress below this is treated as "connecting" (indeterminate arc), not a stuck fill.
+  private let realProgressThreshold: CGFloat = 0.05
   private var isUploading = false
   private var needsDownload = false
   private var isDownloading = false
@@ -3379,19 +3754,20 @@ final class BubbleUploadProgressView: UIView {
     fillLayer.fillColor = UIColor(white: 0.0, alpha: 0.58).cgColor
 
     trackLayer.fillColor = UIColor.clear.cgColor
-    trackLayer.strokeColor = UIColor(white: 1.0, alpha: 0.28).cgColor
-    trackLayer.lineWidth = 3.0
+    trackLayer.strokeColor = UIColor(white: 1.0, alpha: 0.22).cgColor
+    trackLayer.lineWidth = 3.2
 
     progressLayer.fillColor = UIColor.clear.cgColor
     progressLayer.strokeColor = UIColor.white.cgColor
-    progressLayer.lineWidth = 3.0
+    progressLayer.lineWidth = 3.2
     progressLayer.lineCap = .round
-    progressLayer.strokeStart = 0.0
-    progressLayer.strokeEnd = 0.0
+    progressLayer.strokeStart = 0.08
+    progressLayer.strokeEnd = 0.72
 
     layer.addSublayer(fillLayer)
     layer.addSublayer(trackLayer)
-    layer.addSublayer(progressLayer)
+    layer.addSublayer(spinHostLayer)
+    spinHostLayer.addSublayer(progressLayer)
 
     iconView.image = UIImage(systemName: "xmark")?.withConfiguration(
       UIImage.SymbolConfiguration(pointSize: 15, weight: .bold))
@@ -3413,6 +3789,7 @@ final class BubbleUploadProgressView: UIView {
       arcCenter: center, radius: radius, startAngle: -.pi / 2, endAngle: (.pi * 3.0) / 2.0,
       clockwise: true)
     trackLayer.frame = bounds
+    spinHostLayer.frame = bounds
     progressLayer.frame = bounds
     let fillDiameter = max(1.0, min(bounds.width, bounds.height) - 10.0)
     let fillFrame = CGRect(
@@ -3431,11 +3808,14 @@ final class BubbleUploadProgressView: UIView {
       width: 16.0,
       height: 16.0
     )
+    // Path rebuild must not kill the continuous spin (Settings-style spinner).
+    if isUploading || (needsDownload && isDownloading) {
+      ensureSpinning()
+    }
   }
 
   /// `progress == nil` (or no real bytes yet) renders an indeterminate smooth arc
-  /// spinner; a real fraction renders a rotating determinate ring. Never fakes a
-  /// minimum "already sent" fraction — the old seed made the size label lie.
+  /// spinner; a real fraction fills the path while the arc keeps spinning.
   func setUploadState(isUploading: Bool, progress: Double?) {
     if isUploading {
       needsDownload = false
@@ -3445,12 +3825,11 @@ final class BubbleUploadProgressView: UIView {
     }
     let resolvedProgress: CGFloat?
     if isUploading {
-      if let raw = progress.map({ CGFloat($0) }), raw.isFinite, raw > 0.004 {
+      if let raw = progress.map({ CGFloat($0) }), raw.isFinite, raw >= realProgressThreshold {
         let clamped = max(0.0, min(1.0, raw))
         lastResolvedUploadProgress = clamped
         resolvedProgress = clamped
-      } else if let lastResolvedUploadProgress {
-        // Don't flicker back to indeterminate once real progress has shown.
+      } else if let lastResolvedUploadProgress, lastResolvedUploadProgress >= realProgressThreshold {
         resolvedProgress = lastResolvedUploadProgress
       } else {
         resolvedProgress = nil
@@ -3460,7 +3839,11 @@ final class BubbleUploadProgressView: UIView {
       lastResolvedUploadProgress = nil
     }
 
-    if self.isUploading == isUploading, self.uploadProgress == resolvedProgress {
+    let progressChanged =
+      abs((self.uploadProgress ?? -1) - (resolvedProgress ?? -1)) >= 0.002
+    if self.isUploading == isUploading, !progressChanged {
+      // Still ensure the arc is spinning — cells reconfigure without progress deltas.
+      if isUploading { ensureSpinning() }
       return
     }
 
@@ -3474,11 +3857,12 @@ final class BubbleUploadProgressView: UIView {
 
     let resolvedProgress: CGFloat?
     if isDownloading {
-      if let raw = progress.map({ CGFloat($0) }), raw.isFinite, raw > 0.004 {
+      if let raw = progress.map({ CGFloat($0) }), raw.isFinite, raw >= realProgressThreshold {
         let clamped = max(0.0, min(1.0, raw))
         lastResolvedDownloadProgress = clamped
         resolvedProgress = clamped
-      } else if let lastResolvedDownloadProgress {
+      } else if let lastResolvedDownloadProgress, lastResolvedDownloadProgress >= realProgressThreshold
+      {
         resolvedProgress = lastResolvedDownloadProgress
       } else {
         resolvedProgress = nil
@@ -3488,9 +3872,10 @@ final class BubbleUploadProgressView: UIView {
       lastResolvedDownloadProgress = nil
     }
 
-    if self.needsDownload == needsDownload, self.isDownloading == isDownloading,
-      self.downloadProgress == resolvedProgress
-    {
+    let progressChanged =
+      abs((self.downloadProgress ?? -1) - (resolvedProgress ?? -1)) >= 0.002
+    if self.needsDownload == needsDownload, self.isDownloading == isDownloading, !progressChanged {
+      if needsDownload && isDownloading { ensureSpinning() }
       return
     }
 
@@ -3526,51 +3911,68 @@ final class BubbleUploadProgressView: UIView {
 
   private func resetRingVisual() {
     progressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-    progressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
-    progressLayer.strokeStart = 0.0
-    progressLayer.strokeEnd = 0.0
+    spinHostLayer.removeAnimation(forKey: uploadSpinAnimationKey)
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    progressLayer.strokeStart = 0.08
+    progressLayer.strokeEnd = 0.72
+    spinHostLayer.transform = CATransform3DIdentity
+    CATransaction.commit()
     iconView.isHidden = true
   }
 
-  /// nil → indeterminate: a fixed arc sweeping smoothly around the ring.
-  /// value → determinate: the arc fills to the true fraction while still rotating,
-  /// so the transition from "connecting" to "sending bytes" has no visual jump.
+  /// nil → Settings-style indeterminate arc (trim ~0.08…0.72) spinning continuously.
+  /// value → path fills toward the true fraction; host layer keeps spinning until done.
   private func applyRingProgress(_ progress: CGFloat?) {
-    let targetProgress: CGFloat
+    let targetStart: CGFloat
+    let targetEnd: CGFloat
     if let progress {
-      targetProgress = max(0.08, min(1.0, progress))
+      // Determinate fill from top; leave a tiny gap so the arc still reads while spinning.
+      targetStart = 0.0
+      targetEnd = max(0.12, min(0.995, progress))
     } else {
-      targetProgress = 0.26
+      // Match EditProfileDrawingSpinner / Settings avatar upload spinner.
+      targetStart = 0.08
+      targetEnd = 0.72
     }
 
-    let currentProgress = progressLayer.presentation()?.strokeEnd ?? progressLayer.strokeEnd
+    let currentStart = progressLayer.presentation()?.strokeStart ?? progressLayer.strokeStart
+    let currentEnd = progressLayer.presentation()?.strokeEnd ?? progressLayer.strokeEnd
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    progressLayer.strokeStart = 0.0
-    progressLayer.strokeEnd = targetProgress
+    progressLayer.strokeStart = targetStart
+    progressLayer.strokeEnd = targetEnd
     CATransaction.commit()
 
-    if abs(currentProgress - targetProgress) >= 0.002 {
-      let progressAnimation = CABasicAnimation(keyPath: "strokeEnd")
-      progressAnimation.fromValue = currentProgress
-      progressAnimation.toValue = targetProgress
-      progressAnimation.duration = 0.3
-      progressAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-      progressLayer.add(progressAnimation, forKey: uploadProgressAnimationKey)
-    } else {
-      progressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
+    if abs(currentStart - targetStart) >= 0.002 || abs(currentEnd - targetEnd) >= 0.002 {
+      let startAnim = CABasicAnimation(keyPath: "strokeStart")
+      startAnim.fromValue = currentStart
+      startAnim.toValue = targetStart
+      let endAnim = CABasicAnimation(keyPath: "strokeEnd")
+      endAnim.fromValue = currentEnd
+      endAnim.toValue = targetEnd
+      let group = CAAnimationGroup()
+      group.animations = [startAnim, endAnim]
+      group.duration = 0.28
+      group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+      group.isRemovedOnCompletion = false
+      group.fillMode = .forwards
+      progressLayer.add(group, forKey: uploadProgressAnimationKey)
     }
 
-    if progressLayer.animation(forKey: uploadSpinAnimationKey) == nil {
-      let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-      spin.fromValue = 0.0
-      spin.toValue = (2.0 * CGFloat.pi)
-      spin.duration = 1.1
-      spin.repeatCount = .infinity
-      spin.timingFunction = CAMediaTimingFunction(name: .linear)
-      spin.isRemovedOnCompletion = true
-      progressLayer.add(spin, forKey: uploadSpinAnimationKey)
-    }
+    ensureSpinning()
+  }
+
+  private func ensureSpinning() {
+    guard spinHostLayer.animation(forKey: uploadSpinAnimationKey) == nil else { return }
+    let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+    spin.fromValue = 0.0
+    spin.toValue = Double.pi * 2.0
+    spin.duration = 1.0
+    spin.repeatCount = .infinity
+    spin.timingFunction = CAMediaTimingFunction(name: .linear)
+    spin.isRemovedOnCompletion = false
+    spinHostLayer.add(spin, forKey: uploadSpinAnimationKey)
   }
 }
 
@@ -3582,7 +3984,7 @@ final class VoicePlayProgressView: UIView {
   private let iconView = UIImageView()
   private let ringProgressLayer = CAShapeLayer()
   private let uploadProgressAnimationKey = "voice.upload.progress"
-  private var iconTintColor = UIColor.systemBlue
+  private var iconTintColor = ChatListAppearance.fallback.accent
   private var isUploading = false
   private var needsDownload = false
   private var isDownloading = false
@@ -3617,7 +4019,7 @@ final class VoicePlayProgressView: UIView {
     fillView.addSubview(artworkOverlayView)
 
     ringProgressLayer.fillColor = UIColor.clear.cgColor
-    ringProgressLayer.strokeColor = UIColor.systemBlue.cgColor
+    ringProgressLayer.strokeColor = ChatListAppearance.fallback.accent.cgColor
     ringProgressLayer.lineWidth = 2.4
     ringProgressLayer.lineCap = .round
     ringProgressLayer.strokeStart = 0.0
@@ -6006,7 +6408,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 
 private final class MessageSelectionCircleView: UIControl {
   private var checked = false
-  private var accentColor = UIColor.systemBlue
+  private var accentColor = ChatListAppearance.fallback.accent
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -6020,7 +6422,7 @@ private final class MessageSelectionCircleView: UIControl {
 
   func configure(selected: Bool, appearance: ChatListAppearance) {
     checked = selected
-    accentColor = appearance.bubbleMeGradient.first ?? UIColor.systemBlue
+    accentColor = appearance.accent
     accessibilityValue = selected ? "Selected" : "Not selected"
     setNeedsDisplay()
   }
@@ -6134,11 +6536,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   // "View agent" side button on completed agent bubbles — opens the native
   // full-page agent surface (progress/thinking/tools) for that single task.
   private let agentViewButton = UIButton(type: .system)
-  // "Show more"/"Show less" bar for tall-collapsed bubbles (user text, agent text and
-  // settled agent turns share the rule — see the tallBubble* constants). Placed by the
-  // layout branches below; hidden for every other row.
-  private let tallToggleButton = UIButton(type: .system)
+  // Tall-collapse: glass expand/collapse chip is hosted by ChatListView (outside the
+  // list cell). The cell only exposes an anchor via `tallToggleAnchor`.
   private var tallToggleRowMessageId: String?
+  private var lastBubbleFrame: CGRect = .zero
+  private var lastTallToggleVisible = false
+  private var lastTallCollapsed = false
+  private var tallContentAnimationGeneration: UInt = 0
   private let notSentIndicator = UIImageView()
   private var notSentIndicatorShown = false
   private let agentActionBarView = ChatNativeAgentActionBarView()
@@ -6210,6 +6614,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   var onVoiceUploadCancelTap: ((ChatListRow) -> Void)?
   var onInlineAttachmentTap: ((ChatListRow) -> Void)?
   var onMediaNaturalSizeResolved: ((String?, String, CGSize) -> Void)?
+  /// Multi-image grid tile tapped — `(row, tileIndex, sourceImageView)`.
+  var onMediaGridTileTap: ((ChatListRow, Int, UIImageView) -> Void)?
   var onRetryMessageTap: ((ChatListRow) -> Void)?
   var onNotSentTap: ((ChatListRow) -> Void)?
   var onAgentAction: (([String: Any]) -> Void)?
@@ -6269,10 +6675,6 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(agentViewButton)
     contentView.addSubview(notSentIndicator)
     contentView.addSubview(agentActionBarView)
-    tallToggleButton.titleLabel?.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
-    tallToggleButton.isHidden = true
-    tallToggleButton.addTarget(self, action: #selector(handleTallToggleTap), for: .touchUpInside)
-    contentView.addSubview(tallToggleButton)
     agentActionBarView.onNativeEvent = { [weak self] payload in
       self?.onAgentAction?(payload)
     }
@@ -6353,8 +6755,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaVoiceButtonView.addGestureRecognizer(tap)
     mediaVoiceButtonView.applyStyle(
       fillColor: UIColor(white: 1.0, alpha: 0.96),
-      iconTint: appearance.bubbleMeGradient.first ?? UIColor.systemBlue,
-      ringTint: UIColor.white.withAlphaComponent(0.65))
+      iconTint: appearance.accent,
+      ringTint: appearance.accent.withAlphaComponent(0.72))
 
     mediaTitleLabel.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
     mediaTitleLabel.textColor = .white
@@ -6558,6 +6960,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaImageView
   }
 
+  /// Image for a multi-image grid tile (or hero image when index is 0 / no grid).
+  func mediaImage(atGridIndex index: Int) -> UIImage? {
+    if index >= 0, index < mediaGridTileViews.count, !mediaGridTileViews[index].isHidden {
+      return mediaGridTileViews[index].image ?? mediaImageView.image
+    }
+    return mediaImageView.image
+  }
+
+  func mediaImageView(atGridIndex index: Int) -> UIImageView? {
+    if index >= 0, index < mediaGridTileViews.count, !mediaGridTileViews[index].isHidden {
+      return mediaGridTileViews[index]
+    }
+    return mediaImageView
+  }
+
   func setInlineVideoPlaybackActive(_ active: Bool) {
     guard mediaVideoPlaybackActive != active else { return }
     mediaVideoPlaybackActive = active
@@ -6569,25 +6986,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     self.appearance = appearance
     dayLabel.textColor = appearance.dayTextColor
     dayLabel.backgroundColor = appearance.dayBackgroundColor
-    dayLabel.layer.borderColor = appearance.dayBorderColor.cgColor
-    dayLabel.layer.borderWidth = 0.5
-    dayLabel.layer.cornerRadius = 12.0
+    // Clean solid capsule — no hairline border. The corner radius is set in layout,
+    // where the pill's real height is known (fully-rounded capsule).
+    dayLabel.layer.borderWidth = 0.0
+    dayLabel.layer.cornerCurve = .circular
     dayLabel.clipsToBounds = true
     let isCurrentRowMe = row?.isMe == true
-    let currentTextColor = isCurrentRowMe ? appearance.textColorMe : appearance.textColorThem
-    let incomingVoiceStyle = resolvedIncomingVoiceButtonStyle(for: appearance)
     mediaWaveformView.applyColors(
-      active: currentTextColor.withAlphaComponent(0.95),
-      inactive: currentTextColor.withAlphaComponent(0.34)
+      active: appearance.accent.withAlphaComponent(0.98),
+      inactive: appearance.accent.withAlphaComponent(0.34)
     )
     mediaVoiceButtonView.applyStyle(
-      fillColor: isCurrentRowMe ? UIColor(white: 1.0, alpha: 0.96) : incomingVoiceStyle.fill,
-      iconTint: isCurrentRowMe
-        ? (appearance.bubbleMeGradient.first ?? UIColor.systemBlue)
-        : incomingVoiceStyle.accent,
-      ringTint: isCurrentRowMe
-        ? currentTextColor.withAlphaComponent(0.74)
-        : incomingVoiceStyle.accent.withAlphaComponent(0.74)
+      fillColor: appearance.accent,
+      iconTint: contrastingMediaForeground(for: appearance.accent),
+      ringTint: appearance.accent.withAlphaComponent(0.82)
     )
     mediaPlaceholderBlurView.effect = UIBlurEffect(
       style: appearance.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
@@ -6627,6 +7039,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     groupSenderColor: UIColor? = nil,
     groupSenderNameHeight: CGFloat = 0.0
   ) {
+    let previousRow = self.row
+    if previousRow.map({ ($0.messageId ?? $0.key) != (row.messageId ?? row.key) }) == true {
+      resetTallBubbleInnerContentAnimation()
+    }
+    // Status, roster, foreground, and selection updates reconfigure the same visible
+    // cell. Keep its decoded pixels through that synchronous pass so an image never
+    // flashes to the placeholder while the identical cache entry is looked up again.
+    let isSameMediaIdentity = previousRow.map {
+      ($0.messageId ?? $0.key) == (row.messageId ?? row.key)
+        && $0.visualKind == row.visualKind
+        && $0.mediaUrl == row.mediaUrl
+        && $0.localMediaUrl == row.localMediaUrl
+        && $0.mediaKey == row.mediaKey
+    } ?? false
+    let preservedMediaImage = isSameMediaIdentity ? mediaImageView.image : nil
     self.agentTurnState = agentTurnState
     isConfiguredAgentDivider = false
     let activeVoiceSnapshot = VoiceBubblePlaybackCoordinator.shared.currentSnapshot
@@ -6634,6 +7061,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     self.selectionMode = selectionMode
     self.isSelectionChecked = selected
     cachedLayoutMetrics = nil
+
+    let rowId = row.messageId ?? row.key
+    bubbleView.debugRowId = rowId
+    let prevGroupLeading = groupExtraLeading
+    let prevGroupName = groupSenderNameLabel.text
+    let prevGroupColor = groupSenderNameLabel.textColor
 
     // Group sender decoration (name label + reserved avatar gutter). A name is only passed
     // for the first message of a sender-run; the gutter is reserved for every incoming
@@ -6648,6 +7081,59 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       groupSenderNameLabel.text = nil
       groupSenderNameLabel.isHidden = true
       groupNameReservedHeight = 0.0
+    }
+    // Group list color flicker: log gutter/name/sender-color transitions + style path.
+    if chatCellBubbleFlickerDebugLogs,
+      groupExtraLeading > 0.1 || prevGroupLeading > 0.1 || row.isGroupOrChannel
+    {
+      let stylePath: String
+      if row.isAgentMessage {
+        stylePath = "agent"
+      } else if row.isAgentMention {
+        stylePath = "agentMention"
+      } else {
+        stylePath = "normal"
+      }
+      let colorHex: String = {
+        guard let c = groupSenderColor else { return "nil" }
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        c.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return String(
+          format: "#%02X%02X%02X",
+          Int((r * 255).rounded()), Int((g * 255).rounded()), Int((b * 255).rounded()))
+      }()
+      let prevColorHex: String = {
+        guard let c = prevGroupColor else { return "nil" }
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        c.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return String(
+          format: "#%02X%02X%02X",
+          Int((r * 255).rounded()), Int((g * 255).rounded()), Int((b * 255).rounded()))
+      }()
+      NSLog(
+        "[BubbleFlicker] cell.configure id=%@ kind=%@ style=%@ isMe=%@ isGroup=%@ agent=%@ stream=%@ gutter %.0f->%.0f name '%@'->'%@' color %@->%@ sameMedia=%@ shapeTail=%@",
+        rowId,
+        String(describing: row.kind),
+        stylePath,
+        row.isMe ? "Y" : "N",
+        row.isGroupOrChannel ? "Y" : "N",
+        row.isAgentMessage ? "Y" : "N",
+        row.isStreamingText ? "Y" : "N",
+        prevGroupLeading,
+        groupExtraLeading,
+        prevGroupName ?? "—",
+        groupSenderNameLabel.text ?? "—",
+        prevColorHex,
+        colorHex,
+        isSameMediaIdentity ? "Y" : "N",
+        row.shape.showTail ? "Y" : "N"
+      )
     }
     if row.visualKind == .voice, activeVoiceSnapshot.messageId == row.messageId {
       mediaNeedsDownload = activeVoiceSnapshot.isDownloading
@@ -6900,7 +7386,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           tailView.clearAgentTailStyle()
           bubbleView.configure(
             isMe: false,
-            shape: row.shape,
+            shape: chatAppearanceBubbleShape(row.shape, appearance: appearance),
             hidden: true,
             appearance: appearance
           )
@@ -6913,7 +7399,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         } else {
           // Agent messages use "them" styling (not isMe) with a subtle tint
           bubbleView.configure(
-            isMe: false, shape: row.shape, hidden: isGhostHidden, appearance: appearance)
+            isMe: false,
+            shape: chatAppearanceBubbleShape(row.shape, appearance: appearance),
+            hidden: isGhostHidden,
+            appearance: appearance)
           bubbleView.applyAgentStyle(
             appearance: appearance, isMe: false, accent: Self.agentWorkingAccent(for: row))
           tailView.configure(
@@ -6930,7 +7419,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       } else if row.isAgentMention {
         // Agent mention by ME uses "me" styling with glow
         bubbleView.configure(
-          isMe: true, shape: row.shape, hidden: isGhostHidden, appearance: appearance)
+          isMe: true,
+          shape: chatAppearanceBubbleShape(row.shape, appearance: appearance),
+          hidden: isGhostHidden,
+          appearance: appearance)
         bubbleView.applyAgentStyle(appearance: appearance, isMe: true)
         tailView.configure(
           isMe: true,
@@ -6946,7 +7438,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         let hideBubbleForFullBleedMedia = usesFullBleedMediaLayout(row)
         let hideBubbleChrome = hideBubbleForTyping || hideBubbleForSticker || hideBubbleForFullBleedMedia
         bubbleView.configure(
-          isMe: row.isMe, shape: row.shape, hidden: isGhostHidden || hideBubbleChrome,
+          isMe: row.isMe,
+          shape: chatAppearanceBubbleShape(row.shape, appearance: appearance),
+          hidden: isGhostHidden || hideBubbleChrome,
           appearance: appearance)
         tailView.configure(
           isMe: row.isMe,
@@ -6966,7 +7460,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       editedLabel.textColor = metaColor
       pinnedLabel.textColor = metaColor
       timestampLabel.textColor = metaColor
-      configureMediaPresentation(for: row, textColor: textColor, metaColor: metaColor)
+      configureMediaPresentation(
+        for: row,
+        textColor: textColor,
+        metaColor: metaColor,
+        preservedMediaImage: preservedMediaImage
+      )
       if !inlineAttachmentView.isHidden {
         inlineAttachmentView.backgroundColor = UIColor(white: 0.0, alpha: 0.20)
         inlineAttachmentIconView.image = UIImage(systemName: inlineAttachmentIconName(for: row))
@@ -7022,6 +7521,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   override func prepareForReuse() {
     super.prepareForReuse()
+    resetTallBubbleInnerContentAnimation()
+    clipsToBounds = false
+    contentView.clipsToBounds = false
     VoiceBubblePlaybackCoordinator.shared.unbind(cell: self)
     bubbleView.clearAgentStyle()
     tailView.clearAgentTailStyle()
@@ -7029,6 +7531,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     onVoiceUploadCancelTap = nil
     onInlineAttachmentTap = nil
     onMediaNaturalSizeResolved = nil
+    onMediaGridTileTap = nil
     onRetryMessageTap = nil
     onNotSentTap = nil
     onAgentAction = nil
@@ -7167,23 +7670,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return
     }
 
-    // Tall-content toggle defaults: hidden and unclamped unless one of the bubble layout
-    // branches below places the bar (a reused cell must never keep the previous row's
-    // line cap, clipping, or a stray visible bar — every early-return path above the
-    // bubble branches skips them).
-    tallToggleButton.isHidden = true
-    tallToggleButton.frame = .zero
-    // Match the host's row lookup key (messageId ?? key) — a nil messageId here made
-    // the toggle tap a silent no-op on rows addressed only by their key.
+    // Tall-content: outer glass chip is list-hosted. Track id for the host anchor.
     tallToggleRowMessageId = row.messageId ?? row.key
+    lastTallToggleVisible = false
+    lastTallCollapsed = false
+    lastBubbleFrame = .zero
     messageLabel.numberOfLines = 0
+    messageLabel.clipsToBounds = false
     richTextView.clipsToBounds = false
     // Agent turns: ALWAYS clip. A stale layout height (common after live→settle or
     // bridge-restart history upsert) must never paint the body over the next cell.
     agentTurnContentView.clipsToBounds = true
-    applyTallFadeMask(to: messageLabel, enabled: false)
-    applyTallFadeMask(to: richTextView, enabled: false)
-    applyTallFadeMask(to: agentTurnContentView, enabled: false)
 
     let bounds = contentView.bounds
     if row.kind == .day || isConfiguredAgentDivider {
@@ -7196,6 +7693,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         width: width,
         height: height
       )
+      dayLabel.layer.cornerRadius = height / 2.0
       return
     }
 
@@ -7231,7 +7729,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       cachedLayoutWidth = layoutWidth
     }
     let bubbleWidth = metrics.bubbleWidth
-    let bubbleHeight = metrics.bubbleHeight
+    // While the list animates a tall expand/collapse, the cell bounds interpolate
+    // between collapsed and full height. Track that intermediate height so the plate
+    // morphs instead of snapping to the target metrics size (empty gap / overflow jump).
+    // Top-corner glass chip is overlay-only and does not reserve cell height.
+    let outerReserve = metrics.tallOuterToggleReserve
+    let availableBubbleHeight = max(
+      1.0, bounds.height - groupNameReservedHeight - outerReserve)
+    let isTallHeightMorphing =
+      metrics.tallToggleVisible && abs(availableBubbleHeight - metrics.bubbleHeight) > 1.0
+    let bubbleHeight =
+      isTallHeightMorphing ? availableBubbleHeight : metrics.bubbleHeight
     let bubbleX: CGFloat
     if metrics.agentTurnCentered {
       // Compact "thinking" pill: center it in the row instead of pinning to the leading
@@ -7244,7 +7752,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           ? layoutWidth - bubbleWidth - bubbleSideMargin
           : bubbleSideMargin + groupExtraLeading) + selectionInset
     }
-    let bubbleY = max(0.0, bounds.height - bubbleHeight)
+    // Plate sits above the outer glass reserve (when present).
+    let bubbleY = max(0.0, bounds.height - bubbleHeight - outerReserve)
     let bubbleFrame = pixelAlignedRect(
       CGRect(
         x: floor(bubbleX),
@@ -7252,20 +7761,36 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         width: ceil(bubbleWidth),
         height: ceil(bubbleHeight)
       ))
+    lastBubbleFrame = bubbleFrame
+    lastTallToggleVisible = metrics.tallToggleVisible
+    lastTallCollapsed = metrics.tallCollapsed
+
+    // Tall rows clip overflow so full content under a short plate doesn't paint the next
+    // cell. Soft fade mask on the body communicates "more below" (not a hard cut).
+    if metrics.tallToggleVisible {
+      clipsToBounds = true
+      contentView.clipsToBounds = true
+    } else {
+      clipsToBounds = false
+      contentView.clipsToBounds = false
+    }
 
     CATransaction.begin()
     CATransaction.setDisableActions(true)
 
     bubbleView.frame = bubbleFrame
 
-    // Group sender name sits in the reserved top strip, left-aligned to the bubble.
+    // Group sender name sits immediately above the bubble, left-aligned to it. During
+    // the navigation presentation seed the cell can be taller than the exactly measured
+    // bubble; anchoring the label to the cell's y=0 exposed that estimate slack as a large
+    // name-to-bubble gap until the authoritative layout reconciled.
     if !groupSenderNameLabel.isHidden, groupNameReservedHeight > 0 {
       let nameX = bubbleFrame.minX + 6.0
       let nameMaxX = bounds.width - bubbleSideMargin
       groupSenderNameLabel.frame = pixelAlignedRect(
         CGRect(
           x: nameX,
-          y: 1.0,
+          y: max(1.0, bubbleFrame.minY - groupNameReservedHeight + 1.0),
           width: max(0.0, nameMaxX - nameX),
           height: max(0.0, groupNameReservedHeight - 2.0)
         ))
@@ -7416,12 +7941,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaStickerAnimationView.frame = mediaContainerView.bounds
       layoutMediaSubviews(for: row, in: mediaContainerView.bounds)
       inlineAttachmentView.frame = .zero
+      clearTallCollapseFadeMask(on: messageLabel)
+      clearTallCollapseFadeMask(on: richTextView)
+      clearTallCollapseFadeMask(on: agentTurnContentView)
     } else {
       mediaContainerView.frame = .zero
       let bubbleTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
       if bubbleUsesAgentTurnContent(row) {
         richTextView.frame = .zero
         messageLabel.frame = .zero
+        clearTallCollapseFadeMask(on: messageLabel)
+        clearTallCollapseFadeMask(on: richTextView)
         replyPreviewView.frame = .zero
         linkPreviewView.frame = .zero
         inlineAttachmentView.frame = .zero
@@ -7452,40 +7982,47 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
               self.onAgentAction?(["type": "openAgentTurnDetail", "messageId": messageId])
             },
             showsLoaderView: agentTurnBubbleShowsWorkedSummary(row),
-            // Tall-collapse: plain text preview only — full multi-block (table+code glass)
-            // must not be laid out into the 420pt cap (causes overlapping boxes).
-            isContentCollapsed: metrics.tallCollapsed
+            // Keep full multi-block layout always — collapse is plate height + soft mask
+            // only (no content swap / no expand fade).
+            isContentCollapsed: false
           )
           lastAgentTurnConfiguredRow = row
           lastAgentTurnConfiguredWidth = metrics.messageWidth
           lastAgentTurnConfiguredState = agentTurnState
           lastAgentTurnConfiguredStyle = interfaceStyle
         }
+        // Prefer fitting the morphing plate: when the cell is mid expand/collapse the
+        // available body height is the interpolating bubble, not the settled metrics.
+        let agentBodyMaxHeight = max(
+          1.0,
+          bubbleFrame.height - (agentTurnVerticalPadding * 2.0)
+        )
+        // Frame height = visible plate slice; full content is measured taller and soft-
+        // masked when collapsed so expand only grows Y.
+        let agentBodyHeight =
+          metrics.tallToggleVisible
+          ? min(metrics.textHeight, agentBodyMaxHeight)
+          : metrics.textHeight
         agentTurnContentView.frame = pixelAlignedRect(
           CGRect(
             x: contentX,
             y: contentY,
             width: metrics.messageWidth,
-            height: metrics.textHeight
+            height: agentBodyHeight
           )
         )
-        if metrics.tallToggleVisible {
-          // Collapsed: metrics.textHeight is the cap — fade the bottom so the cut
-          // reads as "there's more below". clipsToBounds is already on (above).
-          applyTallFadeMask(to: agentTurnContentView, enabled: metrics.tallCollapsed)
-          styleTallToggle(collapsed: metrics.tallCollapsed, color: bubbleTextColor)
-          tallToggleButton.isHidden = false
-          tallToggleButton.frame = pixelAlignedRect(
-            CGRect(
-              x: bubbleFrame.minX,
-              y: agentTurnContentView.frame.maxY + tallBubbleToggleSpacing,
-              width: bubbleFrame.width,
-              height: tallBubbleToggleHeight
-            ))
-        }
+        let agentNeedsFade =
+          metrics.tallToggleVisible
+          && (metrics.tallCollapsed || isTallHeightMorphing)
+          && metrics.textHeight > agentBodyHeight + 1.0
+        applyTallCollapseFadeMask(to: agentTurnContentView, enabled: agentNeedsFade)
+
       } else if metrics.hasInlineAttachment {
         agentTurnContentView.frame = .zero
         richTextView.frame = .zero
+        clearTallCollapseFadeMask(on: messageLabel)
+        clearTallCollapseFadeMask(on: richTextView)
+        clearTallCollapseFadeMask(on: agentTurnContentView)
         linkPreviewView.frame = .zero
         let contentX = bubbleFrame.minX + bubbleHorizontalPadding
         var contentY = bubbleFrame.minY + bubbleTopPadding
@@ -7556,59 +8093,75 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         } else {
           replyPreviewView.frame = .zero
         }
+        clearTallCollapseFadeMask(on: agentTurnContentView)
+        // Visible body height inside the (possibly morphing) plate — full text is taller
+        // when collapsed; soft mask fades the cut instead of hard-clipping glyphs.
+        let textBodyMaxHeight: CGFloat = {
+          guard metrics.tallToggleVisible else { return metrics.textHeight }
+          let metaAndPreview =
+            (metrics.hasLinkPreview ? bubbleLinkPreviewSpacing + metrics.previewHeight : 0.0)
+            + bubbleMetaTopSpacing + bubbleMetaHeight
+          return max(
+            1.0,
+            bubbleFrame.height - bubbleTopPadding - bubbleBottomPadding
+              - (metrics.hasReplyPreview ? metrics.replyPreviewHeight + bubbleReplyPreviewSpacing : 0.0)
+              - metaAndPreview
+          )
+        }()
+
         if metrics.usesRichTextLayout {
           messageLabel.frame = .zero
+          clearTallCollapseFadeMask(on: messageLabel)
           let richTextHeight = richTextView.configure(
             row: row,
             textColor: bubbleTextColor,
             availableWidth: metrics.messageWidth
           )
-          // Tall-collapsed: metrics.textHeight is the cap — clip the overflow instead of
-          // letting the block layout blow past the measured bubble.
-          richTextView.clipsToBounds = metrics.tallCollapsed
+          let fullRichHeight = max(metrics.textHeight, richTextHeight)
+          let visibleRichHeight =
+            metrics.tallToggleVisible
+            ? min(fullRichHeight, textBodyMaxHeight)
+            : fullRichHeight
+          richTextView.clipsToBounds = metrics.tallToggleVisible
           richTextView.frame = pixelAlignedRect(
             CGRect(
               x: contentX,
               y: contentY,
               width: metrics.messageWidth,
-              height: metrics.tallCollapsed
-                ? metrics.textHeight
-                : max(metrics.textHeight, richTextHeight)
+              height: visibleRichHeight
             )
           )
+          let richNeedsFade =
+            metrics.tallToggleVisible
+            && (metrics.tallCollapsed || isTallHeightMorphing)
+            && fullRichHeight > visibleRichHeight + 1.0
+          applyTallCollapseFadeMask(to: richTextView, enabled: richNeedsFade)
         } else {
           richTextView.frame = .zero
-          // Tall-collapsed: cap the label to the same whole-line count the measurement
-          // used so the truncation is clean (ellipsis on the last visible line).
-          messageLabel.numberOfLines = metrics.tallCollapsed
-            ? Int(max(1.0, (tallBubbleCollapsedContentHeight / bubbleMessageFont.lineHeight).rounded(.down)))
-            : 0
+          clearTallCollapseFadeMask(on: richTextView)
+          // Always unlimited lines — expand only grows the visible height.
+          messageLabel.numberOfLines = 0
+          let visibleTextHeight =
+            metrics.tallToggleVisible
+            ? min(metrics.textHeight, textBodyMaxHeight)
+            : metrics.textHeight
+          messageLabel.clipsToBounds = metrics.tallToggleVisible
           messageLabel.frame = pixelAlignedRect(
             CGRect(
               x: contentX,
               y: contentY,
               width: metrics.messageWidth,
-              height: metrics.textHeight
+              height: visibleTextHeight
             )
           )
+          let textNeedsFade =
+            metrics.tallToggleVisible
+            && (metrics.tallCollapsed || isTallHeightMorphing)
+            && metrics.textHeight > visibleTextHeight + 1.0
+          applyTallCollapseFadeMask(to: messageLabel, enabled: textNeedsFade)
         }
 
-        var textBottom = metrics.usesRichTextLayout ? richTextView.frame.maxY : messageLabel.frame.maxY
-        if metrics.tallToggleVisible {
-          applyTallFadeMask(
-            to: metrics.usesRichTextLayout ? richTextView : messageLabel,
-            enabled: metrics.tallCollapsed)
-          styleTallToggle(collapsed: metrics.tallCollapsed, color: bubbleTextColor)
-          tallToggleButton.isHidden = false
-          tallToggleButton.frame = pixelAlignedRect(
-            CGRect(
-              x: bubbleFrame.minX + bubbleHorizontalPadding,
-              y: textBottom + tallBubbleToggleSpacing,
-              width: metrics.contentWidth,
-              height: tallBubbleToggleHeight
-            ))
-          textBottom = tallToggleButton.frame.maxY
-        }
+        let textBottom = metrics.usesRichTextLayout ? richTextView.frame.maxY : messageLabel.frame.maxY
 
         if metrics.hasLinkPreview {
           let previewTop = textBottom + bubbleLinkPreviewSpacing
@@ -7627,9 +8180,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         let metaTop = metrics.hasLinkPreview
           ? linkPreviewView.frame.maxY + bubbleMetaTopSpacing
           : textBottom + bubbleMetaTopSpacing
-        // Always place the meta block at the bottom right, matching Telegram's RTL behavior
+        // Meta (time / sent) stays trailing. Expand/collapse is a list-level glass chip.
         let metaX = bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
-        metaContainerView.frame = pixelAlignedRect(
+        let metaFrame = pixelAlignedRect(
           CGRect(
             x: metaX,
             y: metaTop,
@@ -7637,6 +8190,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             height: bubbleMetaHeight
           )
         )
+        metaContainerView.frame = metaFrame
       } else {
         agentTurnContentView.frame = .zero
         richTextView.frame = .zero
@@ -7792,6 +8346,122 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     updateWallpaperBackdropLayoutIfNeeded()
   }
 
+  /// Soft bottom fade on collapsed tall content so the cut reads as "more below",
+  /// not a hard clip through glyphs. Expand/collapse only changes height in Y.
+  private func applyTallCollapseFadeMask(to view: UIView, enabled: Bool) {
+    guard enabled, view.bounds.width > 1.0, view.bounds.height > 1.0 else {
+      clearTallCollapseFadeMask(on: view)
+      return
+    }
+    let fade = min(tallBubbleCollapseFadeHeight, max(24.0, view.bounds.height * 0.22))
+    let solidEnd = max(0.0, 1.0 - (fade / max(1.0, view.bounds.height)))
+    let mask: CAGradientLayer
+    if let existing = view.layer.mask as? CAGradientLayer {
+      mask = existing
+    } else {
+      mask = CAGradientLayer()
+      view.layer.mask = mask
+    }
+    mask.frame = view.bounds
+    mask.startPoint = CGPoint(x: 0.5, y: 0.0)
+    mask.endPoint = CGPoint(x: 0.5, y: 1.0)
+    mask.colors = [
+      UIColor.black.cgColor,
+      UIColor.black.cgColor,
+      UIColor.clear.cgColor,
+    ]
+    mask.locations = [0.0, NSNumber(value: Double(solidEnd)), 1.0]
+  }
+
+  private func clearTallCollapseFadeMask(on view: UIView) {
+    if view.layer.mask is CAGradientLayer {
+      view.layer.mask = nil
+    }
+  }
+
+  /// Anchor for the list-hosted glass expand/collapse chip (nil when this row has none).
+  /// Adds a restrained Y-scale to the visible body while the plate reveals/clips it.
+  /// The translation compensates for UIView's center-based transform so the text's top
+  /// edge stays fixed; only the lower edge breathes with the height transition.
+  func animateTallBubbleInnerContent(expanding: Bool, duration: TimeInterval) {
+    let bodyViews = [messageLabel, richTextView, agentTurnContentView].filter {
+      !$0.isHidden && $0.bounds.width > 1.0 && $0.bounds.height > 1.0
+    }
+    guard !bodyViews.isEmpty else { return }
+
+    tallContentAnimationGeneration &+= 1
+    let generation = tallContentAnimationGeneration
+    let compressedScaleY: CGFloat = 0.985
+
+    func topAnchoredScale(for view: UIView, scaleY: CGFloat) -> CGAffineTransform {
+      CGAffineTransform(
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: scaleY,
+        tx: 0.0,
+        ty: -view.bounds.height * (1.0 - scaleY) * 0.5
+      )
+    }
+
+    for view in bodyViews {
+      if let presentation = view.layer.presentation() {
+        view.transform = presentation.affineTransform()
+      }
+      view.layer.removeAnimation(forKey: "transform")
+      if expanding && view.transform.isIdentity {
+        view.transform = topAnchoredScale(for: view, scaleY: compressedScaleY)
+      }
+    }
+
+    UIView.animateKeyframes(
+      withDuration: duration,
+      delay: 0.0,
+      options: [.allowUserInteraction, .beginFromCurrentState, .calculationModeCubic],
+      animations: {
+        if expanding {
+          UIView.addKeyframe(withRelativeStartTime: 0.0, relativeDuration: 1.0) {
+            bodyViews.forEach { $0.transform = .identity }
+          }
+        } else {
+          UIView.addKeyframe(withRelativeStartTime: 0.0, relativeDuration: 0.68) {
+            bodyViews.forEach {
+              $0.transform = topAnchoredScale(for: $0, scaleY: compressedScaleY)
+            }
+          }
+          UIView.addKeyframe(withRelativeStartTime: 0.68, relativeDuration: 0.32) {
+            bodyViews.forEach { $0.transform = .identity }
+          }
+        }
+      },
+      completion: { [weak self] _ in
+        guard let self, self.tallContentAnimationGeneration == generation else { return }
+        bodyViews.forEach { $0.transform = .identity }
+      }
+    )
+  }
+
+  private func resetTallBubbleInnerContentAnimation() {
+    tallContentAnimationGeneration &+= 1
+    for view in [messageLabel, richTextView, agentTurnContentView] {
+      view.layer.removeAnimation(forKey: "transform")
+      view.transform = .identity
+    }
+  }
+
+  func tallToggleAnchor() -> ChatTallToggleAnchor? {
+    guard lastTallToggleVisible,
+      let messageId = tallToggleRowMessageId, !messageId.isEmpty,
+      lastBubbleFrame.width > 1.0, lastBubbleFrame.height > 1.0
+    else { return nil }
+    return ChatTallToggleAnchor(
+      messageId: messageId,
+      bubbleFrameInCell: lastBubbleFrame,
+      collapsed: lastTallCollapsed,
+      isMe: row?.isMe ?? false
+    )
+  }
+
   func updateWallpaperBackdropLayoutIfNeeded() {
     guard let coordinateView = wallpaperCoordinateView else {
       bubbleView.applyWallpaperBackdrop(snapshot: nil, containerSize: .zero, sampleRect: .zero)
@@ -7800,9 +8470,6 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     guard
-      wallpaperBackdropSnapshot != nil,
-      wallpaperBackdropContainerSize.width > 1.0,
-      wallpaperBackdropContainerSize.height > 1.0,
       let row,
       row.kind == .message,
       !bubbleView.isHidden
@@ -7812,34 +8479,64 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return
     }
 
+    // Always pass bubble geometry in list coordinates so me gradients can map to one
+    // shared chat-list space (even when there is no wallpaper snapshot).
     let bubbleRect = bubbleView.convert(bubbleView.bounds, to: coordinateView)
+    let hasWallpaperSnapshot =
+      wallpaperBackdropSnapshot != nil
+      && wallpaperBackdropContainerSize.width > 1.0
+      && wallpaperBackdropContainerSize.height > 1.0
+    let containerSize =
+      hasWallpaperSnapshot
+      ? wallpaperBackdropContainerSize
+      : coordinateView.bounds.size
+    let prevWall = bubbleView.wallpaperSnapshot != nil
     bubbleView.applyWallpaperBackdrop(
-      snapshot: wallpaperBackdropSnapshot,
-      containerSize: wallpaperBackdropContainerSize,
+      snapshot: hasWallpaperSnapshot ? wallpaperBackdropSnapshot : nil,
+      containerSize: containerSize,
       sampleRect: bubbleRect
     )
+    if chatCellBubbleFlickerDebugLogs, prevWall != hasWallpaperSnapshot {
+      NSLog(
+        "[BubbleFlicker] cell.wallpaperLayout id=%@ wall %@->%@ rect=(%.0f,%.0f,%.0fx%.0f) agent=%@",
+        row.messageId ?? row.key,
+        prevWall ? "Y" : "N",
+        hasWallpaperSnapshot ? "Y" : "N",
+        bubbleRect.minX,
+        bubbleRect.minY,
+        bubbleRect.width,
+        bubbleRect.height,
+        row.isAgentMessage ? "Y" : "N"
+      )
+    }
 
     if !tailView.isHidden, tailView.imageView.image == nil {
       let tailRect = tailView.convert(tailView.bounds, to: coordinateView)
       tailView.applyWallpaperBackdrop(
-        snapshot: wallpaperBackdropSnapshot,
-        containerSize: wallpaperBackdropContainerSize,
+        snapshot: hasWallpaperSnapshot ? wallpaperBackdropSnapshot : nil,
+        containerSize: containerSize,
         sampleRect: tailRect
       )
     } else {
       tailView.applyWallpaperBackdrop(snapshot: nil, containerSize: .zero, sampleRect: .zero)
     }
 
-    if row.isAgentMessage && !usesTransparentAgentStreamingLayout(row) {
-      let accent = Self.agentWorkingAccent(for: row)
-      bubbleView.applyAgentStyle(appearance: appearance, isMe: false, accent: accent)
-      if !tailView.isHidden, tailView.imageView.image == nil {
-        tailView.applyAgentTailStyle(appearance: appearance, isMe: false, accent: accent)
-      }
-    } else if row.isAgentMention {
-      bubbleView.applyAgentStyle(appearance: appearance, isMe: true)
-      if !tailView.isHidden, tailView.imageView.image == nil {
-        tailView.applyAgentTailStyle(appearance: appearance, isMe: true)
+    // Agent style is border-only now and is already applied in configure(). Re-applying
+    // on every wallpaper sample pass was thrashing fill colors every layout frame.
+    // Only refresh agent chrome when wallpaper presence just flipped (configure already
+    // painted the border for the steady-state path).
+    if prevWall != hasWallpaperSnapshot {
+      if row.isAgentMessage && !usesTransparentAgentStreamingLayout(row) {
+        let accent = Self.agentWorkingAccent(for: row)
+        bubbleView.applyAgentStyle(appearance: appearance, isMe: false, accent: accent)
+        if !tailView.isHidden, tailView.imageView.image == nil {
+          tailView.applyAgentTailStyle(appearance: appearance, isMe: false, accent: accent)
+        }
+      } else if row.isAgentMention {
+        bubbleView.applyAgentStyle(appearance: appearance, isMe: true)
+        if !tailView.isHidden, tailView.imageView.image == nil {
+          tailView.applyAgentTailStyle(appearance: appearance, isMe: true)
+        }
       }
     }
   }
@@ -8185,6 +8882,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       for tile in mediaGridTileViews {
         tile.isHidden = true
         tile.image = nil
+        tile.gestureRecognizers?.forEach { tile.removeGestureRecognizer($0) }
+        tile.isUserInteractionEnabled = false
       }
       return
     }
@@ -8203,21 +8902,46 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     mediaImageView.isHidden = true
     mediaPrimaryIconView.isHidden = true
+    // Grid tiles need hit-testing; keep the container interactive while the grid is live.
+    mediaContainerView.isUserInteractionEnabled = true
     let rowKey = row.messageId ?? row.key
     mediaGridRowKey = rowKey
     for (index, tile) in mediaGridTileViews.enumerated() {
       tile.isHidden = index >= tiles
       if index < tiles { tile.image = nil }
+      tile.gestureRecognizers?.forEach { tile.removeGestureRecognizer($0) }
+      if index < tiles {
+        tile.isUserInteractionEnabled = true
+        tile.tag = index
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleMediaGridTileTap(_:)))
+        tile.addGestureRecognizer(tap)
+      } else {
+        tile.isUserInteractionEnabled = false
+      }
     }
 
-    for (index, blob) in row.agentBridgeAttachmentsEnc.prefix(tiles).enumerated() {
+    for index in 0..<tiles {
       let cacheKey = "\(rowKey)#grid-\(index)" as NSString
       if let cached = ChatListCell.bridgeGridImageCache.object(forKey: cacheKey) {
         mediaGridTileViews[index].image = cached
         continue
       }
+      // Prefer live sealed blobs; fall back to durable server-persisted thumbs after reopen.
+      let blob = index < row.agentBridgeAttachmentsEnc.count
+        ? row.agentBridgeAttachmentsEnc[index] : nil
+      let thumbB64 = index < row.attachmentThumbnailsB64.count
+        ? row.attachmentThumbnailsB64[index] : nil
       ChatListCell.bridgeGridDecodeQueue.async { [weak self] in
-        guard let image = ChatListCell.decodeBridgeGridImage(blob: blob) else { return }
+        var image: UIImage?
+        if let blob {
+          image = ChatListCell.decodeBridgeGridImage(blob: blob)
+        }
+        if image == nil, let thumbB64,
+          let data = Data(base64Encoded: thumbB64, options: [.ignoreUnknownCharacters])
+        {
+          image = UIImage(data: data)
+        }
+        guard let image else { return }
         ChatListCell.bridgeGridImageCache.setObject(image, forKey: cacheKey)
         DispatchQueue.main.async {
           guard let self,
@@ -8228,6 +8952,18 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         }
       }
     }
+  }
+
+  @objc private func handleMediaGridTileTap(_ gr: UITapGestureRecognizer) {
+    guard let row, let tile = gr.view as? UIImageView else { return }
+    // Don't open while upload/download overlay is active — cancel path owns the center.
+    if row.shouldShowUploadOverlay || mediaIsDownloading { return }
+    onMediaGridTileTap?(row, tile.tag, tile)
+  }
+
+  /// Public entry for gallery/filmstrip seeding from sealed bridge blobs.
+  static func decodeBridgeGridImagePublic(blob: String) -> UIImage? {
+    decodeBridgeGridImage(blob: blob)
   }
 
   /// Open one sealed arte1 image blob into a tile-sized UIImage. Returns nil when the
@@ -8391,7 +9127,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   private func configureMediaPresentation(
-    for row: ChatListRow, textColor: UIColor, metaColor: UIColor
+    for row: ChatListRow,
+    textColor: UIColor,
+    metaColor: UIColor,
+    preservedMediaImage: UIImage?
   ) {
     let isTransparentSticker = isTransparentStickerMessage(row)
     if row.visualKind != .sticker {
@@ -8408,7 +9147,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaDurationBadge.isHidden = true
     mediaImageView.isHidden = true
     mediaStickerAnimationView.isHidden = true
-    mediaImageView.image = nil
+    mediaImageView.image = preservedMediaImage
     mediaImageTask?.cancel()
     mediaImageTask = nil
     mediaPrimaryIconView.image = nil
@@ -8505,19 +9244,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         mediaDetailLabel.text = "\(formatBubbleDuration(seconds: row.duration)) \u{2022}"
         mediaWaveformView.setWaveform(row.waveform)
         mediaWaveformView.applyColors(
-          active: textColor.withAlphaComponent(0.95),
-          inactive: textColor.withAlphaComponent(0.34)
+          active: appearance.accent.withAlphaComponent(0.98),
+          inactive: appearance.accent.withAlphaComponent(0.34)
         )
       }
-      let incomingVoiceStyle = resolvedIncomingVoiceButtonStyle(for: appearance)
       mediaVoiceButtonView.applyStyle(
-        fillColor: row.isMe ? UIColor(white: 1.0, alpha: 0.96) : incomingVoiceStyle.fill,
-        iconTint: row.isMe
-          ? (appearance.bubbleMeGradient.first ?? UIColor.systemBlue)
-          : incomingVoiceStyle.accent,
-        ringTint: row.isMe
-          ? textColor.withAlphaComponent(0.74)
-          : incomingVoiceStyle.accent.withAlphaComponent(0.74)
+        fillColor: appearance.accent,
+        iconTint: contrastingMediaForeground(for: appearance.accent),
+        ringTint: appearance.accent.withAlphaComponent(0.82)
       )
       let uploadProgress: CGFloat?
       if let value = row.uploadProgress, value.isFinite {
@@ -8537,13 +9271,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaPrimaryIconView.isHidden = false
       mediaPrimaryIconView.image = UIImage(systemName: "play.fill")?.withConfiguration(
         UIImage.SymbolConfiguration(pointSize: 24, weight: .bold))
-      mediaPrimaryIconView.backgroundColor = UIColor(white: 0.0, alpha: 0.28)
+      mediaPrimaryIconView.tintColor = contrastingMediaForeground(for: appearance.accent)
+      mediaPrimaryIconView.backgroundColor = appearance.accent.withAlphaComponent(0.90)
       mediaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.35)
-      let bubbleColor =
-        row.isMe ? (appearance.bubbleMeGradient.first ?? appearance.bubbleThemColor) : appearance.bubbleThemColor
       mediaBorderLayer.lineWidth = 1.0
       mediaBorderLayer.strokeColor =
-        bubbleColor.withAlphaComponent(appearance.isDark ? 0.38 : 0.32).cgColor
+        appearance.accent.withAlphaComponent(appearance.isDark ? 0.48 : 0.38).cgColor
       mediaBorderLayer.isHidden = false
 
     case .videoNote:
@@ -8551,13 +9284,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaPrimaryIconView.isHidden = false
       mediaPrimaryIconView.image = UIImage(systemName: "play.fill")?.withConfiguration(
         UIImage.SymbolConfiguration(pointSize: 26, weight: .bold))
-      mediaPrimaryIconView.backgroundColor = UIColor(white: 0.0, alpha: 0.28)
+      mediaPrimaryIconView.tintColor = contrastingMediaForeground(for: appearance.accent)
+      mediaPrimaryIconView.backgroundColor = appearance.accent.withAlphaComponent(0.90)
       mediaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.4)
-      let bubbleColor =
-        row.isMe ? (appearance.bubbleMeGradient.first ?? appearance.bubbleThemColor) : appearance.bubbleThemColor
       mediaBorderLayer.lineWidth = 1.0
       mediaBorderLayer.strokeColor =
-        bubbleColor.withAlphaComponent(appearance.isDark ? 0.42 : 0.34).cgColor
+        appearance.accent.withAlphaComponent(appearance.isDark ? 0.52 : 0.40).cgColor
       mediaBorderLayer.isHidden = false
 
     case .media, .sticker:
@@ -8609,6 +9341,47 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     configureMediaGrid(for: row)
+    // Composer/agent sealed blobs + durable thumbs — always try to fill the hero so the
+    // list never shows an empty media shell (even when a remote mediaUrl is present but
+    // network hasn't finished; thumb paints first).
+    if row.visualKind == .media, chatMediaGridImageCount(row) <= 1,
+      mediaImageView.image == nil,
+      !row.agentBridgeAttachmentsEnc.isEmpty
+        || !row.attachmentThumbnailsB64.isEmpty
+        || (row.thumbnailBase64?.isEmpty == false)
+    {
+      mediaImageView.isHidden = false
+      mediaPrimaryIconView.isHidden = true
+      let rowKey = row.messageId ?? row.key
+      let cacheKey = "\(rowKey)#hero-blob" as NSString
+      if let cached = ChatListCell.bridgeGridImageCache.object(forKey: cacheKey) {
+        mediaImageView.image = cached
+      } else {
+        let firstBlob = row.agentBridgeAttachmentsEnc.first
+        let thumbB64 = row.attachmentThumbnailsB64.first ?? row.thumbnailBase64
+        ChatListCell.bridgeGridDecodeQueue.async { [weak self] in
+          var image: UIImage?
+          if let firstBlob {
+            image = ChatListCell.decodeBridgeGridImage(blob: firstBlob)
+          }
+          if image == nil, let thumbB64 {
+            image = chatMediaImage(fromBase64: thumbB64)
+          }
+          guard let image else {
+            return
+          }
+          ChatListCell.bridgeGridImageCache.setObject(image, forKey: cacheKey)
+          DispatchQueue.main.async {
+            guard let self, (self.row?.messageId ?? self.row?.key) == rowKey else { return }
+            if self.mediaImageView.image == nil {
+              self.mediaImageView.image = image
+            }
+            self.mediaImageView.isHidden = false
+            self.mediaPrimaryIconView.isHidden = true
+          }
+        }
+      }
+    }
 
     chatCellDebugLog(
       chatCellMediaDebugLogs,
@@ -8621,7 +9394,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     )
 
     if mediaImageView.isHidden || row.mediaUrl == nil {
-      if row.visualKind != .text && row.visualKind != .voice && row.visualKind != .sticker {
+      if row.visualKind != .text && row.visualKind != .voice && row.visualKind != .sticker,
+        !chatRowHasBridgeImageBlobsOnly(row)
+      {
         chatCellDebugLog(
           chatCellMediaDebugLogs,
           "[ChatMediaLoad] SKIP-LOAD msgId=%@ type=%@ imgHidden=%@ mediaUrl=%@",
@@ -8633,12 +9408,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       }
     }
     var preferredLocalMediaURL: String?
-    if !mediaImageView.isHidden {
+    // Image-like media must always enter the load path even if mediaImageView was left
+    // hidden by a prior branch (empty shells were "photo" icons forever).
+    let forceImageLoad =
+      row.visualKind == .media && row.messageType != "file"
+      || row.visualKind == .video || row.visualKind == .videoNote
+    if forceImageLoad {
+      mediaImageView.isHidden = false
+    }
+    if !mediaImageView.isHidden || forceImageLoad {
       let prefersVideoPreview = row.visualKind == .video || row.visualKind == .videoNote
       if mediaImageView.image == nil {
         let thumbCacheKey = "thumb-\(row.key)" as NSString
         if let cachedThumb = chatMediaImageCache.object(forKey: thumbCacheKey) {
           applyResolvedMediaPreviewImage(cachedThumb, for: row, mediaURL: row.mediaUrl ?? row.key)
+          mediaPrimaryIconView.isHidden = true
           chatCellDebugLog(
             chatCellMediaDebugLogs,
             "[ChatMediaLoad] thumbnail memory OK msgId=%@ type=%@ hasUrl=%@",
@@ -8646,16 +9430,23 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             row.messageType,
             row.mediaUrl == nil ? "N" : "Y"
           )
-        } else if let thumbnailImage = chatMediaImage(fromBase64: row.thumbnailBase64) {
-          chatMediaImageCache.setObject(thumbnailImage, forKey: thumbCacheKey)
-          applyResolvedMediaPreviewImage(thumbnailImage, for: row, mediaURL: row.mediaUrl ?? row.key)
-          chatCellDebugLog(
-            chatCellMediaDebugLogs,
-            "[ChatMediaLoad] thumbnail metadata OK msgId=%@ type=%@ hasUrl=%@",
-            row.messageId ?? "-",
-            row.messageType,
-            row.mediaUrl == nil ? "N" : "Y"
-          )
+        } else {
+          let thumbSource =
+            row.thumbnailBase64
+            ?? row.attachmentThumbnailsB64.first
+          if let thumbnailImage = chatMediaImage(fromBase64: thumbSource) {
+            chatMediaImageCache.setObject(thumbnailImage, forKey: thumbCacheKey)
+            applyResolvedMediaPreviewImage(
+              thumbnailImage, for: row, mediaURL: row.mediaUrl ?? row.key)
+            mediaPrimaryIconView.isHidden = true
+            chatCellDebugLog(
+              chatCellMediaDebugLogs,
+              "[ChatMediaLoad] thumbnail metadata OK msgId=%@ type=%@ hasUrl=%@",
+              row.messageId ?? "-",
+              row.messageType,
+              row.mediaUrl == nil ? "N" : "Y"
+            )
+          }
         }
       }
       preferredLocalMediaURL = {
@@ -8808,18 +9599,39 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
               guard let self = self, let data = data else {
                 return
               }
-              let decodedData = chatMediaDecryptedDataIfNeeded(data, mediaKey: effectiveMediaKey)
-              guard let safeData = decodedData,
-                let image = chatMediaPreviewImage(
-                  from: safeData,
+              // Always try: (1) mediaKey decrypt (2) raw bytes (3) strip any wrapper.
+              // Wrong/stale mediaKey previously left empty cells forever when only (1) ran.
+              let decrypted = chatMediaDecryptedDataIfNeeded(data, mediaKey: effectiveMediaKey)
+              var candidates: [Data] = []
+              if let decrypted { candidates.append(decrypted) }
+              if decrypted == nil || decrypted?.count != data.count || decrypted != data {
+                candidates.append(data)
+              }
+              // Dedup by count+prefix so we don't decode the same buffer twice.
+              var seen = Set<String>()
+              candidates = candidates.filter { d in
+                let sig =
+                  "\(d.count):\(d.prefix(8).map { String(format: "%02x", $0) }.joined())"
+                return seen.insert(sig).inserted
+              }
+              var previewImage: UIImage?
+              var safeData: Data?
+              for candidate in candidates {
+                if let image = chatMediaPreviewImage(
+                  from: candidate,
                   shouldAnimate: shouldAnimateMedia,
                   cacheKey: cacheKey,
                   urlString: urlStr,
                   fileName: row.fileName,
                   messageType: row.messageType,
                   preferVideoPreview: prefersVideoPreview
-                )
-              else {
+                ) {
+                  previewImage = image
+                  safeData = candidate
+                  break
+                }
+              }
+              guard let image = previewImage, let safeData else {
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
                 let bodyPreview = String(data: data, encoding: .utf8) ?? "nil"
                 chatCellDebugLog(
@@ -8833,8 +9645,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
                   row.fileName ?? "-",
                   row.thumbnailBase64 == nil ? "N" : "Y",
                   String(bodyPreview.prefix(200)),
-                  chatMediaHeaderSummary(from: decodedData ?? data))
-                chatMediaFailedURLs.insert(cacheKey)
+                  chatMediaHeaderSummary(from: decrypted ?? data))
+                // Don't permanent-fail if we at least have a durable thumb — cell can show it.
+                if row.thumbnailBase64 == nil && row.attachmentThumbnailsB64.isEmpty {
+                  chatMediaFailedURLs.insert(cacheKey)
+                }
                 return
               }
               chatCellDebugLog(
@@ -8842,13 +9657,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
                 "[ChatMediaLoad] network fetch OK msgId=%@ type=%@ bytes=%d url=%@",
                 row.messageId ?? "-",
                 row.messageType,
-                data.count,
+                safeData.count,
                 shortUrl
               )
               chatMediaImageCache.setObject(image, forKey: cacheKey as NSString)
               chatMediaDiskCacheSave(safeData, forKey: cacheKey)
               DispatchQueue.main.async {
+                guard
+                  let currentRow = self.row,
+                  (currentRow.messageId ?? currentRow.key) == (row.messageId ?? row.key),
+                  currentRow.mediaUrl == row.mediaUrl,
+                  currentRow.localMediaUrl == row.localMediaUrl,
+                  currentRow.mediaKey == row.mediaKey
+                else { return }
                 self.applyResolvedMediaPreviewImage(image, for: row, mediaURL: naturalSizeURL)
+                self.mediaPrimaryIconView.isHidden = true
               }
             }
             mediaImageTask?.resume()
@@ -8912,6 +9735,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaURL: String
   ) {
     mediaImageView.image = image
+    mediaImageView.isHidden = false
+    // Drop the SF Symbol "photo" placeholder the moment real pixels land.
+    if row.visualKind == .media || row.visualKind == .video || row.visualKind == .videoNote {
+      mediaPrimaryIconView.isHidden = true
+    }
     reportNaturalMediaSizeIfNeeded(for: row, mediaURL: mediaURL, image: image)
     updateMediaPlaceholderVisibility()
     if let metrics = cachedLayoutMetrics,
@@ -8925,6 +9753,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private func layoutMediaSubviews(for row: ChatListRow, in bounds: CGRect) {
     let width = bounds.width
     let height = bounds.height
+    let appearanceShape = chatAppearanceBubbleShape(row.shape, appearance: appearance)
 
     let isTransparentSticker = isTransparentStickerMessage(row)
     let isFullBleed = usesFullBleedMediaLayout(row)
@@ -8951,10 +9780,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         fullBleedMaskLayer.path =
           bubbleRoundedPath(
             rect: mediaContainerView.bounds,
-            topLeft: row.shape.borderTopLeftRadius,
-            topRight: row.shape.borderTopRightRadius,
-            bottomRight: row.shape.borderBottomRightRadius,
-            bottomLeft: row.shape.borderBottomLeftRadius
+            topLeft: appearanceShape.borderTopLeftRadius,
+            topRight: appearanceShape.borderTopRightRadius,
+            bottomRight: appearanceShape.borderBottomRightRadius,
+            bottomLeft: appearanceShape.borderBottomLeftRadius
           ).cgPath
         mediaContainerView.layer.mask = fullBleedMaskLayer
       }
@@ -8966,8 +9795,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       fullBleedMaskLayer.path =
         bubbleRoundedPath(
           rect: mediaContainerView.bounds,
-          topLeft: max(4.0, row.shape.borderTopLeftRadius - mediaCaptionEdgeInset),
-          topRight: max(4.0, row.shape.borderTopRightRadius - mediaCaptionEdgeInset),
+          topLeft: max(2.0, appearanceShape.borderTopLeftRadius - mediaCaptionEdgeInset),
+          topRight: max(2.0, appearanceShape.borderTopRightRadius - mediaCaptionEdgeInset),
           bottomRight: 5.0,
           bottomLeft: 5.0
         ).cgPath
@@ -8991,10 +9820,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         mediaBorderLayer.path =
           bubbleRoundedPath(
             rect: borderBounds,
-            topLeft: max(0.0, row.shape.borderTopLeftRadius - borderInset),
-            topRight: max(0.0, row.shape.borderTopRightRadius - borderInset),
-            bottomRight: max(0.0, row.shape.borderBottomRightRadius - borderInset),
-            bottomLeft: max(0.0, row.shape.borderBottomLeftRadius - borderInset)
+            topLeft: max(0.0, appearanceShape.borderTopLeftRadius - borderInset),
+            topRight: max(0.0, appearanceShape.borderTopRightRadius - borderInset),
+            bottomRight: max(0.0, appearanceShape.borderBottomRightRadius - borderInset),
+            bottomLeft: max(0.0, appearanceShape.borderBottomLeftRadius - borderInset)
           ).cgPath
       } else {
         mediaBorderLayer.path =
@@ -9280,73 +10109,6 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if row.shouldShowUploadOverlay || mediaIsDownloading {
       onVoiceUploadCancelTap?(row)
     }
-  }
-
-  @objc private func handleTallToggleTap() {
-    guard let messageId = tallToggleRowMessageId, !messageId.isEmpty else {
-      NSLog("[TallToggle] tap DROPPED in cell — no row id (row=%@)", row?.key ?? "<nil>")
-      return
-    }
-    NSLog(
-      "[TallToggle] tap id=%@ handler=%@", String(messageId.prefix(24)),
-      onAgentAction == nil ? "MISSING" : "ok")
-    onAgentAction?(["type": "toggleTallBubble", "messageId": messageId])
-  }
-
-  /// "Show more ⌄" / "Show less ⌃" in the bubble's own text color (the old accent-blue
-  /// link text was invisible against some bubble fills and looked like an inert label).
-  private func styleTallToggle(collapsed: Bool, color: UIColor) {
-    tallToggleButton.setTitle(collapsed ? "Show more" : "Show less", for: .normal)
-    tallToggleButton.setTitleColor(color, for: .normal)
-    tallToggleButton.tintColor = color
-    let symbolConfig = UIImage.SymbolConfiguration(pointSize: 10.0, weight: .semibold)
-    tallToggleButton.setImage(
-      UIImage(systemName: collapsed ? "chevron.down" : "chevron.up", withConfiguration: symbolConfig),
-      for: .normal)
-    // Chevron trails the label.
-    tallToggleButton.semanticContentAttribute = .forceRightToLeft
-    tallToggleButton.imageEdgeInsets = UIEdgeInsets(top: 0.0, left: 5.0, bottom: 0.0, right: -5.0)
-  }
-
-  /// Soft bottom fade on a tall-collapsed bubble's clipped content, so the cap reads as
-  /// "content continues below" instead of a hard chop against the Show-more bar.
-  private func applyTallFadeMask(to view: UIView, enabled: Bool) {
-    guard enabled, view.bounds.height > 1.0 else {
-      if view.layer.mask != nil { view.layer.mask = nil }
-      return
-    }
-    let mask = (view.layer.mask as? CAGradientLayer) ?? CAGradientLayer()
-    let height = view.bounds.height
-    // Eased (not linear) fade: content stays fully readable until the last ~80pt, then
-    // melts out gently, hitting fully transparent only at the very bottom lip — right
-    // where the Show more bar sits below. A linear ramp reads as a smoked-glass band;
-    // this reads as paper trailing off.
-    let fadeHeight: CGFloat = min(80.0, height * 0.35)
-    let start = Double(max(0.0, 1.0 - fadeHeight / height))
-    let span = 1.0 - start
-    mask.colors = [
-      UIColor.black.cgColor,
-      UIColor.black.cgColor,
-      UIColor.black.withAlphaComponent(0.88).cgColor,
-      UIColor.black.withAlphaComponent(0.62).cgColor,
-      UIColor.black.withAlphaComponent(0.30).cgColor,
-      UIColor.black.withAlphaComponent(0.08).cgColor,
-      UIColor.clear.cgColor,
-    ]
-    mask.locations = [
-      0.0,
-      NSNumber(value: start),
-      NSNumber(value: start + span * 0.30),
-      NSNumber(value: start + span * 0.55),
-      NSNumber(value: start + span * 0.75),
-      NSNumber(value: start + span * 0.90),
-      1.0,
-    ]
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    mask.frame = view.bounds
-    CATransaction.commit()
-    view.layer.mask = mask
   }
 
   @objc private func handleInlineVideoMuteTap() {
@@ -10401,9 +11163,8 @@ final class BubbleTailView: UIView {
     isMe: Bool,
     accent accentOverride: UIColor? = nil
   ) {
-    let agentColor =
-      accentOverride
-      ?? appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+    // Accent kept for API parity with body agent style; them fill no longer washes with it.
+    _ = accentOverride
     let hasWallpaperBackdrop =
       wallpaperSnapshot != nil
       && wallpaperContainerSize.width > 1.0
@@ -10413,38 +11174,32 @@ final class BubbleTailView: UIView {
     CATransaction.begin()
     CATransaction.setDisableActions(true)
 
+    // Match bubble body: them tails use the same stable wallpaper plate (no agent wash
+    // recolor). Me tails keep the shared me gradient path.
     if !isMe {
-      if hasWallpaperBackdrop {
-        gradientLayer.isHidden = true
-        gradientLayer.opacity = 0.0
-        let plateColor = appearance.agentWallpaperPlateColor(
-          isMe: false,
-          sampleRect: wallpaperSampleRect,
-          containerSize: wallpaperContainerSize,
-          accent: agentColor
-        )
-        fillLayer.fillColor = plateColor.withAlphaComponent(appearance.incomingPlateFillOpacity).cgColor
-        blurView.alpha = 0.0
-      } else {
-        gradientLayer.isHidden = false
-        gradientLayer.colors = [
-          agentColor.withAlphaComponent(0.18).cgColor,
-          agentColor.withAlphaComponent(0.06).cgColor,
-        ]
-        gradientLayer.opacity = 0.62
-        blurView.alpha = 0.38
-      }
+      gradientLayer.isHidden = true
+      gradientLayer.opacity = 0.0
+      let plateSample =
+        wallpaperSampleRect.width > 1 && wallpaperSampleRect.height > 1
+        ? wallpaperSampleRect
+        : CGRect(x: 0, y: 0, width: 1, height: 1)
+      let plateContainer =
+        wallpaperContainerSize.width > 1 && wallpaperContainerSize.height > 1
+        ? wallpaperContainerSize
+        : CGSize(width: 1, height: 1)
+      let plateColor = appearance.wallpaperPlateColor(
+        isMe: false,
+        sampleRect: plateSample,
+        containerSize: plateContainer
+      )
+      fillLayer.fillColor = plateColor.withAlphaComponent(appearance.incomingPlateFillOpacity).cgColor
+      blurView.alpha = 0.0
     } else {
       if hasWallpaperBackdrop {
         gradientLayer.isHidden = true
         gradientLayer.opacity = 0.0
-        let plateColor = appearance.agentWallpaperPlateColor(
-          isMe: true,
-          sampleRect: wallpaperSampleRect,
-          containerSize: wallpaperContainerSize,
-          accent: agentColor
-        )
-        fillLayer.fillColor = plateColor.withAlphaComponent(appearance.outgoingPlateFillOpacity).cgColor
+        // Me underfill stays clear — body gradient paints the continuous ramp.
+        fillLayer.fillColor = UIColor.clear.cgColor
       } else {
         gradientLayer.isHidden = false
         gradientLayer.colors = appearance.bubbleMeGradient.map(\.cgColor)
@@ -10464,15 +11219,30 @@ final class BubbleTailView: UIView {
     containerSize: CGSize,
     sampleRect: CGRect
   ) {
+    let prevHas =
+      wallpaperSnapshot != nil
+      && wallpaperContainerSize.width > 1.0
+      && wallpaperContainerSize.height > 1.0
+    let nextHas =
+      snapshot != nil
+      && containerSize.width > 1.0
+      && containerSize.height > 1.0
+    let sampleOnly = prevHas == nextHas
     wallpaperSnapshot = snapshot
     wallpaperContainerSize = containerSize
     wallpaperSampleRect = sampleRect
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    applyTailChrome(isMe: currentIsMe, visible: !isHidden)
-    applyWallpaperBackdropLayer()
+    if sampleOnly {
+      applyWallpaperBackdropLayer()
+    } else {
+      applyTailChrome(isMe: currentIsMe, visible: !isHidden)
+      applyWallpaperBackdropLayer()
+    }
     CATransaction.commit()
-    setNeedsLayout()
+    if !sampleOnly {
+      setNeedsLayout()
+    }
   }
 
   override func layoutSubviews() {
@@ -10583,45 +11353,49 @@ final class BubbleTailView: UIView {
         : 1.0
     )
     blurView.effect = UIBlurEffect(style: isMe ? .systemThinMaterialDark : .systemMaterialDark)
+    // Same as body: them plate is stable with/without wallpaper (no solid→plate flash).
     let materialAlpha: CGFloat
     if hasWallpaperBackdrop {
       materialAlpha = 0.0
     } else if isMe {
       materialAlpha = 0.34
     } else {
-      materialAlpha = appearance.isDark ? 0.44 : 0.0
+      materialAlpha = 0.0
     }
     blurView.alpha = materialAlpha
-    if hasWallpaperBackdrop {
-      gradientLayer.isHidden = true
-      gradientLayer.opacity = 0.0
-      let plateColor = appearance.wallpaperPlateColor(
-        isMe: isMe,
-        sampleRect: wallpaperSampleRect,
-        containerSize: wallpaperContainerSize
-      )
-      let plateAlpha = isMe ? appearance.outgoingPlateFillOpacity : appearance.incomingPlateFillOpacity
-      fillLayer.fillColor = plateColor.withAlphaComponent(plateAlpha).cgColor
-    } else {
-      // Fill the tail with a SOLID color that matches the bubble body at the tail junction
-      // instead of giving the tail its own gradient. The tail view is rotated 26.5°, so a
-      // gradient painted in its local space samples a *different* point of the ramp than the
-      // body edge it butts against — that mismatch is the visible color seam + washed /
-      // "reduced opacity" look. The junction sits at the body's gradient end (bottom-right
-      // for me → last stop), so a solid last-stop color at the body's own 0.88 gradient
-      // opacity, over the same blur, reads as one continuous shape.
-      gradientLayer.isHidden = true
-      gradientLayer.opacity = 0.0
-      if isMe {
-        let junction =
-          appearance.bubbleMeGradient.last
-          ?? appearance.bubbleMeGradient.first
-          ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
-        fillLayer.fillColor = junction.withAlphaComponent(0.88).cgColor
+    gradientLayer.isHidden = true
+    gradientLayer.opacity = 0.0
+    if isMe {
+      // Body paints the shared me gradient; tail junction stays a solid mid plate so
+      // the rotated lobe doesn't desync from the continuous ramp.
+      if hasWallpaperBackdrop {
+        let plateColor = appearance.wallpaperPlateColor(
+          isMe: true,
+          sampleRect: wallpaperSampleRect,
+          containerSize: wallpaperContainerSize
+        )
+        fillLayer.fillColor = plateColor.withAlphaComponent(appearance.outgoingPlateFillOpacity)
+          .cgColor
       } else {
         fillLayer.fillColor =
-          appearance.bubbleThemColor.withAlphaComponent(appearance.isDark ? 0.86 : 1.0).cgColor
+          appearance.outgoingBasePlateColor.withAlphaComponent(0.88).cgColor
       }
+    } else {
+      let plateSample =
+        wallpaperSampleRect.width > 1 && wallpaperSampleRect.height > 1
+        ? wallpaperSampleRect
+        : CGRect(x: 0, y: 0, width: 1, height: 1)
+      let plateContainer =
+        wallpaperContainerSize.width > 1 && wallpaperContainerSize.height > 1
+        ? wallpaperContainerSize
+        : CGSize(width: 1, height: 1)
+      let plateColor = appearance.wallpaperPlateColor(
+        isMe: false,
+        sampleRect: plateSample,
+        containerSize: plateContainer
+      )
+      fillLayer.fillColor = plateColor.withAlphaComponent(appearance.incomingPlateFillOpacity)
+        .cgColor
     }
 
     // For 'me': rotate CW 26.565° (tail curves right at bottom-right of bubble)

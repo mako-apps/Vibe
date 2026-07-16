@@ -243,6 +243,10 @@ struct ChatListRow {
     let leadWorker: String?
     let teamRole: String?
     let suppressVisible: Bool
+    // Supervisor team runs render NO agent text bubble — only the progress runner
+    // cell + per-worker rows. The lead's final summary is the only prose. Server
+    // sets this true when teamMode == supervisor.
+    let suppressAllText: Bool
     let teamWorkersStatus: [TeamWorkerStatus]
     let computerId: String?
     let computerLabel: String?
@@ -546,6 +550,8 @@ struct ChatListRow {
   // E2E-encrypted bridge image attachments (phone-held key); rendered locally in the
   // agent surface and relayed to the desktop bridge as opaque ciphertext.
   let agentBridgeAttachmentsEnc: [String]
+  /// Server-persisted JPEG thumbs for multi-image agent sends (blobs are stripped on persist).
+  let attachmentThumbnailsB64: [String]
   let agentActionSourceText: String?
   let agentRegeneratePrompt: String?
   let agentCard: AgentCard?
@@ -598,6 +604,11 @@ struct ChatListRow {
     }
     if isVideoNote {
       return .videoNote
+    }
+    // Sealed Claude/Codex image blobs (or durable thumbs after reopen) ride on
+    // messages that must render as media, not bare text.
+    if !agentBridgeAttachmentsEnc.isEmpty || !attachmentThumbnailsB64.isEmpty {
+      return .media
     }
     let inferredVideo = isVideoMediaReference(mediaUrl: mediaUrl, fileName: fileName)
     let inferredImage = isImageMediaReference(mediaUrl: mediaUrl, fileName: fileName)
@@ -786,6 +797,7 @@ struct ChatListRow {
       agentActionSourceId = nil
       agentBridgeResumeSessionId = nil
       agentBridgeAttachmentsEnc = []
+      attachmentThumbnailsB64 = []
       agentActionSourceText = nil
       agentRegeneratePrompt = nil
       agentCard = nil
@@ -1030,6 +1042,12 @@ struct ChatListRow {
         + parseStringArray(message["agent_bridge_attachments_enc"])
         + parseStringArray(message["attachmentsEnc"])
         + parseStringArray(message["attachments_enc"])
+    )
+    attachmentThumbnailsB64 = uniqueStrings(
+      parseStringArray(metadata?["attachmentThumbnailsB64"])
+        + parseStringArray(metadata?["attachment_thumbnails_b64"])
+        + parseStringArray(message["attachmentThumbnailsB64"])
+        + parseStringArray(message["attachment_thumbnails_b64"])
     )
     agentActionSourceText = firstNonEmptyString(
       in: [metadata, message],
@@ -1395,9 +1413,16 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.status == rhs.status
     && lhs.isEdited == rhs.isEdited && lhs.isPinned == rhs.isPinned
     && lhs.messageId == rhs.messageId && lhs.reactionEmoji == rhs.reactionEmoji
-    && lhs.replyToId == rhs.replyToId
-    && lhs.replyPreviewTitle == rhs.replyPreviewTitle
-    && lhs.replyPreviewText == rhs.replyPreviewText
+    // Render-aware: agent-turn bubbles never render reply bands (zero replyPreview
+    // reads in the whole VibeAgentKit stack), and reply fields on agent rows are
+    // pipeline-unstable — they ride only the live delivery, so history/store copies
+    // flip nil↔value forever after. Comparing them repaints (and re-measures) rows
+    // whose rendered pixels are identical: the mode=batch changed=73 post-push
+    // flicker/shift on every reply-heavy team-chat open.
+    && (lhs.isAgentMessage
+      || (lhs.replyToId == rhs.replyToId
+        && lhs.replyPreviewTitle == rhs.replyPreviewTitle
+        && lhs.replyPreviewText == rhs.replyPreviewText))
     && lhs.messageType == rhs.messageType
     && lhs.mediaUrl == rhs.mediaUrl && lhs.localMediaUrl == rhs.localMediaUrl
     && lhs.mediaKey == rhs.mediaKey && lhs.fileName == rhs.fileName
@@ -1437,6 +1462,57 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.hiddenFromTranscript == rhs.hiddenFromTranscript
     && lhs.isDeliveryFailed == rhs.isDeliveryFailed
     && lhs.isAgentError == rhs.isAgentError
+}
+
+/// Stable (cross-launch) FNV-1a hash — used for persisted-height validation.
+private func chatListStableHashHex(_ string: String) -> String {
+  var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+  for byte in string.utf8 {
+    hash ^= UInt64(byte)
+    hash = hash &* 0x0000_0100_0000_01b3
+  }
+  return String(hash, radix: 16)
+}
+
+/// Content signature covering the SAME fields as `chatListRowContentEqual` above —
+/// keep the two in sync. Rows with equal signatures must have equal layout inputs,
+/// so a disk-persisted measured height may be reused across launches. Complex value
+/// fields go through `String(describing:)`, which is deterministic for the value
+/// types ChatListRow stores; a mismatch is always safe (the row is just re-measured).
+func chatListRowContentSignature(_ row: ChatListRow) -> String {
+  let joined = [
+    String(describing: row.kind), row.key, row.label, row.text, row.timestamp,
+    String(row.isMe), String(describing: row.status), String(row.isEdited),
+    String(row.isPinned), String(describing: row.messageId),
+    String(describing: row.reactionEmoji),
+    // Keep in sync with chatListRowContentEqual: reply fields are render-inert and
+    // pipeline-unstable on agent rows — a stable placeholder keeps persisted heights
+    // valid across the nil↔value flips (was: 8 reason=sig promote misses per open).
+    row.isAgentMessage ? "-" : String(describing: row.replyToId),
+    row.isAgentMessage ? "-" : String(describing: row.replyPreviewTitle),
+    row.isAgentMessage ? "-" : String(describing: row.replyPreviewText),
+    row.messageType, String(describing: row.mediaUrl), String(describing: row.localMediaUrl),
+    String(describing: row.mediaKey), String(describing: row.fileName),
+    String(describing: row.duration), String(row.isVideoNote),
+    String(describing: row.waveform), String(describing: row.uploadProgress),
+    String(describing: row.fileSize), String(describing: row.shape),
+    String(describing: row.stickerId), String(describing: row.stickerPackId),
+    String(describing: row.stickerBundleFileName), String(row.isAgentMessage),
+    String(describing: row.agentName), String(describing: row.agentId),
+    String(describing: row.agentUserId), String(describing: row.agentUsername),
+    String(describing: row.plainContent), String(row.isStreamingText),
+    String(describing: row.agentProgressNodes), String(describing: row.agentActionSourceId),
+    String(describing: row.agentActionSourceText), String(describing: row.agentRegeneratePrompt),
+    String(describing: row.agentCard), String(describing: row.agentRuntime),
+    String(describing: row.agentMsgKind), String(describing: row.agentActionEnc),
+    String(describing: row.agentActionsEnc), String(describing: row.relatedMessageIds),
+    String(describing: row.relatedMessagesTitle), String(describing: row.relatedMessagesSubtitle),
+    String(row.isEventNotification), String(row.isEventInboxSummary),
+    String(describing: row.eventType), String(describing: row.eventPriority),
+    String(describing: row.eventThreadId), String(describing: row.eventInboxRole),
+    String(row.hiddenFromTranscript), String(row.isDeliveryFailed), String(row.isAgentError),
+  ].joined(separator: "\u{1F}")
+  return chatListStableHashHex(joined) + ".\(joined.utf8.count)"
 }
 
 private func progressNodeLabel(from item: [String: Any]) -> String? {
@@ -1611,6 +1687,7 @@ func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
     leadWorker: parseNonEmptyString(object["leadWorker"] ?? object["lead_worker"]),
     teamRole: parseNonEmptyString(object["teamRole"] ?? object["team_role"]),
     suppressVisible: parseBool(object["suppressVisible"] ?? object["suppress_visible"]) ?? false,
+    suppressAllText: parseBool(object["suppressAllText"] ?? object["suppress_all_text"]) ?? false,
     teamWorkersStatus: parseTeamWorkersStatus(
       object["teamWorkersStatus"] ?? object["team_workers_status"]),
     computerId: parseNonEmptyString(object["computerId"] ?? object["computer_id"]),

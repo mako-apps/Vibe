@@ -419,6 +419,15 @@ final class ChatEngine {
   // for a short grace after the last running push so a transient blip doesn't blank it.
   private var agentTurnRunningAtMsByChatId: [String: Int64] = [:]
   private static let agentTurnRunningGraceMs: Int64 = 12_000
+  // Per-session terminal latch: chatId -> (sessionId -> the tail item's content signature
+  // at the moment we saw the run finish). Presence of a sessionId key == "this session is
+  // settled; do NOT re-light its tail cell from the chat-wide running grace." Needed because
+  // the tail cell's streaming/collapsed state is otherwise widened by `agentTurnRunningAtMsByChatId`
+  // (which is chat-wide and re-stamped by transcript growth), so a post-finish runtime-card
+  // re-push would keep a done turn shimmering ~12s. The stored content sig lets a GENUINE
+  // resume (new running content) clear the latch while a stale `running=true` flip-flop with
+  // identical content does NOT (no flicker). Cleared on live evidence, set on every terminal.
+  private var bridgeSettledSessionSigByChatId: [String: [String: String]] = [:]
   // Signature of the last agent-bridge session transcript applied per chat. The bridge
   // already dedups identical pushes WITHIN a watch (rec.lastSig), but a socket flap resets
   // that and forces a full re-push of unchanged state on every reconnect — which on the
@@ -443,6 +452,22 @@ final class ChatEngine {
   // Accumulated raw CLI lines received over LAN for a task (used to keep the live
   // bubble moving when the cloud socket is mid-flap).
   private var lanProgressLinesByTask: [String: [String]] = [:]
+  // Cloud is the AUTHORITATIVE painter of a live turn's visible row: its frames
+  // carry the server-reparsed progress nodes (tool/read/edit steps), while the LAN
+  // direct mirror only carries lightweight accumulated text (progressNodes: []).
+  // If BOTH paint the same row the cell flip-flops between "text, no nodes" and
+  // "short text + N nodes" every frame → height oscillation + setRows churn. So we
+  // record when cloud last painted each task ("chatId:taskId") and let the LAN
+  // mirror paint only as a FALLBACK once cloud has gone silent past the reclaim
+  // window (bridge→server relay dead but the direct link still alive).
+  private var cloudProgressAtMsByTask: [String: Int64] = [:]
+  // A long agent turn goes minutes between cloud frames while the model thinks or
+  // runs a tool (observed gaps: 17s, 36s, 53s, 134s). At 8s the LAN mirror reclaimed
+  // the row during every one of those gaps and repainted it text-only, so the cell
+  // flip-flopped between cloud's node feed and a LAN text blob for the whole run.
+  // The window must exceed a normal think/tool gap; cloud genuinely dying still
+  // hands over within a minute.
+  private static let lanReclaimAfterCloudSilenceMs: Int64 = 60000
 
   // Canonical row id for each in-flight bridge task (chatId -> taskId -> first-seen
   // streamId). The server's per-connection stream state is NOT durable across a
@@ -465,6 +490,10 @@ final class ChatEngine {
   // independently so opening a transcript cannot evict the rows used by the
   // History screen on its next appearance.
   private var agentBridgeHistoryListByChatProvider: [String: [String: Any]] = [:]
+  // Request ids for history LIST reads sent over the direct LAN link, awaiting a LAN
+  // reply. If the reply lands the id is removed; a 2s fallback re-issues over cloud so a
+  // silent LAN drop never leaves the History view empty.
+  private var lanHistoryPendingRequestIds: Set<String> = []
   // History can be requested while the native chat topic is still joining. Keep
   // those wire payloads here and flush them on the successful JOIN instead of
   // rejecting the view with `chat_not_joined` and making it poll.
@@ -530,6 +559,12 @@ final class ChatEngine {
   private var historyRowsRestoredFromCacheChats = Set<String>()
   private var cachedSavedMessagesResponse: [[String: Any]]?
   private var historyLoadingChats = Set<String>()
+  private var historyOlderExhaustedChats = Set<String>()
+  private var historyLoadingOlderChats = Set<String>()
+  private var historyHasMoreByChat: [String: Bool] = [:]
+  private var historyNextCursorByChat: [String: String] = [:]
+  private var historyNextCursorBoundaryByChat: [String: (messageId: String, timestampMs: Int64)] =
+    [:]
   private let nativeCallSignalDemandMs = 60_000
   private let nativeCallSignalMaxAgeMs = 45_000
   private var liveMessageRowsByChat: [String: [String: [String: Any]]] = [:]
@@ -560,7 +595,11 @@ final class ChatEngine {
   private let keyTTL: TimeInterval = 300
   private let chatHistoryCacheKeyPrefix = "vibe.ios.chatHistory.rows.v1"
   private let chatHistoryFetchLimit = 100
+  private let chatOlderHistoryFetchLimit = 60
   private let chatHistoryCacheRowLimit = 120
+  /// Durable SQLite store behind restore/store/clearCachedHistoryRowsLocked.
+  /// Only touched on `queue` (the store is not internally synchronized).
+  private let messageStore = ChatMessageStore()
 
   private init() {
     queue.setSpecific(key: queueSpecificKey, value: queueSpecificValue)
@@ -1339,6 +1378,11 @@ final class ChatEngine {
       historyFullyLoadedChats.removeAll()
       historyRowsRestoredFromCacheChats.removeAll()
       historyLoadingChats.removeAll()
+      historyOlderExhaustedChats.removeAll()
+      historyLoadingOlderChats.removeAll()
+      historyHasMoreByChat.removeAll()
+      historyNextCursorByChat.removeAll()
+      historyNextCursorBoundaryByChat.removeAll()
       cachedSavedMessagesResponse = nil
       chatPeerUserIdsByChatId.removeAll()
       friendPublicKeysByUserId.removeAll()
@@ -2057,46 +2101,83 @@ final class ChatEngine {
         wirePayload["computerId"] = computerId
       }
 
-      guard let client = phoenixClient else {
-        queueAgentBridgeHistoryRequestLocked(chatId: chatId, payload: wirePayload)
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-          self?.ensureNativeTransport(trigger: "bridge_history_no_socket")
+      // Direct-LAN fast path for LIST reads: idempotent, needs no server persistence, and
+      // works even before the cloud socket is up. Detail / current-session ingest stays on
+      // the cloud path (session render + no_current_session logic lives there).
+      if mode == "list", AgentBridgeTransport.preference != .cloud {
+        var lanPayload = wirePayload
+        lanPayload["chatId"] = chatId
+        if LanBridgeService.shared.send(type: "history_request", payload: lanPayload) {
+          lanHistoryPendingRequestIds.insert(requestId)
+          let cloudFallback = wirePayload
+          queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self else { return }
+            guard self.lanHistoryPendingRequestIds.remove(requestId) != nil else { return }
+            NSLog(
+              "[LanBridge] history list over LAN timed out req=%@ — cloud fallback",
+              String(requestId.prefix(8)))
+            _ = self.sendAgentBridgeHistoryOverCloudLocked(
+              chatId: chatId, wirePayload: cloudFallback, requestId: requestId)
+          }
+          NSLog(
+            "[LanBridge] history list sent over LAN req=%@ chat=%@",
+            String(requestId.prefix(8)), String(chatId.prefix(12)))
+          return ["accepted": true, "transport": "lan", "requestId": requestId]
         }
-        return [
-          "accepted": true,
-          "transport": "native_queued",
-          "reason": "joining_transport",
-          "requestId": requestId,
-        ]
-      }
-      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
-        queueAgentBridgeHistoryRequestLocked(chatId: chatId, payload: wirePayload)
-        joinNativeChatTopicIfNeededLocked(chatId: chatId)
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-          self?.ensureNativeTransport(trigger: "bridge_history_chat_not_joined")
-        }
-        return [
-          "accepted": true,
-          "transport": "native_queued",
-          "reason": "joining_chat",
-          "requestId": requestId,
-        ]
       }
 
-      let ref = client.push(
-        topic: chatTopic(for: chatId),
-        event: "agent-bridge-history",
-        payload: wirePayload
-      )
-      appendJournalLocked(
-        event: "native-agent-bridge-history-request",
-        payload: [
-          "chatId": chatId, "provider": provider, "mode": mode, "before": before ?? "",
-          "ref": ref,
-        ]
-      )
-      return ["accepted": true, "transport": "native", "ref": ref, "requestId": requestId]
+      return sendAgentBridgeHistoryOverCloudLocked(
+        chatId: chatId, wirePayload: wirePayload, requestId: requestId)
     }
+  }
+
+  /// Cloud (Phoenix) path for a history request — the persistence-backed source of truth.
+  /// Split out so the direct-LAN fast path can fall back here on timeout.
+  private func sendAgentBridgeHistoryOverCloudLocked(
+    chatId: String, wirePayload: [String: Any], requestId: String
+  ) -> [String: Any] {
+    guard let client = phoenixClient else {
+      queueAgentBridgeHistoryRequestLocked(chatId: chatId, payload: wirePayload)
+      DispatchQueue.global(qos: .utility).async { [weak self] in
+        self?.ensureNativeTransport(trigger: "bridge_history_no_socket")
+      }
+      return [
+        "accepted": true,
+        "transport": "native_queued",
+        "reason": "joining_transport",
+        "requestId": requestId,
+      ]
+    }
+    guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
+      queueAgentBridgeHistoryRequestLocked(chatId: chatId, payload: wirePayload)
+      joinNativeChatTopicIfNeededLocked(chatId: chatId)
+      DispatchQueue.global(qos: .utility).async { [weak self] in
+        self?.ensureNativeTransport(trigger: "bridge_history_chat_not_joined")
+      }
+      return [
+        "accepted": true,
+        "transport": "native_queued",
+        "reason": "joining_chat",
+        "requestId": requestId,
+      ]
+    }
+
+    let ref = client.push(
+      topic: chatTopic(for: chatId),
+      event: "agent-bridge-history",
+      payload: wirePayload
+    )
+    appendJournalLocked(
+      event: "native-agent-bridge-history-request",
+      payload: [
+        "chatId": chatId,
+        "provider": normalizedString(wirePayload["provider"]) ?? "",
+        "mode": normalizedString(wirePayload["mode"]) ?? "list",
+        "before": normalizedString(wirePayload["before"]) ?? "",
+        "ref": ref,
+      ]
+    )
+    return ["accepted": true, "transport": "native", "ref": ref, "requestId": requestId]
   }
 
   private func queueAgentBridgeHistoryRequestLocked(chatId: String, payload: [String: Any]) {
@@ -2444,43 +2525,82 @@ final class ChatEngine {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) ?? ""
     let provider = normalizedString(payload["provider"]) ?? ""
     let sessionId = normalizedString(payload["sessionId"] ?? payload["session_id"]) ?? ""
+    let topicHint = normalizedString(payload["topic"]) ?? ""
     guard !chatId.isEmpty, !provider.isEmpty, !sessionId.isEmpty else {
       return ["accepted": false, "reason": "invalid_session"]
     }
-    // Same session already mounted and ingested — don't re-fetch (history sheet
-    // re-taps and open-path races were reloading 019f45b0 repeatedly).
-    let already: [String: Any]? = syncOnQueue {
-      if let live = liveBridgeSessionIngestByChatId[chatId],
-        live.sessionId == sessionId,
-        lastIngestedBridgeSessionSigByChatId[chatId] != nil
-      {
-        NSLog(
-          "[ChatEngine][BridgeMount] loadSession SKIP same session chat=%@ session=%@",
-          String(chatId.suffix(12)), String(sessionId.prefix(12))
-        )
-        return ["accepted": true, "reason": "already_loaded"]
-      }
-      // Single-flight: history UI can fire pick + open + join for the same session
-      // before the first detail returns (3 concurrent details for 019f4644).
-      let now = Int64(nowMs())
-      if let inflight = sessionLoadInflightByChatId[chatId],
-        inflight.sessionId == sessionId,
-        now - inflight.atMs < 5000
-      {
-        NSLog(
-          "[ChatEngine][BridgeMount] loadSession SKIP inflight chat=%@ session=%@",
-          String(chatId.suffix(12)), String(sessionId.prefix(12))
-        )
-        return ["accepted": true, "reason": "inflight"]
-      }
-      return nil
-    }
-    if let already { return already }
 
+    // History picks originate from SwiftUI/UIKit on the main thread. The engine queue
+    // can be busy ingesting/decrypting a large bridge transcript, so synchronously
+    // entering it here freezes the tap (observed at 11s). This API is already
+    // completion-by-notification; enqueue the complete state transition so its
+    // single-flight check, topic seed, request, and live-tail registration remain
+    // ordered without ever making the caller wait for the engine queue.
     let requestId = UUID().uuidString
-    syncOnQueue {
-      sessionLoadInflightByChatId[chatId] = (sessionId: sessionId, requestId: requestId, atMs: Int64(nowMs()))
+    queue.async { [weak self] in
+      self?.loadAgentBridgeSessionIntoChatLocked(
+        chatId: chatId,
+        provider: provider,
+        sessionId: sessionId,
+        topicHint: topicHint,
+        requestId: requestId
+      )
     }
+    return [
+      "accepted": true,
+      "transport": "engine_queued",
+      "requestId": requestId,
+    ]
+  }
+
+  private func loadAgentBridgeSessionIntoChatLocked(
+    chatId: String,
+    provider: String,
+    sessionId: String,
+    topicHint: String,
+    requestId: String
+  ) {
+    dispatchPrecondition(condition: .onQueue(queue))
+
+    // Seed the History-row title immediately (including already_loaded / inflight
+    // short-circuits). Without this the header stays on "Start session" while the
+    // list is empty/loading under historical isolation.
+    seedBridgeSessionTopicLocked(chatId: chatId, topic: topicHint)
+
+    // Same session already mounted and ingested — don't re-fetch (history sheet
+    // re-taps and open-path races were reloading 019f45b0 repeatedly). Still re-emit
+    // a rows signal so the chat list re-applies its session filter and paints the
+    // already-ingested `bridge-<sessionId>-…` rows instead of an empty feed.
+    if let live = liveBridgeSessionIngestByChatId[chatId],
+      live.sessionId == sessionId,
+      lastIngestedBridgeSessionSigByChatId[chatId] != nil
+    {
+      NSLog(
+        "[ChatEngine][BridgeMount] loadSession SKIP same session chat=%@ session=%@",
+        String(chatId.suffix(12)), String(sessionId.prefix(12))
+      )
+      postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId])
+      return
+    }
+    // Single-flight: history UI can fire pick + open + join for the same session
+    // before the first detail returns (3 concurrent details for 019f4644).
+    let now = Int64(nowMs())
+    if let inflight = sessionLoadInflightByChatId[chatId],
+      inflight.sessionId == sessionId,
+      now - inflight.atMs < 5000
+    {
+      NSLog(
+        "[ChatEngine][BridgeMount] loadSession SKIP inflight chat=%@ session=%@",
+        String(chatId.suffix(12)), String(sessionId.prefix(12))
+      )
+      return
+    }
+    sessionLoadInflightByChatId[chatId] = (
+      sessionId: sessionId,
+      requestId: requestId,
+      atMs: Int64(nowMs())
+    )
+
     let result = requestAgentBridgeHistory([
       "chatId": chatId,
       "provider": provider,
@@ -2490,33 +2610,37 @@ final class ChatEngine {
       "limit": Self.bridgeSessionPageLimit,
     ])
     if (result["accepted"] as? Bool) == true {
-      let topicHint = normalizedString(payload["topic"]) ?? ""
-      syncOnQueue {
-        pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: provider)
-        // Stay subscribed: the bridge re-pushes this requestId as the transcript
-        // grows, and each re-push upserts new turns in place (live tail).
-        liveBridgeSessionIngestByChatId[chatId] = (provider: provider, sessionId: sessionId, requestId: requestId)
-        // Switching sessions invalidates prior ingest sig so the new transcript applies.
-        lastIngestedBridgeSessionSigByChatId.removeValue(forKey: chatId)
-        bridgeSessionPagingByChatId[chatId] = (
-          provider: provider, sessionId: sessionId, nextBefore: nil, hasMoreBefore: true,
-          loadingOlder: false
-        )
-        // A History pick already knows its row's title — seed it now so the header
-        // renames instantly; the detail reply re-asserts (or corrects) it on landing.
-        if !topicHint.isEmpty, bridgeSessionTopicByChatId[chatId] != topicHint {
-          bridgeSessionTopicByChatId[chatId] = topicHint
-          postChangeLocked(reason: "agentBridgeSessionTopic", userInfo: ["chatId": chatId])
-        }
-      }
+      pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: provider)
+      // Stay subscribed: the bridge re-pushes this requestId as the transcript
+      // grows, and each re-push upserts new turns in place (live tail).
+      liveBridgeSessionIngestByChatId[chatId] = (
+        provider: provider,
+        sessionId: sessionId,
+        requestId: requestId
+      )
+      // Switching sessions invalidates prior ingest sig so the new transcript applies.
+      lastIngestedBridgeSessionSigByChatId.removeValue(forKey: chatId)
+      bridgeSessionPagingByChatId[chatId] = (
+        provider: provider, sessionId: sessionId, nextBefore: nil, hasMoreBefore: true,
+        loadingOlder: false
+      )
     } else {
-      syncOnQueue {
-        if sessionLoadInflightByChatId[chatId]?.requestId == requestId {
-          sessionLoadInflightByChatId.removeValue(forKey: chatId)
-        }
+      if sessionLoadInflightByChatId[chatId]?.requestId == requestId {
+        sessionLoadInflightByChatId.removeValue(forKey: chatId)
       }
     }
-    return result
+  }
+
+  /// Apply a History-row title as soon as a session is picked (before the detail
+  /// transcript lands). Must run on the engine queue; no-ops on empty topic.
+  private func seedBridgeSessionTopicLocked(chatId: String, topic: String) {
+    dispatchPrecondition(condition: .onQueue(queue))
+    let trimmed = topic.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    if bridgeSessionTopicByChatId[chatId] != trimmed {
+      bridgeSessionTopicByChatId[chatId] = trimmed
+      postChangeLocked(reason: "agentBridgeSessionTopic", userInfo: ["chatId": chatId])
+    }
   }
 
   /// Load whatever session is CURRENTLY live for this chat — used when a Claude/Codex/Grok DM
@@ -2658,6 +2782,7 @@ final class ChatEngine {
     queue.async { [weak self] in
       guard let self else { return }
       self.liveBridgeSessionIngestByChatId.removeValue(forKey: chatId)
+      self.bridgeSettledSessionSigByChatId.removeValue(forKey: chatId)
       self.bridgeSessionPagingByChatId.removeValue(forKey: chatId)
       self.pendingBridgeSessionIngestByRequestId = self.pendingBridgeSessionIngestByRequestId.filter {
         $0.value.chatId != chatId
@@ -2920,6 +3045,9 @@ final class ChatEngine {
       // after settle (reopen-later-heals).
       if lastRawRunning {
         agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+        // Still running this session → not settled; drop any stale terminal latch so its
+        // tail cell tracks the live grace again.
+        bridgeClearSessionSettledLocked(chatId: chatId, sessionId: sessionId)
         let nodes =
           (lastRaw?["progressNodes"] as? [[String: Any]])
           ?? (lastRaw?["progress_nodes"] as? [[String: Any]]) ?? []
@@ -2935,6 +3063,13 @@ final class ChatEngine {
         // the header cleared after bridge restart recovery.
         agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
         clearAgentProgressLocked(chatId: chatId, reason: "ingestSigMatch(settled)")
+        // Latch this session settled (keyed to the tail's content sig) so a later
+        // growth re-push can't re-light the tail via the chat-wide grace, and force
+        // the already-ingested tail bridge-… row out of its streaming state now (this
+        // path RETURNs before the per-row loop, so nothing else settles the cell).
+        let tailContentSig = "\(lastRawUid):\(lastRawTextSig):\(lastRawNodeSig)"
+        bridgeMarkSessionSettledLocked(chatId: chatId, sessionId: sessionId, contentSig: tailContentSig)
+        settleBridgeTailRowStreamingLocked(chatId: chatId, sessionId: sessionId, uid: lastRawUid)
       }
       return
     }
@@ -2949,7 +3084,12 @@ final class ChatEngine {
     let previousIngestSig = lastIngestedBridgeSessionSigByChatId[chatId]
     let lastRawRole = (normalizedString(lastRaw?["role"]) ?? "").lowercased()
     if let previousIngestSig, previousIngestSig.contains(":\(sessionId):"),
-      previousIngestSig != ingestSig, lastRawRole != "user"
+      previousIngestSig != ingestSig, lastRawRole != "user",
+      // …but not once the session is terminally latched: a post-finish re-push (runtime
+      // card / final token count) is "growth" too, and re-stamping grace here would keep a
+      // done turn's tail shimmering for the whole 12s window (the settle race). A genuine
+      // resume clears the latch first (below), so this only suppresses post-finish noise.
+      !bridgeSessionIsSettledLocked(chatId: chatId, sessionId: sessionId)
     {
       agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
     }
@@ -3001,6 +3141,14 @@ final class ChatEngine {
     var sawRunningAgentItem = false
     var ingestedAgentRow = false
     var runningTurnProgressNodes: [[String: Any]] = []
+    // Only the LAST agent turn may be widened to "still streaming" through a tool/MCP gap
+    // (the per-item `running` flag drops false while a tool executes, with no item actively
+    // streaming). Older finished turns must stay collapsed. Track the tail agent item and,
+    // as we pass it, its content signature (for the terminal-latch set/clear below).
+    let tailAgentIndex = rawMessages.lastIndex {
+      (normalizedString($0["role"]) ?? "").lowercased() != "user"
+    }
+    var tailAgentContentSig = ""
 
     for (index, item) in rawMessages.enumerated() {
       let role = (normalizedString(item["role"]) ?? "").lowercased()
@@ -3103,8 +3251,36 @@ final class ChatEngine {
         // Always write the flag (true or false) so a settle re-ingest cannot leave a
         // prior `isStreaming=true` stuck on the same bridge-… id (empty cell + Thinking
         // header after the session is already done).
-        meta["isStreaming"] = isRunningTranscriptItem
-        synthetic["isStreaming"] = isRunningTranscriptItem
+        //
+        // WIDEN the TAIL agent turn: the per-item `running` flag GAPS to false during a
+        // text→tool/MCP execution window (nothing is actively streaming while the tool
+        // runs), which collapsed the live cell to "Worked for Xs · N steps" and shifted
+        // the list, then snapped back when the next node arrived. For the last agent turn
+        // only, also treat it as streaming while the chat-wide run grace is fresh (the same
+        // signal the header already uses through gaps) — unless this session is terminally
+        // latched. Older turns keep the raw per-item flag so they stay collapsed.
+        let isTailAgentItem = (index == tailAgentIndex)
+        if isTailAgentItem {
+          let itemUid = normalizedString(item["uid"] ?? item["id"]) ?? "\(index)"
+          let itemTextSig = bridgeSessionSignatureText(item["text"])
+          let itemNodeSig = bridgeSessionProgressNodesSignature(
+            item["progressNodes"] ?? item["progress_nodes"])
+          tailAgentContentSig = "\(itemUid):\(itemTextSig):\(itemNodeSig)"
+          // Genuine resume: a running tail whose content moved past the latched settle
+          // point re-opens the session. A stale `running=true` re-push with the SAME
+          // content does not (its sig matches the latch) — so no post-finish flicker.
+          if isRunningTranscriptItem,
+            let latched = bridgeSettledSessionSigByChatId[chatId]?[sessionId],
+            latched != tailAgentContentSig
+          {
+            bridgeClearSessionSettledLocked(chatId: chatId, sessionId: sessionId)
+          }
+        }
+        let streamingFlag =
+          isRunningTranscriptItem
+          || (isTailAgentItem && bridgeRunIsLiveLocked(chatId: chatId, sessionId: sessionId))
+        meta["isStreaming"] = streamingFlag
+        synthetic["isStreaming"] = streamingFlag
         // Carry the per-message E2E runtime card forward so the ingested history
         // shows the same "N files changed +X −Y" card as the live path. The blob
         // stays opaque here; ChatListRow decrypts it with the phone-held key.
@@ -3192,6 +3368,11 @@ final class ChatEngine {
           chatId: chatId, agentUserId: Self.bridgeAgentUserId(forProvider: provider))
         agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
         clearAgentProgressLocked(chatId: chatId, reason: "ingestSettle(noRunningTurn)")
+        // Latch the session settled so a subsequent growth re-push can't re-widen its
+        // tail cell (the loop already wrote isStreaming=false this push, since the grace
+        // expired). Keyed to the tail's content sig for genuine-resume detection.
+        bridgeMarkSessionSettledLocked(
+          chatId: chatId, sessionId: sessionId, contentSig: tailAgentContentSig)
       }
     }
 
@@ -4101,17 +4282,24 @@ final class ChatEngine {
           }
         }()
 
+        // CRITICAL: mediaUrl on the wire must be the durable remote URL after upload.
+        // Historically this was always NSNull, so the server persisted media_url=NULL.
+        // Encrypted payload still carried mediaUrl, but history/profile often only had
+        // a dead local path in metadata — images vanished after reopen (esp. agent groups).
         var wirePayload: [String: Any] = [
           "id": messageId,
           "encryptedContent": encryptedContent,
           "timestamp": timestampMs,
           "type": type,
           "pushPreview": pushPreview,
-          "mediaUrl": NSNull(),
-          "fileName": NSNull(),
-          "latitude": NSNull(),
-          "longitude": NSNull(),
+          "mediaUrl": finalMediaUrl as Any? ?? NSNull(),
+          "fileName": finalFileName as Any? ?? NSNull(),
+          "latitude": latitude as Any? ?? NSNull(),
+          "longitude": longitude as Any? ?? NSNull(),
         ]
+        if let finalMediaKey, !finalMediaKey.isEmpty {
+          wirePayload["mediaKey"] = finalMediaKey
+        }
         if let replyToId, !replyToId.isEmpty {
           wirePayload["replyToId"] = replyToId
         }
@@ -4142,8 +4330,21 @@ final class ChatEngine {
             wirePayload["agentText"] = agentText
           }
         }
-        if !metadata.isEmpty {
-          wirePayload["metadata"] = makeJSONSafeMap(metadata)
+        // Prefer post-upload metadata (remote mediaUrl, thumbs) over the pre-upload copy.
+        let wireMetadata =
+          (localEffectivePayload["metadata"] as? [String: Any]).flatMap { $0.isEmpty ? nil : $0 }
+          ?? (metadata.isEmpty ? nil : metadata)
+        if let wireMetadata {
+          // Never persist local-only file paths as the durable mediaUrl.
+          var cleaned = makeJSONSafeMap(wireMetadata)
+          if let remote = finalMediaUrl, !self.isLocalMediaURI(remote) {
+            cleaned["mediaUrl"] = remote
+          } else if let existing = cleaned["mediaUrl"] as? String, self.isLocalMediaURI(existing) {
+            cleaned.removeValue(forKey: "mediaUrl")
+          }
+          // Sealed agent blobs stay on the wire for bridge dispatch only — server strips them
+          // from broadcast/persist. Keep thumbs for durable list/profile after reopen.
+          wirePayload["metadata"] = cleaned
         }
 
         if var message = localOptimisticRow["message"] as? [String: Any] {
@@ -4732,6 +4933,11 @@ final class ChatEngine {
       historyRowsByChat.removeValue(forKey: chatId)
       historyFullyLoadedChats.remove(chatId)
       historyRowsRestoredFromCacheChats.remove(chatId)
+      historyOlderExhaustedChats.remove(chatId)
+      historyLoadingOlderChats.remove(chatId)
+      historyHasMoreByChat.removeValue(forKey: chatId)
+      historyNextCursorByChat.removeValue(forKey: chatId)
+      historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
       clearCachedHistoryRowsLocked(chatId: chatId)
       if chatId == "saved_messages" {
         self.cachedSavedMessagesResponse = nil
@@ -5222,8 +5428,28 @@ final class ChatEngine {
 
   func agentProgress(chatId: String?) -> [String: Any]? {
     guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return nil }
-    return syncOnQueue {
+    return syncOnQueue { () -> [String: Any]? in
       guard let state = agentProgressByChatId[chatId] else { return nil }
+      let status = state.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      // Terminal / idle statuses are not live work — never advertise them as active.
+      let terminal: Set<String> = [
+        "done", "completed", "complete", "idle", "failed", "error", "cancelled", "canceled",
+        "stopped", "settled", "success",
+      ]
+      if terminal.contains(status) {
+        return nil
+      }
+      // Stale map entries (no update for 90s) must not keep home rows on "Working…".
+      let ageMs = Int64(nowMs()) - state.updatedAtMs
+      if ageMs > 90_000 {
+        return nil
+      }
+      let activeHints = ["running", "streaming", "in_progress", "active", "thinking", "tool", "wait"]
+      let looksActive =
+        status.isEmpty
+        || activeHints.contains(where: { status.contains($0) })
+        || ageMs < 15_000
+      guard looksActive else { return nil }
       var payload: [String: Any] = [
         "label": state.label,
         "status": state.status,
@@ -5264,6 +5490,51 @@ final class ChatEngine {
     syncOnQueue {
       _ = restoreCachedHistoryRowsLocked(chatId: chatId)
       return historyFullyLoadedChats.contains(chatId)
+    }
+  }
+
+  /// True while a history fetch (initial or older page) is in flight for this chat.
+  /// Drives the chat header "Updating" phase (synced with Home list updates).
+  func isChatHistoryLoading(chatId: String) -> Bool {
+    syncOnQueue {
+      guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return false }
+      return historyLoadingChats.contains(chatId) || historyLoadingOlderChats.contains(chatId)
+    }
+  }
+
+  /// True when older transcript pages may exist below the currently-loaded window
+  /// (local store depth or a live server cursor). Cheap; callable from any thread.
+  func hasOlderChatHistory(chatId: String) -> Bool {
+    syncOnQueue {
+      guard let chatId = normalizedString(chatId), !chatId.isEmpty,
+        chatId != "saved_messages",
+        !isBuiltInAgentChatId(chatId),
+        !isVolatileBridgeAgentChatLocked(chatId: chatId),
+        !historyOlderExhaustedChats.contains(chatId),
+        let boundary = oldestHistoryBoundaryLocked(chatId: chatId)
+      else { return false }
+
+      let hasStoredOlder: Bool
+      if let userId = chatHistoryCacheUserIdLocked(), messageStore.isAvailable {
+        hasStoredOlder = messageStore.hasOlderMessages(
+          userId: userId,
+          chatId: chatId,
+          beforeTs: boundary.timestampMs,
+          beforeMessageId: boundary.messageId
+        )
+      } else {
+        hasStoredOlder = false
+      }
+      return hasStoredOlder || historyHasMoreByChat[chatId] != false
+    }
+  }
+
+  /// Loads one older transcript page from the durable store, then the server.
+  @discardableResult
+  func loadOlderChatHistory(chatId: String) -> Bool {
+    syncOnQueue {
+      guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return false }
+      return loadOlderChatHistoryLocked(chatId: chatId)
     }
   }
 
@@ -5597,6 +5868,16 @@ final class ChatEngine {
 
   // MARK: - Live agent streaming (bridge)
   //
+  /// Reconcile the phone's synthetic live rows against the bridge daemon's complete task
+  /// table. Stream/result frames remain the fast path; this authoritative snapshot is the
+  /// hard stop that prevents a missed terminal frame or socket flap from leaving a provider
+  /// or supervisor team card permanently marked running.
+  func reconcileAgentBridgeStatus(_ status: AgentBridgeStatus, source: String) {
+    queue.async { [weak self] in
+      self?.reconcileAgentBridgeStatusLocked(status, source: source)
+    }
+  }
+
   /// Ingest a frame mirrored over the direct Mac LAN link (progress / result).
   /// Cloud `agent-stream` remains authoritative for full tool/node parse; LAN keeps
   /// the live bubble moving during cloud flaps (sequence-deduped).
@@ -5609,6 +5890,8 @@ final class ChatEngine {
   private func ingestLanBridgeEventLocked(type: String, payload: [String: Any]) {
     let kind = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     switch kind {
+    case "history_result", "agent-bridge-history":
+      applyLanHistoryResultLocked(payload)
     case "progress":
       ingestLanProgressLocked(payload)
     case "result":
@@ -5620,11 +5903,150 @@ final class ChatEngine {
       {
         let key = "\(provider):\(chatId):\(taskId)"
         lanProgressLinesByTask.removeValue(forKey: key)
+        cloudProgressAtMsByTask.removeValue(forKey: "\(chatId):\(taskId)")
         // Don't wipe seq immediately — cloud may still deliver frames with lower seq.
+        let exitStatus = Int(parseLongValue(payload["exitStatus"] ?? payload["exit_status"]) ?? 0)
+        let terminalStatus = exitStatus == 0 ? "done" : (exitStatus == 130 ? "stopped" : "error")
+        // A supervisor's lead process can finish while one of its worker processes is
+        // still active. The bridge-status snapshot carries the whole team task table and
+        // is therefore the terminal authority for team cards; solo tasks can settle from
+        // their direct result immediately.
+        if normalizedString(payload["teamRunId"] ?? payload["team_run_id"]) == nil {
+          settleAgentBridgeTaskLocked(
+            chatId: chatId,
+            taskId: taskId,
+            terminalStatus: terminalStatus,
+            reason: "lan-result"
+          )
+        }
+      }
+    case "status", "bridge_status":
+      DispatchQueue.main.async {
+        AgentPairingService.ingestLanStatusSnapshot(payload)
       }
     default:
       break
     }
+  }
+
+  private func reconcileAgentBridgeStatusLocked(
+    _ status: AgentBridgeStatus,
+    source: String
+  ) {
+    // A disconnected REST snapshot can be a transient relay outage while the CLI is
+    // still running. Only a connected daemon can authoritatively say its task table is
+    // empty. Authenticated LAN snapshots are published as connected by the parser.
+    guard status.connected else { return }
+
+    let activeTaskKeys = Set(status.runningTasks.compactMap { task -> String? in
+      let chatId = task.chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+      let taskId = task.taskId.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !chatId.isEmpty, !taskId.isEmpty else { return nil }
+      return "\(chatId)|\(taskId)"
+    })
+    let activeTeamKeys = Set(status.runningTasks.compactMap { task -> String? in
+      let chatId = task.chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+      let teamRunId = task.teamRunId?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      guard !chatId.isEmpty, !teamRunId.isEmpty else { return nil }
+      return "\(chatId)|\(teamRunId)"
+    })
+
+    var staleRows: [(chatId: String, messageId: String, taskId: String?, teamRunId: String?)] = []
+    for (chatId, perChat) in liveMessageRowsByChat {
+      for (messageId, row) in perChat {
+        guard let message = row["message"] as? [String: Any],
+          let metadata = message["metadata"] as? [String: Any]
+        else { continue }
+        let runtime = (metadata["agentRuntime"] as? [String: Any]) ?? [:]
+        let isStreaming =
+          (message["isStreaming"] as? Bool) == true
+          || (metadata["isStreaming"] as? Bool) == true
+        let runtimeStatus = (normalizedString(runtime["status"]) ?? "").lowercased()
+        let runtimeIsLive = ["running", "starting", "pending", "active", "streaming"]
+          .contains(runtimeStatus)
+        guard isStreaming || runtimeIsLive else { continue }
+
+        let taskId = normalizedString(
+          runtime["taskId"] ?? runtime["task_id"]
+            ?? metadata["agentTaskId"] ?? metadata["agent_task_id"])
+        let teamRunId = normalizedString(runtime["teamRunId"] ?? runtime["team_run_id"])
+        guard taskId != nil || teamRunId != nil else { continue }
+        if let taskId, activeTaskKeys.contains("\(chatId)|\(taskId)") { continue }
+        if let teamRunId, activeTeamKeys.contains("\(chatId)|\(teamRunId)") { continue }
+        staleRows.append((chatId, messageId, taskId, teamRunId))
+      }
+    }
+
+    guard !staleRows.isEmpty else { return }
+    var changedChats = Set<String>()
+    for stale in staleRows {
+      if settleLiveBridgeMessageLocked(
+        chatId: stale.chatId,
+        messageId: stale.messageId,
+        terminalStatus: "done"
+      ) {
+        changedChats.insert(stale.chatId)
+      }
+      if let taskId = stale.taskId {
+        removeBridgeTaskTrackingLocked(chatId: stale.chatId, taskId: taskId)
+      }
+      if let teamRunId = stale.teamRunId,
+        liveStreamTaskRowIdByChatId[stale.chatId]?["team:\(teamRunId)"] == stale.messageId
+      {
+        liveStreamTaskRowIdByChatId[stale.chatId]?.removeValue(forKey: "team:\(teamRunId)")
+      }
+    }
+
+    for chatId in changedChats {
+      let chatStillActive = status.runningTasks.contains {
+        $0.chatId.trimmingCharacters(in: .whitespacesAndNewlines) == chatId
+      }
+      if !chatStillActive {
+        agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
+        clearAgentProgressLocked(
+          chatId: chatId,
+          status: "done",
+          reason: "bridgeStatus(\(source))"
+        )
+      }
+      storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+      postChangeLocked(
+        reason: "chatRowsReloaded",
+        userInfo: ["chatId": chatId, "state": statusSnapshotLocked()]
+      )
+    }
+    NSLog(
+      "[AgentStatus] reconciled source=%@ staleRows=%d chats=%d activeTasks=%d",
+      source, staleRows.count, changedChats.count, status.runningTasks.count)
+  }
+
+  /// A history LIST reply that arrived over the direct LAN link. Stores it exactly like
+  /// the cloud `agent-bridge-history` list branch and cancels the cloud fallback. LAN only
+  /// ever carries list reads, so the detail-ingest / no_current_session logic isn't needed.
+  private func applyLanHistoryResultLocked(_ payload: [String: Any]) {
+    guard let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) else { return }
+    let requestId = normalizedString(payload["requestId"]) ?? ""
+    if !requestId.isEmpty { lanHistoryPendingRequestIds.remove(requestId) }
+    let mode = normalizedString(payload["mode"]) ?? "list"
+    guard mode == "list" else { return }  // detail never routes over LAN
+    let provider = normalizedString(payload["provider"]) ?? ""
+    agentBridgeHistoryByChat[chatId] = payload
+    if !provider.isEmpty {
+      agentBridgeHistoryListByChatProvider["\(chatId)|\(provider.lowercased())"] = payload
+    }
+    NSLog(
+      "[LanBridge] history list reply over LAN req=%@ chat=%@ provider=%@",
+      String(requestId.prefix(8)), String(chatId.prefix(12)), provider)
+    postChangeLocked(
+      reason: "agentBridgeHistory",
+      userInfo: [
+        "chatId": chatId,
+        "provider": provider,
+        "mode": mode,
+        "requestId": requestId,
+      ]
+    )
   }
 
   private func ingestLanProgressLocked(_ payload: [String: Any]) {
@@ -5634,12 +6056,9 @@ final class ChatEngine {
     else { return }
     let seq = parseLongValue(payload["sequence"]) ?? 0
     let key = "\(provider):\(chatId):\(taskId)"
-    if let prev = lanProgressSeqByTask[key], seq > 0, seq <= prev {
-      return  // already applied (cloud or earlier LAN)
-    }
-    if seq > 0 {
-      lanProgressSeqByTask[key] = Int(seq)
-    }
+    // Always accumulate the raw line + keep the header alive, even when cloud owns
+    // the visible row — so a reclaim (cloud going silent) can paint from a complete
+    // buffer and the header never flashes idle mid-run.
     let line = normalizedString(payload["line"]) ?? ""
     if !line.isEmpty {
       var lines = lanProgressLinesByTask[key] ?? []
@@ -5647,18 +6066,42 @@ final class ChatEngine {
       if lines.count > 400 { lines = Array(lines.suffix(400)) }
       lanProgressLinesByTask[key] = lines
     }
+    agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+
+    // Cloud-authority gate: if cloud painted this task within the reclaim window,
+    // stay passive (no seq advance, no paint) so cloud's node-rich frames own the
+    // cell and it never flip-flops with the LAN text-only representation.
+    let taskKey = "\(chatId):\(taskId)"
+    if let lastCloud = cloudProgressAtMsByTask[taskKey],
+      Int64(nowMs()) - lastCloud < Self.lanReclaimAfterCloudSilenceMs
+    {
+      return
+    }
+
+    if let prev = lanProgressSeqByTask[key], seq > 0, seq <= prev {
+      return  // already applied (cloud or earlier LAN)
+    }
+    if seq > 0 {
+      lanProgressSeqByTask[key] = Int(seq)
+    }
     let accumulated = (lanProgressLinesByTask[key] ?? []).joined(separator: "\n")
     let displayText = Self.lightweightStreamText(from: accumulated, provider: provider)
-    // Keep the header "working" so a cloud flap doesn't flash idle mid-run.
-    agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
     let agentUserId = Self.bridgeAgentUserId(forProvider: provider)
     let streamId = "lan-\(taskId)"
+    // LAN frames are text-only. Reclaiming with an empty node list would wipe a tool
+    // feed cloud already painted — the regress guard in applyAgentStreamLocked can't
+    // catch it, because LAN carries MORE text than cloud's tail narration and that
+    // guard only fires when text regresses too. Carry the nodes forward so a reclaim
+    // refreshes narration instead of destroying the feed.
+    let existingNodes =
+      ((liveMessageRowsByChat[chatId]?[streamId]?["message"] as? [String: Any])?["metadata"]
+        as? [String: Any])?["progressNodes"] as? [[String: Any]] ?? []
     var streamPayload: [String: Any] = [
       "streamId": streamId,
       "taskId": taskId,
       "status": "running",
       "text": displayText,
-      "progressNodes": [] as [[String: Any]],
+      "progressNodes": existingNodes,
       "userId": agentUserId as Any,
       "sequence": seq,
     ]
@@ -5752,6 +6195,14 @@ final class ChatEngine {
       return
     }
 
+    // Mark cloud as the authoritative painter of this task's visible row. A cloud
+    // relay frame is `stream-…`; the LAN direct mirror is `lan-…`. While cloud keeps
+    // painting, the LAN mirror stays passive (ingestLanProgressLocked reclaim gate)
+    // so the cell never flip-flops between the two representations.
+    if streamId.hasPrefix("stream-"), let taskId, !taskId.isEmpty {
+      cloudProgressAtMsByTask["\(chatId):\(taskId)"] = Int64(nowMs())
+    }
+
     // Cloud and LAN both carry sequence; advance the high-water mark so the other
     // path cannot re-apply a staler frame as a second bubble update.
     if let taskId, !taskId.isEmpty,
@@ -5808,7 +6259,8 @@ final class ChatEngine {
     // registers this chat in the SAME map History uses, so a phone-side reconnect's
     // existing rearmLiveBridgeSessionLocked (chat_joined) proactively re-syncs this
     // turn too — not just turns the user happened to open History on.
-    if let sessionId = normalizedString(payload["sessionId"] ?? payload["session_id"]),
+    let frameSessionId = normalizedString(payload["sessionId"] ?? payload["session_id"])
+    if let sessionId = frameSessionId,
       !sessionId.isEmpty,
       liveBridgeSessionIngestByChatId[chatId]?.sessionId != sessionId
     {
@@ -5916,11 +6368,16 @@ final class ChatEngine {
       // ingest settle-clear can promptly retire the stale stream row once the transcript
       // confirms done, instead of waiting out the full grace.
       agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
+      // Latch THIS frame's own session settled (never the chat's live slot, which in a
+      // group may hold a different provider still streaming — Fable's group hole). This
+      // gates the imminent post-done transcript re-push from re-widening the tail cell.
+      if let doneSessionId = frameSessionId ?? liveBridgeSessionIngestByChatId[chatId]?.sessionId,
+        !doneSessionId.isEmpty
+      {
+        bridgeMarkSessionSettledLocked(chatId: chatId, sessionId: doneSessionId, contentSig: "")
+      }
       if let taskId, !taskId.isEmpty {
-        liveStreamTaskRowIdByChatId[chatId]?.removeValue(forKey: taskId)
-        if liveStreamTaskRowIdByChatId[chatId]?.isEmpty == true {
-          liveStreamTaskRowIdByChatId.removeValue(forKey: chatId)
-        }
+        removeBridgeTaskTrackingLocked(chatId: chatId, taskId: taskId)
       }
       // If the rich finished session card (a non-streaming `bridge-<session>-` row) has
       // ALREADY been ingested for this turn, this live stream row is now a stale duplicate
@@ -5942,12 +6399,11 @@ final class ChatEngine {
       }
       // Keep the accumulated text but stop the live indicator. The persisted
       // message (or its absence, on failure) takes over from here.
-      mutateLiveMessagePayloadLocked(chatId: chatId, messageId: effectiveRowId) { message in
-        message["isStreaming"] = false
-        var metadata = (message["metadata"] as? [String: Any]) ?? [:]
-        metadata["isStreaming"] = false
-        message["metadata"] = metadata
-      }
+      _ = settleLiveBridgeMessageLocked(
+        chatId: chatId,
+        messageId: effectiveRowId,
+        terminalStatus: status
+      )
       postChangeLocked(
         reason: "chatMessageChanged",
         userInfo: ["chatId": chatId, "messageId": effectiveRowId, "state": statusSnapshotLocked()]
@@ -5975,6 +6431,11 @@ final class ChatEngine {
     // mid-run and wipes the live header → "Start session" flicker + collapsed cell. Every
     // stream frame is proof the turn is alive, so it keeps the grace fresh.
     agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+    // A live (non-terminal) frame for this session is genuine proof-of-life — drop any
+    // stale terminal latch so the tail cell tracks the grace again (a resumed/continued run).
+    if let liveSessionId = frameSessionId, !liveSessionId.isEmpty {
+      bridgeClearSessionSettledLocked(chatId: chatId, sessionId: liveSessionId)
+    }
 
     // Stable timestamp so the bubble holds its position as text grows. Stamp it at the
     // FIRST RENDERABLE frame, not the first frame: the empty pre-content shell (text=0,
@@ -6034,6 +6495,15 @@ final class ChatEngine {
     if let advisor = normalizedString(payload["advisor"] ?? payload["advisorModel"] ?? payload["advisor_model"]) {
       metadata["agentRuntimeAdvisor"] = advisor
     }
+    // The team/solo render is STICKY per run: capture what this row already knew so a
+    // later frame that omits the team fields can't strip them (see the backfill below).
+    let existingRuntime: [String: Any] = {
+      guard let existingRow = liveMessageRowsByChat[chatId]?[effectiveRowId],
+        let existingMessage = existingRow["message"] as? [String: Any],
+        let existingMeta = existingMessage["metadata"] as? [String: Any]
+      else { return [:] }
+      return (existingMeta["agentRuntime"] as? [String: Any]) ?? [:]
+    }()
     var liveRuntime: [String: Any] = [
       "status": "running",
     ]
@@ -6078,6 +6548,26 @@ final class ChatEngine {
     if let statusList, !statusList.isEmpty {
       liveRuntime["teamWorkersStatus"] = statusList
       metadata["teamWorkersStatus"] = statusList
+    }
+    // Sticky team metadata. A frame minted after a bridge/socket reconnect (the ~50s
+    // bridge flaps) can arrive as a bare text delta with none of the team fields, and
+    // liveRuntime is rebuilt fresh every frame — so without this backfill that one
+    // frame would drop teamMode / teamRunId / teamWorkersStatus, flip
+    // `bubbleRendersTeamRun` false, and revert a long-running team OR solo cell to its
+    // raw agent stream in the main view (and drop it from the socket-reset preserve
+    // guard, wiping it on backgrounding). Once a run has shown as a team/solo cell it
+    // stays one: carry any team field this row already knew when the frame omits it.
+    for key in ["teamMode", "teamRunId", "teamWorker", "teamWorkers", "leadWorker", "teamRole"] {
+      if liveRuntime[key] == nil, let carried = existingRuntime[key] {
+        liveRuntime[key] = carried
+      }
+    }
+    if (liveRuntime["teamWorkersStatus"] as? [[String: Any]])?.isEmpty != false,
+      let carriedStatus = existingRuntime["teamWorkersStatus"] as? [[String: Any]],
+      !carriedStatus.isEmpty
+    {
+      liveRuntime["teamWorkersStatus"] = carriedStatus
+      metadata["teamWorkersStatus"] = carriedStatus
     }
     // Live team/single agent runs can always be cancelled from the sheet.
     liveRuntime["controls"] = ["canCancel": true, "canRevert": false]
@@ -6697,18 +7187,16 @@ final class ChatEngine {
     queue.async {
       let inFlightMessages = Array(self.nativePendingMessagePushRefs.values)
       for pending in inFlightMessages {
-        if let provider = self.bridgeProviderForChatLocked(chatId: pending.chatId) {
-          // In-flight when the socket died — may or may not have reached the server.
-          // Keep the bubble with an error badge; retrying an agent dispatch that
-          // might already be running stays a user decision.
-          self.markVolatileBridgeSendErrorLocked(
-            chatId: pending.chatId,
-            messageId: pending.messageId,
-            reason: "socket_closed",
-            provider: provider
-          )
-          continue
-        }
+        // In-flight when the socket died → the message is UN-ACKED (a server ack removes
+        // it from this map), so the server never finished handling it. Keep the bubble as
+        // "pending" — waiting to reconnect — NEVER a dead-end "error" and NEVER removed,
+        // then queue it for auto-replay on reconnect. This holds for AGENT chats too:
+        // re-sending an agent turn is safe from a double-run because the bridge dedupes by
+        // taskId, and the taskId is the client message id (chat_channel base_task_id =
+        // data["id"]) — a replay of the same id collapses to one run. (The old agent-only
+        // branch marked "error" and made the user resend manually, which surfaced the
+        // confusing "your device is not up — send again"; that manual resend re-pushed the
+        // SAME id and relied on the SAME dedup, so auto-replay is no less safe.)
         self.upsertLocalStatusLocked(
           chatId: pending.chatId, messageId: pending.messageId, status: "pending")
         if let draft = self.pendingOutboundDraftsByMessageId[pending.messageId] {
@@ -6760,16 +7248,9 @@ final class ChatEngine {
       if shouldForceReconnect {
         let inFlightMessages = Array(self.nativePendingMessagePushRefs.values)
         for pending in inFlightMessages {
-          if let provider = self.bridgeProviderForChatLocked(chatId: pending.chatId) {
-            // Same as socket_closed: wire state unknown, keep the bubble + error badge.
-            self.markVolatileBridgeSendErrorLocked(
-              chatId: pending.chatId,
-              messageId: pending.messageId,
-              reason: "socket_error",
-              provider: provider
-            )
-            continue
-          }
+          // Same recoverable contract as socket_closed: un-acked → keep the bubble as
+          // "pending" (waiting), never a dead-end error, and queue for auto-replay. Safe
+          // for agent chats via the bridge's message-id taskId dedup (see socket_closed).
           self.upsertLocalStatusLocked(
             chatId: pending.chatId, messageId: pending.messageId, status: "pending")
           if let draft = self.pendingOutboundDraftsByMessageId[pending.messageId] {
@@ -8460,6 +8941,33 @@ final class ChatEngine {
       }
     }
 
+    // Dead-run settle: a persisted agent/team row that still claims to be streaming but
+    // has no live row feeding it and hasn't been touched in minutes is an orphan — its
+    // run ended without a terminal frame (CLI crash, or the finalizing monitor was reset
+    // by a server redeploy). Left alone it re-renders as a live shimmering team cell on
+    // every history load. Coerce a terminal display copy so it settles ("stopped"
+    // workers, no shimmer). A genuinely live run keeps a live row (preferred at :8660),
+    // so it never enters here; the staleness gate protects the cold-start-mid-run window
+    // (the row re-arms its live row on the next frame and that live row wins).
+    // A history-only row settles quickly (3 min). A row ALSO present in the live store
+    // (e.g. a streaming snapshot resurrected from the volatile bridge-rows disk cache, or
+    // a run the monitor never finalized) gets a long grace — a genuinely live turn keeps a
+    // fast-refreshing live row, but no real turn streams for an hour, so an hour-stale live
+    // row is an orphan. Flip the plaintext isStreaming so the cell settles; the client
+    // terminalizes the (decrypted, E2E) worker rows once the message is no longer streaming.
+    let staleStreamingIds: [String] = mergedById.compactMap { id, row in
+      let minStaleMs: Int64 = liveRows[id] == nil ? (3 * 60 * 1000) : (60 * 60 * 1000)
+      return isStaleStreamingAgentRowLocked(row, minStaleMs: minStaleMs) ? id : nil
+    }
+    for id in staleStreamingIds {
+      guard let row = mergedById[id] else { continue }
+      mergedById[id] = terminalizedStaleAgentRowLocked(row)
+      NSLog(
+        "[TeamSettle] merge-coerce chat=%@ id=%@ inLiveStore=%@",
+        String(chatId.suffix(12)), String(id.suffix(12)),
+        liveRows[id] != nil ? "Y" : "N")
+    }
+
     var mergedRows = Array(mergedById.values)
     mergedRows.sort { lhs, rhs in
       let lt = messageTimestampMs(fromRow: lhs)
@@ -8498,7 +9006,26 @@ final class ChatEngine {
         continue
       }
       guard !deletedIds.contains(messageId) else { continue }
-      mergedById[messageId] = rowAdoptingSettleSlotTs(row, messageId: messageId)
+      // Reply previews only ride the live socket delivery; the history endpoint's
+      // JSON omits them, so a plain remote overwrite ERASES previews the app already
+      // rendered. Every refetch then flips replyPreview* nil↔value between the cached
+      // seed and the flush — 77-row reuse misses, sig height-promote misses, and a
+      // mode=batch changed=73 repaint after every open of a reply-heavy chat. Carry
+      // the known fields over so enrichment is monotone.
+      var remoteRow = row
+      if let existing = mergedById[messageId],
+        var remoteMessage = remoteRow["message"] as? [String: Any],
+        let existingMessage = existing["message"] as? [String: Any]
+      {
+        var carried = false
+        for key in ["replyToId", "replyPreview", "replyPreviewTitle", "replyPreviewText"]
+        where remoteMessage[key] == nil && existingMessage[key] != nil {
+          remoteMessage[key] = existingMessage[key]
+          carried = true
+        }
+        if carried { remoteRow["message"] = remoteMessage }
+      }
+      mergedById[messageId] = rowAdoptingSettleSlotTs(remoteRow, messageId: messageId)
     }
 
     var mergedRows = Array(mergedById.values)
@@ -8553,10 +9080,277 @@ final class ChatEngine {
     liveMessageRowsByChat[chatId] = perChat
   }
 
+  /// Make every liveness field agree on a terminal state. Previously the top-level
+  /// `isStreaming` flag was cleared while `agentRuntime.status` and team worker rows
+  /// remained `running`, so the same card kept its spinners after the CLI had exited.
+  @discardableResult
+  private func settleLiveBridgeMessageLocked(
+    chatId: String,
+    messageId: String,
+    terminalStatus: String
+  ) -> Bool {
+    guard var perChat = liveMessageRowsByChat[chatId],
+      var row = perChat[messageId],
+      var message = row["message"] as? [String: Any]
+    else { return false }
+
+    var metadata = (message["metadata"] as? [String: Any]) ?? [:]
+    var runtime = (metadata["agentRuntime"] as? [String: Any]) ?? [:]
+    let activeStates = Set(["running", "starting", "pending", "active", "streaming"])
+    let previousRuntimeStatus = (normalizedString(runtime["status"]) ?? "").lowercased()
+    let wasLive =
+      (message["isStreaming"] as? Bool) == true
+      || (metadata["isStreaming"] as? Bool) == true
+      || activeStates.contains(previousRuntimeStatus)
+      || ((runtime["teamWorkersStatus"] as? [[String: Any]]) ?? []).contains { worker in
+        activeStates.contains((normalizedString(worker["status"]) ?? "").lowercased())
+      }
+    guard wasLive else { return false }
+
+    func terminalized(_ entries: [[String: Any]]) -> [[String: Any]] {
+      entries.map { entry in
+        var next = entry
+        let state = (normalizedString(next["status"]) ?? "").lowercased()
+        if activeStates.contains(state) {
+          next["status"] = terminalStatus
+        }
+        return next
+      }
+    }
+
+    message["isStreaming"] = false
+    metadata["isStreaming"] = false
+    runtime["status"] = terminalStatus
+    runtime["controls"] = ["canCancel": false, "canRevert": false]
+
+    let workerRows =
+      (runtime["teamWorkersStatus"] as? [[String: Any]])
+      ?? (metadata["teamWorkersStatus"] as? [[String: Any]])
+      ?? []
+    if !workerRows.isEmpty {
+      let settledWorkers = terminalized(workerRows)
+      runtime["teamWorkersStatus"] = settledWorkers
+      metadata["teamWorkersStatus"] = settledWorkers
+    }
+    if let nodes = metadata["progressNodes"] as? [[String: Any]], !nodes.isEmpty {
+      metadata["progressNodes"] = terminalized(nodes)
+    }
+    metadata["agentRuntime"] = runtime
+    message["metadata"] = metadata
+    row["message"] = message
+    perChat[messageId] = row
+    liveMessageRowsByChat[chatId] = perChat
+    return true
+  }
+
+  /// True when `row` is an agent/team turn that still claims to be streaming yet is older
+  /// than `minStaleMs` — i.e. a dead run that never got a terminal frame. Detection must
+  /// survive the E2E case: on persisted/cached rows the runtime (teamWorkersStatus/status)
+  /// is encrypted into `agentRuntimeEnc`, so the only streaming signal ChatEngine can read
+  /// is the plaintext `isStreaming` flag, and `isAgentMessage` may be absent — detect via
+  /// any agent marker, the encrypted blob included.
+  private func isStaleStreamingAgentRowLocked(_ row: [String: Any], minStaleMs: Int64) -> Bool {
+    guard let message = row["message"] as? [String: Any] else { return false }
+    let meta = message["metadata"] as? [String: Any]
+    let isAgentRow =
+      (message["isAgentMessage"] as? Bool) == true
+      || meta?["agentRuntime"] != nil || meta?["agent_runtime"] != nil
+      || message["agentRuntime"] != nil || message["agent_runtime"] != nil
+      || meta?["agentRuntimeEnc"] != nil || meta?["agent_runtime_enc"] != nil
+      || message["agentRuntimeEnc"] != nil || message["agent_runtime_enc"] != nil
+      || meta?["teamWorkersStatus"] != nil || meta?["team_workers_status"] != nil
+      || (meta?["progressNodes"] as? [[String: Any]])?.isEmpty == false
+      || (message["progressNodes"] as? [[String: Any]])?.isEmpty == false
+      || normalizedString(message["agentUserId"] ?? message["agent_user_id"]) != nil
+      || normalizedString(message["agentUsername"] ?? message["agent_username"]) != nil
+    guard isAgentRow else { return false }
+    let active = Set(["running", "starting", "pending", "queued", "active", "streaming", "waiting"])
+    let runtime = meta?["agentRuntime"] as? [String: Any]
+    let streaming =
+      (message["isStreaming"] as? Bool) == true
+      || (meta?["isStreaming"] as? Bool) == true
+      || active.contains((normalizedString(runtime?["status"]) ?? "").lowercased())
+      || ((runtime?["teamWorkersStatus"] as? [[String: Any]]) ?? []).contains { worker in
+        active.contains((normalizedString(worker["status"]) ?? "").lowercased())
+      }
+    guard streaming else { return false }
+    let ts = messageTimestampMs(fromRow: row)
+    return ts == 0 || Int64(nowMs()) - ts > minStaleMs
+  }
+
+  /// A dead run that never received a terminal frame — the CLI crashed, or the server
+  /// monitor that would have finalized it was reset by a redeploy — stays `isStreaming`
+  /// forever in its PERSISTED row. `settleLiveBridgeMessageLocked` only fixes the live
+  /// store, so on every history load such an orphan re-renders as a live, shimmering
+  /// team cell (worker rows stuck "working…"). This returns a TERMINAL display copy of
+  /// the row: every liveness field agrees on "stopped" so the cell settles. The stored
+  /// source row is never mutated — if the run ever re-arms a live row, that live row is
+  /// preferred in the merge and wins.
+  private func terminalizedStaleAgentRowLocked(_ row: [String: Any]) -> [String: Any] {
+    guard var message = row["message"] as? [String: Any] else { return row }
+    let activeStates = Set(["running", "starting", "pending", "queued", "active", "streaming", "waiting"])
+    func terminalized(_ entries: [[String: Any]]) -> [[String: Any]] {
+      entries.map { entry in
+        var next = entry
+        let state = (normalizedString(next["status"]) ?? "").lowercased()
+        if activeStates.contains(state) { next["status"] = "stopped" }
+        return next
+      }
+    }
+    var metadata = (message["metadata"] as? [String: Any]) ?? [:]
+    var runtime = (metadata["agentRuntime"] as? [String: Any]) ?? [:]
+    message["isStreaming"] = false
+    metadata["isStreaming"] = false
+    runtime["status"] = "stopped"
+    runtime["controls"] = ["canCancel": false, "canRevert": false]
+    if let workers = runtime["teamWorkersStatus"] as? [[String: Any]], !workers.isEmpty {
+      runtime["teamWorkersStatus"] = terminalized(workers)
+    }
+    if let workers = metadata["teamWorkersStatus"] as? [[String: Any]], !workers.isEmpty {
+      metadata["teamWorkersStatus"] = terminalized(workers)
+    }
+    if let nodes = metadata["progressNodes"] as? [[String: Any]], !nodes.isEmpty {
+      metadata["progressNodes"] = terminalized(nodes)
+    }
+    metadata["agentRuntime"] = runtime
+    message["metadata"] = metadata
+    var out = row
+    out["message"] = message
+    return out
+  }
+
+  private func removeBridgeTaskTrackingLocked(chatId: String, taskId: String) {
+    let taskKey = "\(chatId):\(taskId)"
+    cloudProgressAtMsByTask.removeValue(forKey: taskKey)
+    if var taskRows = liveStreamTaskRowIdByChatId[chatId] {
+      taskRows.removeValue(forKey: taskId)
+      if taskRows.isEmpty {
+        liveStreamTaskRowIdByChatId.removeValue(forKey: chatId)
+      } else {
+        liveStreamTaskRowIdByChatId[chatId] = taskRows
+      }
+    }
+    let lanKeys = lanProgressLinesByTask.keys.filter { $0.contains(":\(chatId):\(taskId)") }
+    for key in lanKeys {
+      lanProgressLinesByTask.removeValue(forKey: key)
+      lanProgressSeqByTask.removeValue(forKey: key)
+    }
+  }
+
+  private func settleAgentBridgeTaskLocked(
+    chatId: String,
+    taskId: String,
+    terminalStatus: String,
+    reason: String
+  ) {
+    let matchingIds = (liveMessageRowsByChat[chatId] ?? [:]).compactMap {
+      messageId, row -> String? in
+      guard let message = row["message"] as? [String: Any],
+        let metadata = message["metadata"] as? [String: Any]
+      else { return nil }
+      let runtime = (metadata["agentRuntime"] as? [String: Any]) ?? [:]
+      let rowTaskId = normalizedString(
+        runtime["taskId"] ?? runtime["task_id"]
+          ?? metadata["agentTaskId"] ?? metadata["agent_task_id"])
+      return rowTaskId == taskId ? messageId : nil
+    }
+    var changed = false
+    for messageId in matchingIds {
+      changed = settleLiveBridgeMessageLocked(
+        chatId: chatId,
+        messageId: messageId,
+        terminalStatus: terminalStatus
+      ) || changed
+    }
+    removeBridgeTaskTrackingLocked(chatId: chatId, taskId: taskId)
+    guard changed else { return }
+    agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
+    clearAgentProgressLocked(chatId: chatId, status: terminalStatus, reason: reason)
+    storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+    postChangeLocked(
+      reason: "chatRowsReloaded",
+      userInfo: ["chatId": chatId, "state": statusSnapshotLocked()]
+    )
+  }
+
   private func setLiveMessageStatusLocked(chatId: String, messageId: String, status: String) {
     mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
       message["status"] = status
     }
+  }
+
+  // MARK: - Bridge tail-cell liveness (mid-run collapse fix)
+
+  /// Latch a bridge session as terminally settled so its tail cell stops being widened to
+  /// "still streaming" by the chat-wide run grace. `contentSig` is the tail item's content
+  /// signature at settle time (uid:text:nodes) — used to distinguish a genuine resume (new
+  /// content) from a stale `running=true` re-push of the same content.
+  private func bridgeMarkSessionSettledLocked(chatId: String, sessionId: String, contentSig: String) {
+    guard !sessionId.isEmpty else { return }
+    var perChat = bridgeSettledSessionSigByChatId[chatId] ?? [:]
+    perChat[sessionId] = contentSig
+    // Bound growth across a long-lived chat (new-task-per-message mints many session ids):
+    // once it gets large, drop everything but the session we just settled.
+    if perChat.count > 24 { perChat = [sessionId: contentSig] }
+    bridgeSettledSessionSigByChatId[chatId] = perChat
+  }
+
+  /// Drop a session's terminal latch on genuine proof-of-life (running item/frame, resume).
+  private func bridgeClearSessionSettledLocked(chatId: String, sessionId: String) {
+    guard var perChat = bridgeSettledSessionSigByChatId[chatId], perChat[sessionId] != nil else {
+      return
+    }
+    perChat.removeValue(forKey: sessionId)
+    if perChat.isEmpty {
+      bridgeSettledSessionSigByChatId.removeValue(forKey: chatId)
+    } else {
+      bridgeSettledSessionSigByChatId[chatId] = perChat
+    }
+  }
+
+  private func bridgeSessionIsSettledLocked(chatId: String, sessionId: String) -> Bool {
+    bridgeSettledSessionSigByChatId[chatId]?[sessionId] != nil
+  }
+
+  /// Is this bridge session's tail turn still live right now? Used to keep the tail agent
+  /// cell in its streaming state through a text→tool/MCP gap where the per-item `running`
+  /// flag momentarily reads false. Session-agnostic grace (matches the header + settle-clear)
+  /// gated by the per-session terminal latch for prompt, correct settle.
+  private func bridgeRunIsLiveLocked(chatId: String, sessionId: String) -> Bool {
+    if bridgeSessionIsSettledLocked(chatId: chatId, sessionId: sessionId) { return false }
+    let askOutstanding = agentBridgeAskByRequestId.values.contains { payload in
+      (normalizedString(payload["chatId"]) ?? "") == chatId
+    }
+    if askOutstanding { return true }
+    guard let last = agentTurnRunningAtMsByChatId[chatId] else { return false }
+    return Int64(nowMs()) - last < Self.agentTurnRunningGraceMs
+  }
+
+  /// Flip an already-ingested tail `bridge-<sessionId>-<uid>` row out of its streaming state.
+  /// Called from the idempotent-settled early-return (which returns before the per-row loop,
+  /// so nothing else settles the cell). No-ops — and posts no change — when the row is already
+  /// settled, so the per-tick idempotent re-push doesn't re-render the cell.
+  private func settleBridgeTailRowStreamingLocked(chatId: String, sessionId: String, uid: String) {
+    guard !uid.isEmpty else { return }
+    let messageId = "bridge-\(sessionId)-\(uid)"
+    var changed = false
+    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
+      let wasStreaming =
+        (message["isStreaming"] as? Bool) == true
+        || ((message["metadata"] as? [String: Any])?["isStreaming"] as? Bool) == true
+      guard wasStreaming else { return }
+      message["isStreaming"] = false
+      var metadata = (message["metadata"] as? [String: Any]) ?? [:]
+      metadata["isStreaming"] = false
+      message["metadata"] = metadata
+      changed = true
+    }
+    guard changed else { return }
+    storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+    postChangeLocked(
+      reason: "chatMessageChanged",
+      userInfo: ["chatId": chatId, "messageId": messageId, "state": statusSnapshotLocked()]
+    )
   }
 
   /// Pin a settled agent reply to the slot its live stream bubble occupied. Rewrites the
@@ -8932,16 +9726,48 @@ final class ChatEngine {
     }
     // The server strips sealed image blobs (`agentBridgeAttachmentsEnc`) from the
     // broadcast/persisted copy, so an own-send echo would wipe the attachment
-    // thumbnails off the optimistic row. Carry them (and the caption, which some
-    // echo paths lose for cleartext agent DMs) forward from the existing row.
+    // thumbnails off the optimistic row. Carry them (and durable thumbs/caption)
+    // forward from the existing row.
     if isMe, let existingMessage = findMessagePayloadLocked(chatId: chatId, messageId: messageId) {
       let existingMeta = existingMessage["metadata"] as? [String: Any]
       let existingBlobs =
         (existingMeta?["agentBridgeAttachmentsEnc"] as? [String])?.filter { !$0.isEmpty } ?? []
-      if !existingBlobs.isEmpty, var message = row["message"] as? [String: Any] {
+      let existingThumbs =
+        (existingMeta?["attachmentThumbnailsB64"] as? [String])?.filter { !$0.isEmpty } ?? []
+      let existingThumb =
+        (existingMeta?["thumbnailBase64"] as? String)
+        ?? (existingMessage["thumbnailBase64"] as? String)
+      if var message = row["message"] as? [String: Any] {
         var meta = (message["metadata"] as? [String: Any]) ?? [:]
-        if ((meta["agentBridgeAttachmentsEnc"] as? [String])?.isEmpty ?? true) {
+        var changed = false
+        if !existingBlobs.isEmpty,
+          ((meta["agentBridgeAttachmentsEnc"] as? [String])?.isEmpty ?? true)
+        {
           meta["agentBridgeAttachmentsEnc"] = existingBlobs
+          changed = true
+        }
+        if !existingThumbs.isEmpty,
+          ((meta["attachmentThumbnailsB64"] as? [String])?.isEmpty ?? true)
+        {
+          meta["attachmentThumbnailsB64"] = existingThumbs
+          changed = true
+        }
+        if let existingThumb, !existingThumb.isEmpty,
+          ((meta["thumbnailBase64"] as? String)?.isEmpty ?? true)
+        {
+          meta["thumbnailBase64"] = existingThumb
+          message["thumbnailBase64"] = existingThumb
+          changed = true
+        }
+        // Keep image type if the optimistic row was media and the echo collapsed to text.
+        let existingType = ((existingMessage["type"] as? String) ?? "").lowercased()
+        let nextType = ((message["type"] as? String) ?? "").lowercased()
+        if ["image", "gif", "video"].contains(existingType), nextType == "text" || nextType.isEmpty
+        {
+          message["type"] = existingType
+          changed = true
+        }
+        if changed {
           message["metadata"] = meta
           row["message"] = message
         }
@@ -10147,12 +10973,24 @@ final class ChatEngine {
     if historyRowsByChat[chatId] != nil, historyFullyLoadedChats.contains(chatId) {
       return true
     }
-    guard let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId),
-      let data = UserDefaults.standard.data(forKey: cacheKey),
-      let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
-      let decodedRows = object as? [[String: Any]]
-    else {
-      return false
+    guard let userId = chatHistoryCacheUserIdLocked() else { return false }
+    var decodedRows: [[String: Any]] = messageStore.recentMessagePayloads(
+      userId: userId, chatId: chatId, limit: chatHistoryCacheRowLimit
+    ).compactMap { payload in
+      (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any]
+    }
+    if decodedRows.isEmpty {
+      // One-time migration from the legacy UserDefaults blob cache.
+      guard let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId),
+        let data = UserDefaults.standard.data(forKey: cacheKey),
+        let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
+        let legacyRows = object as? [[String: Any]]
+      else {
+        return false
+      }
+      decodedRows = legacyRows
+      persistHistoryRowsToStoreLocked(chatId: chatId, rows: legacyRows)
+      UserDefaults.standard.removeObject(forKey: cacheKey)
     }
     // Self-heal caches written before transient rows were excluded from storage.
     let rows = decodedRows.filter { !isTransientStreamRow($0) }
@@ -10177,33 +11015,54 @@ final class ChatEngine {
       clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "store_cache")
       return
     }
-    guard !chatId.isEmpty, !rows.isEmpty, let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId)
-    else { return }
-    let persistableRows = rows.filter { !isTransientStreamRow($0) }
-    guard !persistableRows.isEmpty else { return }
-    let limitedRows = Array(persistableRows.suffix(chatHistoryCacheRowLimit))
-    guard JSONSerialization.isValidJSONObject(limitedRows),
-      let data = try? JSONSerialization.data(withJSONObject: limitedRows, options: [])
-    else {
-      appendJournalLocked(
-        event: "native-chat-history-cache-skip",
-        payload: ["chatId": chatId, "rows": rows.count, "reason": "invalid_json"])
-      return
-    }
-
-    UserDefaults.standard.set(data, forKey: cacheKey)
-    UserDefaults.standard.synchronize()
+    guard !chatId.isEmpty, !rows.isEmpty else { return }
+    let stored = persistHistoryRowsToStoreLocked(chatId: chatId, rows: rows)
+    guard stored > 0 else { return }
     appendJournalLocked(
       event: "native-chat-history-cache-store",
-      payload: ["chatId": chatId, "rows": limitedRows.count])
+      payload: ["chatId": chatId, "rows": stored])
     VibeDebugLog.log(
       "[ChatEngine] stored cached chat history chatId=%@ rows=%d",
       String(chatId.prefix(12)),
-      limitedRows.count
+      stored
     )
   }
 
+  /// Upserts persistable rows into the SQLite store; locally-deleted ids are
+  /// removed so they cannot resurrect on the next restore. Returns the number
+  /// of rows written.
+  @discardableResult
+  private func persistHistoryRowsToStoreLocked(
+    chatId: String,
+    rows: [[String: Any]],
+    skipPrune: Bool = false
+  ) -> Int {
+    guard let userId = chatHistoryCacheUserIdLocked(), messageStore.isAvailable else { return 0 }
+    var entries: [(messageId: String, ts: Int64, payload: Data)] = []
+    entries.reserveCapacity(rows.count)
+    for row in rows {
+      guard !isTransientStreamRow(row),
+        let messageId = messageId(fromRow: row),
+        JSONSerialization.isValidJSONObject(row),
+        let payload = try? JSONSerialization.data(withJSONObject: row, options: [])
+      else { continue }
+      entries.append((messageId, messageTimestampMs(fromRow: row), payload))
+    }
+    guard !entries.isEmpty else { return 0 }
+    messageStore.upsertMessages(userId: userId, chatId: chatId, entries: entries)
+    if let deletedIds = deletedMessageIdsByChat[chatId], !deletedIds.isEmpty {
+      messageStore.deleteMessages(userId: userId, chatId: chatId, messageIds: Array(deletedIds))
+    }
+    if !skipPrune {
+      messageStore.pruneChat(userId: userId, chatId: chatId)
+    }
+    return entries.count
+  }
+
   private func clearCachedHistoryRowsLocked(chatId: String) {
+    if let userId = chatHistoryCacheUserIdLocked() {
+      messageStore.deleteChat(userId: userId, chatId: chatId)
+    }
     guard let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId) else { return }
     UserDefaults.standard.removeObject(forKey: cacheKey)
     UserDefaults.standard.synchronize()
@@ -10314,10 +11173,27 @@ final class ChatEngine {
     var perChat = liveMessageRowsByChat[chatId] ?? [:]
     let deletedIds = deletedMessageIdsByChat[chatId] ?? []
     var seeded = 0
+    var settledOnRestore = 0
     for (rowMessageId, row) in cached {
       guard perChat[rowMessageId] == nil, !deletedIds.contains(rowMessageId) else { continue }
-      perChat[rowMessageId] = row
+      // A disk snapshot is never itself a live stream — liveness is re-established by
+      // incoming frames. A cached row still flagged streaming is a dead run that was killed
+      // mid-flight (CLI crash, app killed, monitor reset); restoring it as-is resurrects it
+      // into the live store as a permanent shimmer that no terminal frame will ever clear.
+      // Settle it on the way in; if the run is genuinely still live, the next frame re-marks
+      // it streaming. The 3-min gate leaves a just-backgrounded live turn untouched.
+      if isStaleStreamingAgentRowLocked(row, minStaleMs: 3 * 60 * 1000) {
+        perChat[rowMessageId] = terminalizedStaleAgentRowLocked(row)
+        settledOnRestore += 1
+      } else {
+        perChat[rowMessageId] = row
+      }
       seeded += 1
+    }
+    if settledOnRestore > 0 {
+      NSLog(
+        "[TeamSettle] restore-settle chat=%@ settled=%d of %d",
+        String(chatId.prefix(12)), settledOnRestore, seeded)
     }
     guard seeded > 0 else { return }
     liveMessageRowsByChat[chatId] = perChat
@@ -10335,6 +11211,11 @@ final class ChatEngine {
     historyRowsByChat.removeValue(forKey: chatId)
     historyFullyLoadedChats.remove(chatId)
     historyRowsRestoredFromCacheChats.remove(chatId)
+    historyOlderExhaustedChats.remove(chatId)
+    historyLoadingOlderChats.remove(chatId)
+    historyHasMoreByChat.removeValue(forKey: chatId)
+    historyNextCursorByChat.removeValue(forKey: chatId)
+    historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
     agentBridgeHistoryByChat.removeValue(forKey: chatId)
     let listPrefix = "\(chatId)|"
     agentBridgeHistoryListByChatProvider = agentBridgeHistoryListByChatProvider.filter {
@@ -10471,6 +11352,285 @@ final class ChatEngine {
     return resolved.isEmpty ? "default" : resolved
   }
 
+  private func oldestHistoryBoundaryLocked(
+    rows: [[String: Any]]
+  ) -> (messageId: String, timestampMs: Int64)? {
+    var oldest: (messageId: String, timestampMs: Int64)?
+    for row in rows {
+      guard let messageId = messageId(fromRow: row) else { continue }
+      let timestampMs = messageTimestampMs(fromRow: row)
+      if let current = oldest,
+        current.timestampMs < timestampMs
+          || (current.timestampMs == timestampMs && current.messageId <= messageId)
+      {
+        continue
+      }
+      oldest = (messageId, timestampMs)
+    }
+    return oldest
+  }
+
+  private func oldestHistoryBoundaryLocked(
+    chatId: String
+  ) -> (messageId: String, timestampMs: Int64)? {
+    guard let rows = historyRowsByChat[chatId], !rows.isEmpty else { return nil }
+    return oldestHistoryBoundaryLocked(rows: rows)
+  }
+
+  private func encodedHistoryCursorLocked(
+    timestampMs: Int64,
+    messageId: String
+  ) -> String? {
+    guard
+      let data = try? JSONSerialization.data(
+        withJSONObject: ["timestamp": timestampMs, "id": messageId], options: [.sortedKeys])
+    else { return nil }
+    return data.base64EncodedString()
+      .replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "=", with: "")
+  }
+
+  private func applyHistoryPaginationMetadataLocked(
+    chatId: String,
+    response: [String: Any],
+    remoteRows: [[String: Any]]
+  ) {
+    if response.keys.contains("hasMore"), let hasMore = parseBooleanLike(response["hasMore"]) {
+      historyHasMoreByChat[chatId] = hasMore
+      if hasMore {
+        historyOlderExhaustedChats.remove(chatId)
+      } else {
+        historyOlderExhaustedChats.insert(chatId)
+      }
+    }
+
+    if response.keys.contains("nextCursor") {
+      if let nextCursor = normalizedString(response["nextCursor"]) {
+        historyNextCursorByChat[chatId] = nextCursor
+        if let boundary = oldestHistoryBoundaryLocked(rows: remoteRows) {
+          historyNextCursorBoundaryByChat[chatId] = boundary
+        } else {
+          historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
+        }
+      } else {
+        historyNextCursorByChat.removeValue(forKey: chatId)
+        historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
+      }
+    }
+  }
+
+  private func loadOlderChatHistoryLocked(chatId: String) -> Bool {
+    guard !historyLoadingOlderChats.contains(chatId), !historyLoadingChats.contains(chatId),
+      chatId != "saved_messages",
+      !isBuiltInAgentChatId(chatId),
+      !isVolatileBridgeAgentChatLocked(chatId: chatId),
+      !historyOlderExhaustedChats.contains(chatId),
+      let boundary = oldestHistoryBoundaryLocked(chatId: chatId)
+    else { return false }
+
+    historyLoadingOlderChats.insert(chatId)
+    if let userId = chatHistoryCacheUserIdLocked(), messageStore.isAvailable {
+      let payloads = messageStore.olderMessagePayloads(
+        userId: userId,
+        chatId: chatId,
+        beforeTs: boundary.timestampMs,
+        beforeMessageId: boundary.messageId,
+        limit: chatOlderHistoryFetchLimit
+      )
+      if !payloads.isEmpty {
+        let olderRows = payloads.compactMap { payload in
+          (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any]
+        }.filter { !isTransientStreamRow($0) }
+        let existingCount = historyRowsByChat[chatId]?.count ?? 0
+        let rows = mergedStoredHistoryRowsLocked(chatId: chatId, remoteRows: olderRows)
+        historyRowsByChat[chatId] = rows
+        historyLoadingOlderChats.remove(chatId)
+        state["updatedAt"] = nowMs()
+        let prependedCount = max(0, rows.count - existingCount)
+        appendJournalLocked(
+          event: "native-chat-older-history-load-ok",
+          payload: [
+            "chatId": chatId,
+            "source": "store",
+            "rows": prependedCount,
+          ])
+        NSLog(
+          "[ChatEngine] loadOlderHistory chatId=%@ source=store rows=%d exhausted=N",
+          String(chatId.prefix(12)), prependedCount)
+        postChangeLocked(
+          reason: "chatRowsReloaded",
+          userInfo: [
+            "chatId": chatId,
+            "state": statusSnapshotLocked(),
+            "prependedOlder": prependedCount,
+          ])
+        return true
+      }
+    }
+
+    guard let apiBase = apiBaseURLLocked(),
+      normalizedString(getConfigValueLocked("userId")) != nil
+    else {
+      historyLoadingOlderChats.remove(chatId)
+      appendJournalLocked(
+        event: "native-chat-older-history-skip",
+        payload: ["chatId": chatId, "reason": "missing_config"])
+      return false
+    }
+
+    let cursor: String?
+    if let serverCursor = historyNextCursorByChat[chatId],
+      let cursorBoundary = historyNextCursorBoundaryByChat[chatId],
+      cursorBoundary.messageId == boundary.messageId,
+      cursorBoundary.timestampMs == boundary.timestampMs
+    {
+      cursor = serverCursor
+    } else {
+      cursor = encodedHistoryCursorLocked(
+        timestampMs: boundary.timestampMs, messageId: boundary.messageId)
+    }
+    guard let cursor else {
+      historyLoadingOlderChats.remove(chatId)
+      return false
+    }
+
+    let baseMessageUrl = apiBase.appendingPathComponent("api").appendingPathComponent("chat")
+      .appendingPathComponent(chatId).appendingPathComponent("messages")
+    var urlComponents = URLComponents(url: baseMessageUrl, resolvingAgainstBaseURL: false)
+    urlComponents?.queryItems = [
+      URLQueryItem(name: "limit", value: "\(chatOlderHistoryFetchLimit)"),
+      URLQueryItem(name: "before", value: cursor),
+    ]
+    guard let finalUrl = urlComponents?.url else {
+      historyLoadingOlderChats.remove(chatId)
+      return false
+    }
+    var request = URLRequest(url: finalUrl)
+    request.httpMethod = "GET"
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    if let token = authHeaderTokenLocked(), !token.isEmpty {
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
+    let fetchStartMs = nowMs()
+    NSLog(
+      "[ChatEngine] loadOlderHistory START chatId=%@ limit=%d",
+      String(chatId.prefix(12)), chatOlderHistoryFetchLimit)
+    appendJournalLocked(
+      event: "native-chat-older-history-load-start",
+      payload: ["chatId": chatId, "source": "network"])
+
+    let session = ChatPhoenixClient.makePinnedURLSession()
+    session.dataTask(with: request) { [weak self] data, response, error in
+      guard let self else { return }
+      self.queue.async {
+        let durationMs = self.nowMs() - fetchStartMs
+        self.historyLoadingOlderChats.remove(chatId)
+        if let error {
+          NSLog(
+            "[ChatEngine] loadOlderHistory FAIL chatId=%@ duration=%lldms error=%@",
+            String(chatId.prefix(12)), durationMs, error.localizedDescription)
+          self.appendJournalLocked(
+            event: "native-chat-older-history-load-error",
+            payload: ["chatId": chatId, "error": error.localizedDescription])
+          self.postChangeLocked(
+            reason: "engineError",
+            userInfo: ["state": self.statusSnapshotLocked(), "error": error.localizedDescription])
+          return
+        }
+        guard let http = response as? HTTPURLResponse else {
+          NSLog(
+            "[ChatEngine] loadOlderHistory FAIL chatId=%@ duration=%lldms error=invalid_response",
+            String(chatId.prefix(12)), durationMs)
+          self.appendJournalLocked(
+            event: "native-chat-older-history-load-error",
+            payload: ["chatId": chatId, "error": "invalid_response"])
+          return
+        }
+        guard (200...299).contains(http.statusCode), let data else {
+          NSLog(
+            "[ChatEngine] loadOlderHistory FAIL chatId=%@ duration=%lldms status=%d",
+            String(chatId.prefix(12)), durationMs, http.statusCode)
+          self.appendJournalLocked(
+            event: "native-chat-older-history-load-error",
+            payload: ["chatId": chatId, "status": http.statusCode])
+          return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) else {
+          self.appendJournalLocked(
+            event: "native-chat-older-history-load-error",
+            payload: ["chatId": chatId, "error": "invalid_json_expected_messages_array"])
+          return
+        }
+
+        let responseDict = object as? [String: Any]
+        let messagesArray: [[String: Any]]
+        if let array = object as? [[String: Any]] {
+          messagesArray = array
+        } else if let array = responseDict?["data"] as? [[String: Any]] {
+          messagesArray = array
+        } else if let array = responseDict?["messages"] as? [[String: Any]] {
+          messagesArray = array
+        } else {
+          self.appendJournalLocked(
+            event: "native-chat-older-history-load-error",
+            payload: ["chatId": chatId, "error": "invalid_json_expected_messages_array"])
+          return
+        }
+
+        let olderRows = self.buildHistoryRowsLocked(chatId: chatId, rawMessages: messagesArray)
+          .filter { !self.isTransientStreamRow($0) }
+        if let responseDict {
+          self.applyHistoryPaginationMetadataLocked(
+            chatId: chatId, response: responseDict, remoteRows: olderRows)
+        }
+        guard !olderRows.isEmpty else {
+          self.historyHasMoreByChat[chatId] = false
+          self.historyNextCursorByChat.removeValue(forKey: chatId)
+          self.historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
+          self.historyOlderExhaustedChats.insert(chatId)
+          NSLog(
+            "[ChatEngine] loadOlderHistory chatId=%@ source=network rows=0 exhausted=Y",
+            String(chatId.prefix(12)))
+          self.appendJournalLocked(
+            event: "native-chat-older-history-load-ok",
+            payload: ["chatId": chatId, "source": "network", "rows": 0, "exhausted": true])
+          return
+        }
+
+        let existingCount = self.historyRowsByChat[chatId]?.count ?? 0
+        let rows = self.mergedStoredHistoryRowsLocked(chatId: chatId, remoteRows: olderRows)
+        self.historyRowsByChat[chatId] = rows
+        _ = self.persistHistoryRowsToStoreLocked(
+          chatId: chatId, rows: olderRows, skipPrune: true)
+        self.state["updatedAt"] = self.nowMs()
+        let prependedCount = max(0, rows.count - existingCount)
+        let exhausted = self.historyOlderExhaustedChats.contains(chatId)
+        NSLog(
+          "[ChatEngine] loadOlderHistory chatId=%@ source=network rows=%d exhausted=%@",
+          String(chatId.prefix(12)), prependedCount, exhausted ? "Y" : "N")
+        self.appendJournalLocked(
+          event: "native-chat-older-history-load-ok",
+          payload: [
+            "chatId": chatId,
+            "source": "network",
+            "rows": prependedCount,
+            "exhausted": exhausted,
+          ])
+        self.postChangeLocked(
+          reason: "chatRowsReloaded",
+          userInfo: [
+            "chatId": chatId,
+            "state": self.statusSnapshotLocked(),
+            "prependedOlder": prependedCount,
+          ])
+      }
+    }.resume()
+    return true
+  }
+
   private func loadChatHistoryIfNeededLocked(chatId: String, force: Bool = false) {
     guard !chatId.isEmpty else { return }
     guard !isBuiltInAgentChatId(chatId),
@@ -10480,6 +11640,11 @@ final class ChatEngine {
       historyRowsByChat.removeValue(forKey: chatId)
       historyFullyLoadedChats.remove(chatId)
       historyRowsRestoredFromCacheChats.remove(chatId)
+      historyOlderExhaustedChats.remove(chatId)
+      historyLoadingOlderChats.remove(chatId)
+      historyHasMoreByChat.removeValue(forKey: chatId)
+      historyNextCursorByChat.removeValue(forKey: chatId)
+      historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
       clearCachedHistoryRowsLocked(chatId: chatId)
       appendJournalLocked(
         event: "native-chat-history-skip",
@@ -10488,7 +11653,7 @@ final class ChatEngine {
       VibeDebugLog.log("[ChatEngine] loadChatHistory SKIP chatId=%@ reason=agent_surface", chatId)
       return
     }
-    if historyLoadingChats.contains(chatId) { return }
+    if historyLoadingChats.contains(chatId) || historyLoadingOlderChats.contains(chatId) { return }
     if !force, historyFullyLoadedChats.contains(chatId),
       !historyRowsRestoredFromCacheChats.contains(chatId)
     {
@@ -10658,9 +11823,18 @@ final class ChatEngine {
     }
 
     let remoteRows = buildHistoryRowsLocked(chatId: chatId, rawMessages: messagesArray)
-    let existingRowsCount = historyRowsByChat[chatId]?.count ?? 0
+    if let response = object as? [String: Any] {
+      applyHistoryPaginationMetadataLocked(
+        chatId: chatId, response: response, remoteRows: remoteRows)
+    }
+    let existingRows = historyRowsByChat[chatId] ?? []
+    let existingRowsCount = existingRows.count
     let liveRowsCount = liveMessageRowsByChat[chatId]?.count ?? 0
     let rows = mergedStoredHistoryRowsLocked(chatId: chatId, remoteRows: remoteRows)
+    // Refetch reconciliation that changed nothing must not repaint: the view already
+    // rendered these exact rows from cache, and the reload notification would send the
+    // whole transcript back through the full parse/diff/layout pipeline on main.
+    let isUnchangedRefetch = !existingRows.isEmpty && (rows as NSArray).isEqual(to: existingRows)
     historyRowsByChat[chatId] = rows
     historyFullyLoadedChats.insert(chatId)
     historyRowsRestoredFromCacheChats.remove(chatId)
@@ -10677,14 +11851,16 @@ final class ChatEngine {
         "messages": messagesArray.count,
       ])
     NSLog(
-      "[ChatEngine] loadChatHistory MERGE chatId=%@ remoteRows=%d existingRows=%d liveRows=%d mergedRows=%d",
+      "[ChatEngine] loadChatHistory MERGE chatId=%@ remoteRows=%d existingRows=%d liveRows=%d mergedRows=%d unchanged=%@",
       String(chatId.prefix(12)),
       remoteRows.count,
       existingRowsCount,
       liveRowsCount,
-      rows.count
+      rows.count,
+      isUnchangedRefetch ? "Y" : "N"
     )
     scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "history_loaded")
+    guard !isUnchangedRefetch else { return }
     let snapshot = statusSnapshotLocked()
     postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId, "state": snapshot])
   }
@@ -10849,8 +12025,49 @@ final class ChatEngine {
       {
         enrichedFields["mediaUrl"] = rawMediaUrl
       }
-      if let rawMediaKey, !rawMediaKey.isEmpty, normalizedString(enrichedFields["mediaKey"]) == nil {
-        enrichedFields["mediaKey"] = rawMediaKey
+      // Prefer remote URL over a dead local file path left in metadata after reopen.
+      if let existing = normalizedString(enrichedFields["mediaUrl"]), isLocalMediaURI(existing) {
+        if let rawMediaUrl, !rawMediaUrl.isEmpty, !isLocalMediaURI(rawMediaUrl) {
+          enrichedFields["mediaUrl"] = rawMediaUrl
+        } else if let meta = enrichedFields["metadata"] as? [String: Any],
+          let remote = normalizedString(meta["mediaUrl"] ?? meta["media_url"]),
+          !remote.isEmpty, !isLocalMediaURI(remote)
+        {
+          enrichedFields["mediaUrl"] = remote
+        } else {
+          // Drop unusable local path so UI falls through to thumbs.
+          enrichedFields.removeValue(forKey: "mediaUrl")
+        }
+      }
+      // Promote durable thumbs from server metadata into decrypted fields.
+      if let rawMetadata {
+        if normalizedString(enrichedFields["thumbnailBase64"]) == nil,
+          let thumb = normalizedString(
+            rawMetadata["thumbnailBase64"] ?? rawMetadata["thumbnail_base64"])
+        {
+          enrichedFields["thumbnailBase64"] = thumb
+        }
+        if (enrichedFields["attachmentThumbnailsB64"] as? [String])?.isEmpty != false,
+          let thumbs = rawMetadata["attachmentThumbnailsB64"] as? [String], !thumbs.isEmpty
+        {
+          enrichedFields["attachmentThumbnailsB64"] = thumbs
+          var meta = (enrichedFields["metadata"] as? [String: Any]) ?? [:]
+          meta["attachmentThumbnailsB64"] = thumbs
+          enrichedFields["metadata"] = meta
+        }
+      }
+      let resolvedMedia = normalizedString(enrichedFields["mediaUrl"])
+      let hasThumb =
+        normalizedString(enrichedFields["thumbnailBase64"]) != nil
+        || ((enrichedFields["attachmentThumbnailsB64"] as? [String])?.isEmpty == false)
+        || ((rawMetadata?["thumbnailBase64"] as? String)?.isEmpty == false)
+      if normalizedString(enrichedFields["mediaKey"]) == nil {
+        let keyFromRaw = rawMediaKey
+        let keyFromMeta = normalizedString(
+          rawMetadata?["mediaKey"] ?? rawMetadata?["media_key"])
+        if let key = keyFromRaw ?? keyFromMeta, !key.isEmpty {
+          enrichedFields["mediaKey"] = key
+        }
       }
       let fileNameForRow =
         rawFileName
@@ -10860,11 +12077,18 @@ final class ChatEngine {
       {
         enrichedFields["fileName"] = fileNameForRow
       }
+      // If type collapsed to text but we have media evidence, restore image type for list/profile.
+      var resolvedType = type
+      if (resolvedType == "text" || resolvedType.isEmpty),
+        (resolvedMedia != nil && !(resolvedMedia?.isEmpty ?? true)) || hasThumb
+      {
+        resolvedType = "image"
+      }
       var row = buildLiveRowPayloadLocked(
         chatId: chatId,
         messageId: messageId,
         fromId: fromId,
-        type: type,
+        type: resolvedType,
         timestampMs: timestampMs,
         encryptedContent: encryptedContent,
         decryptedFields: enrichedFields,

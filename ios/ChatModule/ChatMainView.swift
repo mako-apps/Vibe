@@ -1,5 +1,15 @@
 import UIKit
 
+/// Uptime anchor for "user tapped a chat row" — set at route creation, read by every
+/// `[ChatOpen] host-stage` log so the tap→settled timeline is attributable end to end.
+enum VibeChatOpenTap {
+  static var uptime: TimeInterval = 0
+  static func msSinceTap() -> Int {
+    guard uptime > 0 else { return -1 }
+    return Int((ProcessInfo.processInfo.systemUptime - uptime) * 1000)
+  }
+}
+
 final class ChatNativeMainRegistry {
   static let shared = ChatNativeMainRegistry()
 
@@ -161,6 +171,8 @@ public final class ChatMainView: UIView,
   private let chatSubtitleRow = UIStackView()
   private let chatSubtitleDotView = UIView()
   private let chatSubtitleLabel = UILabel()
+  /// Leading line spinner for Connecting / Updating — matches Home principal header.
+  private let chatConnectingSpinner = VibeHeaderLineSpinnerView(size: 11, lineWidth: 1.55)
   private let profileHeaderStack = UIStackView()
   private let profileTitleLabel = UILabel()
   private let profileSubtitleLabel = UILabel()
@@ -351,15 +363,25 @@ public final class ChatMainView: UIView,
     red: 36.0 / 255.0, green: 36.0 / 255.0, blue: 36.0 / 255.0, alpha: 1.0)
   private static let themeLightCard = UIColor.white
   override init(frame: CGRect) {
+    let initStartedAt = ProcessInfo.processInfo.systemUptime
     chatListView = ChatListView()
+    let listDoneAt = ProcessInfo.processInfo.systemUptime
     super.init(frame: frame)
     clipsToBounds = true
     configureView()
+    let configureDoneAt = ProcessInfo.processInfo.systemUptime
     startObservingChatEngine()
     syncListDispatchers()
     applyTheme()
     updateHeaderTexts()
     updateProfileTexts()
+    let now = ProcessInfo.processInfo.systemUptime
+    NSLog(
+      "[ChatOpen] host-stage ChatMainView.init totalMs=%d listMs=%d configureMs=%d sinceTapMs=%d",
+      Int((now - initStartedAt) * 1000),
+      Int((listDoneAt - initStartedAt) * 1000),
+      Int((configureDoneAt - listDoneAt) * 1000),
+      VibeChatOpenTap.msSinceTap())
   }
 
   required init?(coder: NSCoder) {
@@ -387,13 +409,32 @@ public final class ChatMainView: UIView,
 
   override public func layoutSubviews() {
     super.layoutSubviews()
+    let layoutStartedAt = ProcessInfo.processInfo.systemUptime
+    var layoutMarkAt = layoutStartedAt
+    func layoutPhaseMs() -> Int {
+      let now = ProcessInfo.processInfo.systemUptime
+      defer { layoutMarkAt = now }
+      return Int((now - layoutMarkAt) * 1000)
+    }
     rootWallpaperLayer.frame = bounds
     layoutChrome()
+    let chromeMs = layoutPhaseMs()
     layoutPages()
+    let pagesMs = layoutPhaseMs()
     layoutProfileContent()
     layoutProfileMembersContent()
+    let profileMs = layoutPhaseMs()
     layoutAgentContent()
+    let agentMs = layoutPhaseMs()
     applyPageState(animated: false, emitEvent: false)
+    let pageStateMs = layoutPhaseMs()
+    let layoutTotalMs = Int((ProcessInfo.processInfo.systemUptime - layoutStartedAt) * 1000)
+    if layoutTotalMs >= 8 {
+      NSLog(
+        "[ChatOpen] host-stage ChatMainView.layout totalMs=%d chromeMs=%d pagesMs=%d profileMs=%d agentMs=%d pageStateMs=%d sinceTapMs=%d",
+        layoutTotalMs, chromeMs, pagesMs, profileMs, agentMs, pageStateMs,
+        VibeChatOpenTap.msSinceTap())
+    }
 
     avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "savedMessagesGradient" })?.frame = avatarGlassView.contentView.bounds
     // Inset to match avatarImageView's sizing (avatarButton.bounds.insetBy(dx: 4, dy: 4))
@@ -408,6 +449,18 @@ public final class ChatMainView: UIView,
   }
 
   // MARK: - Forwarded chat-list APIs
+
+  func setOpeningUnreadCount(_ value: Int) {
+    chatListView.setOpeningUnreadCount(value)
+  }
+
+  func persistViewportState() {
+    chatListView.persistViewportState()
+  }
+
+  func captureReopenSnapshot() {
+    chatListView.captureReopenSnapshot()
+  }
 
   func setRows(_ rows: [[String: Any]]) {
     // [EmptyTrace] The chat view gets its rows here. Log an empty apply together with the
@@ -431,6 +484,25 @@ public final class ChatMainView: UIView,
     }
   }
 
+  func setAuthoritativeRows(_ rows: [[String: Any]]) {
+    chatListView.setAuthoritativeRows(rows)
+    let nextHasPeerResponse = Self.rowsContainPeerResponse(rows, peerUserId: enginePeerUserId)
+    if nextHasPeerResponse != hasPeerResponseInCurrentRows {
+      hasPeerResponseInCurrentRows = nextHasPeerResponse
+      applyTheme()
+      updateHeaderTexts()
+      updateProfileTexts()
+    }
+  }
+
+  func clearRows() {
+    chatListView.clearRows()
+    hasPeerResponseInCurrentRows = false
+    applyTheme()
+    updateHeaderTexts()
+    updateProfileTexts()
+  }
+
   func setEngineSurfaceId(_ value: String) {
     chatListView.setEngineSurfaceId(value)
   }
@@ -439,6 +511,14 @@ public final class ChatMainView: UIView,
     if defersEngineStateRefreshes == value { return }
     defersEngineStateRefreshes = value
     VibeDebugLog.log("[ChatMainView] defersEngineStateRefreshes=%@", value ? "true" : "false")
+  }
+
+  func setDefersTranscriptUpdatesForPresentation(_ value: Bool) {
+    chatListView.setDefersTranscriptUpdatesForPresentation(value)
+  }
+
+  func completeTranscriptPresentation() {
+    chatListView.completeTranscriptPresentation()
   }
 
   func setEngineChatId(_ value: String) {
@@ -511,6 +591,19 @@ public final class ChatMainView: UIView,
   /// bridge rows do not combine on the shared agent DM chatId.
   func setBridgeLoadedSessionId(_ sessionId: String?) {
     chatListView.setBridgeLoadedSessionId(sessionId)
+  }
+
+  /// History sheet pick: seed the session title, scope the list, show the custom
+  /// skeleton spinner, and request the session transcript from the bridge.
+  /// Header shows **Loading…** until rows land (never the idle "Start session" default).
+  func loadBridgeHistorySession(provider: String, session: AgentBridgeHistorySession) {
+    let topic = session.topic.trimmingCharacters(in: .whitespacesAndNewlines)
+    // Seed topic for when load finishes; while in-flight the subtitle is "Loading…".
+    if !topic.isEmpty {
+      bridgeSessionTopic = topic
+    }
+    chatListView.loadBridgeSessionIntoChat(provider: provider, session: session)
+    updateHeaderTexts()
   }
 
   /// Enables agent inbox mode: event notifications are filtered out of the
@@ -1038,10 +1131,10 @@ public final class ChatMainView: UIView,
     chatListView.onEventInboxChanged = { [weak self] count, latestPreview in
       self?.updateInboxBanner(count: count, latestPreview: latestPreview)
     }
-    chatListView.onBridgeUsageBannerVisibilityChanged = { [weak self] in
-      self?.setNeedsLayout()
-      self?.layoutIfNeeded()
-    }
+    // The usage card is an absolute overlay owned and laid out by ChatListView. It does
+    // not reserve list/header space, so synchronously relaying its visibility through the
+    // whole chat hierarchy only makes the fixed header mask flash during a rows update.
+    chatListView.onBridgeUsageBannerVisibilityChanged = nil
 
     // The DM-level agent runtime view is hosted FULL-SCREEN by the owning controller;
     // forward ChatListView's present/teardown/presence to it (no in-view nesting).
@@ -1115,13 +1208,16 @@ public final class ChatMainView: UIView,
     headerContainer.addSubview(headerMaskView)
     headerMaskView.addSubview(headerMaskBlurView)
     headerMaskBlurView.contentView.addSubview(headerMaskOverlayView)
+    // Soft alpha fade (not a hard cutoff). Keeps status-bar chrome legible while the
+    // native soft scroll-edge shapes glass around the chips. Light/dark fill only —
+    // never wallpaper / bubble colors (see applyTheme / refreshHeaderGlass).
     headerMaskGradientLayer.colors = [
       UIColor.black.withAlphaComponent(1.0).cgColor,
-      UIColor.black.withAlphaComponent(0.95).cgColor,
-      UIColor.black.withAlphaComponent(0.55).cgColor,
+      UIColor.black.withAlphaComponent(0.88).cgColor,
+      UIColor.black.withAlphaComponent(0.35).cgColor,
       UIColor.clear.cgColor,
     ]
-    headerMaskGradientLayer.locations = [0.0, 0.35, 0.75, 1.0]
+    headerMaskGradientLayer.locations = [0.0, 0.42, 0.72, 1.0]
     headerMaskView.layer.mask = headerMaskGradientLayer
     headerContainer.addSubview(headerContentView)
     headerContainer.layer.zPosition = 50.0
@@ -1292,7 +1388,8 @@ public final class ChatMainView: UIView,
     avatarFallbackLabel.isHidden = false
 
     chatHeaderStack.axis = .vertical
-    chatHeaderStack.alignment = .leading
+    // Center title + subtitle group (Connecting / Updating / presence all align mid).
+    chatHeaderStack.alignment = .center
     chatHeaderStack.distribution = .fill
     chatHeaderStack.spacing = -1
 
@@ -1303,12 +1400,12 @@ public final class ChatMainView: UIView,
 
     [chatTitleLabel, profileTitleLabel].forEach { label in
       label.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
-      label.textAlignment = .left
+      label.textAlignment = .center
       label.lineBreakMode = .byTruncatingTail
     }
     [chatSubtitleLabel, profileSubtitleLabel].forEach { label in
       label.font = UIFont.systemFont(ofSize: 12, weight: .medium)
-      label.textAlignment = .left
+      label.textAlignment = .center
       label.lineBreakMode = .byTruncatingTail
       label.isHidden = true
     }
@@ -1324,8 +1421,20 @@ public final class ChatMainView: UIView,
     chatSubtitleRow.axis = .horizontal
     chatSubtitleRow.alignment = .center
     chatSubtitleRow.spacing = 4
+    // Order: status dot → line spinner → text (matches Home principal).
+    // Spinner/dot slots stay laid out (alpha/isHidden carefully) to limit jump.
+    chatConnectingSpinner.translatesAutoresizingMaskIntoConstraints = false
+    chatConnectingSpinner.setContentHuggingPriority(.required, for: .horizontal)
+    chatConnectingSpinner.setContentCompressionResistancePriority(.required, for: .horizontal)
+    NSLayoutConstraint.activate([
+      chatConnectingSpinner.widthAnchor.constraint(equalToConstant: 11),
+      chatConnectingSpinner.heightAnchor.constraint(equalToConstant: 11),
+    ])
     chatSubtitleRow.addArrangedSubview(chatSubtitleDotView)
+    chatSubtitleRow.addArrangedSubview(chatConnectingSpinner)
     chatSubtitleRow.addArrangedSubview(chatSubtitleLabel)
+    chatConnectingSpinner.alpha = 0
+    chatConnectingSpinner.isHidden = false
 
     chatHeaderStack.addArrangedSubview(chatTitleLabel)
     chatHeaderStack.addArrangedSubview(chatSubtitleRow)
@@ -1430,10 +1539,13 @@ public final class ChatMainView: UIView,
     updateChatModeHeaderControls()
 
     if #available(iOS 26.0, *) {
-      let mainInteraction = UIScrollEdgeElementContainerInteraction()
-      mainInteraction.scrollView = chatListView.collectionView
-      mainInteraction.edge = .top
-      headerContainer.addInteraction(mainInteraction)
+      // Let UIKit shape the Liquid Glass edge where the fixed header overlays the message
+      // scroller. This interaction is attached once with the header hierarchy; list data
+      // updates no longer rebuild or relayout the header container.
+      let chatInteraction = UIScrollEdgeElementContainerInteraction()
+      chatInteraction.scrollView = chatListView.collectionView
+      chatInteraction.edge = .top
+      headerContainer.addInteraction(chatInteraction)
 
       let profileInteraction = UIScrollEdgeElementContainerInteraction()
       profileInteraction.scrollView = profileScrollView
@@ -3084,62 +3196,107 @@ public final class ChatMainView: UIView,
     presenter.present(navigationController, animated: true)
   }
 
+  /// System light/dark only — never wallpaper luminance (`appearance.isDark`) or bubble colors.
+  /// Reads the window / view trait collection (system default), not chat list theme.
+  private var headerChromeIsDark: Bool {
+    let style =
+      window?.traitCollection.userInterfaceStyle
+      ?? traitCollection.userInterfaceStyle
+    if style == .unspecified {
+      return UIScreen.main.traitCollection.userInterfaceStyle == .dark
+    }
+    return style == .dark
+  }
+
+  /// Apple UIGlassEffect.tintColor — “a tint color applied to the glass” (stained wash).
+  /// Use pure system surface colors so Liquid Glass does not pick up list/bubble hues.
+  private func headerGlassSystemTint(isDark: Bool) -> UIColor {
+    let traits = UITraitCollection(userInterfaceStyle: isDark ? .dark : .light)
+    // systemBackground = black (dark) / white (light). Opaque enough that scrolling
+    // content cannot recolor the chip; still translucent for glass refraction.
+    return UIColor.systemBackground
+      .resolvedColor(with: traits)
+      .withAlphaComponent(isDark ? 0.55 : 0.50)
+  }
+
+  /// Soft mask band under the header — systemBackground only (light/dark).
+  private func headerMaskSystemColor(isDark: Bool) -> UIColor {
+    let traits = UITraitCollection(userInterfaceStyle: isDark ? .dark : .light)
+    return UIColor.systemBackground.resolvedColor(with: traits)
+  }
+
+  private func applyHeaderChromeSystemStyle() {
+    let isDark = headerChromeIsDark
+    let chromeStyle: UIUserInterfaceStyle = isDark ? .dark : .light
+    // Lock chrome traits to system light/dark so materials never adapt to transcript content.
+    headerContainer.overrideUserInterfaceStyle = chromeStyle
+    profileHeaderContainer.overrideUserInterfaceStyle = chromeStyle
+    headerMaskView.overrideUserInterfaceStyle = chromeStyle
+    headerMaskBlurView.overrideUserInterfaceStyle = chromeStyle
+    [
+      backGlassView, titleGlassView, avatarGlassView, menuGlassView,
+      savedSearchCancelGlassView, rightActionsGlassView,
+      profileBackGlassView, profileMenuGlassView,
+    ].forEach { $0.overrideUserInterfaceStyle = chromeStyle }
+
+    // Mask: forced system material + systemBackground plate (not wallpaper/bubbles).
+    headerMaskBlurView.effect =
+      UIBlurEffect(style: isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight)
+    headerMaskOverlayView.backgroundColor =
+      headerMaskSystemColor(isDark: isDark).withAlphaComponent(isDark ? 0.78 : 0.72)
+  }
+
   private func refreshHeaderGlass() {
+    applyHeaderChromeSystemStyle()
+    let isDark = headerChromeIsDark
+
     if #available(iOS 26.0, *) {
-      headerMaskView.isHidden = true
+      // Soft native scroll-edge + soft system-tint fade band. Band tints from system
+      // light/dark only so list element colors cannot shift the mask.
+      headerMaskView.isHidden = false
       profileHeaderMaskView.isHidden = true
 
-      // Liquid Glass samples/tints itself from whatever's rendered behind or inside it —
-      // the title glass in particular was picking up a blue cast once the subtitle started
-      // carrying colored (green/red) live-agent text and an animated shimmer mask. Pin
-      // every header glass effect's tint explicitly so the chrome always reads as neutral,
-      // regardless of what content sits on top of it.
-      let backEffect = UIGlassEffect()
-      backEffect.isInteractive = true
-      backEffect.tintColor = .clear
-      backGlassView.effect = backEffect
+      let glassTint = headerGlassSystemTint(isDark: isDark)
 
-      let titleEffect = UIGlassEffect()
-      titleEffect.isInteractive = true
-      titleEffect.tintColor = .clear
-      titleGlassView.effect = nil // Explicitly remove glass effect for title
+      func makeGlassEffect() -> UIGlassEffect {
+        let effect = UIGlassEffect(style: .regular)
+        effect.isInteractive = true
+        // Required: without tintColor, glass samples whatever is behind (bubbles/images).
+        effect.tintColor = glassTint
+        return effect
+      }
 
-      let avatarEffect = UIGlassEffect()
-      avatarEffect.isInteractive = true
-      avatarEffect.tintColor = .clear
-      avatarGlassView.effect = avatarEffect
+      backGlassView.effect = makeGlassEffect()
+      titleGlassView.effect = nil // Title stays clear of glass chrome
+      avatarGlassView.effect = makeGlassEffect()
+      menuGlassView.effect = makeGlassEffect()
+      savedSearchCancelGlassView.effect = makeGlassEffect()
+      rightActionsGlassView.effect = makeGlassEffect()
+      profileBackGlassView.effect = makeGlassEffect()
+      profileMenuGlassView.effect = makeGlassEffect()
 
-      let menuEffect = UIGlassEffect()
-      menuEffect.isInteractive = true
-      menuEffect.tintColor = .clear
-      menuGlassView.effect = menuEffect
-      let searchCancelEffect = UIGlassEffect()
-      searchCancelEffect.isInteractive = true
-      searchCancelEffect.tintColor = .clear
-      savedSearchCancelGlassView.effect = searchCancelEffect
-      
-      let rightActionsEffect = UIGlassEffect()
-      rightActionsEffect.isInteractive = true
-      rightActionsEffect.tintColor = .clear
-      rightActionsGlassView.effect = rightActionsEffect
-      
-      let profileBackEffect = UIGlassEffect()
-      profileBackEffect.isInteractive = true
-      profileBackEffect.tintColor = .clear
-      profileBackGlassView.effect = profileBackEffect
-      let profileMenuEffect = UIGlassEffect()
-      profileMenuEffect.isInteractive = true
-      profileMenuEffect.tintColor = .clear
-      profileMenuGlassView.effect = profileMenuEffect
+      let collection = chatListView.collectionView
+      collection.topEdgeEffect.isHidden = false
+      collection.topEdgeEffect.style = .soft
+      collection.bottomEdgeEffect.isHidden = false
+      collection.bottomEdgeEffect.style = .soft
+
+      profileScrollView.topEdgeEffect.isHidden = false
+      profileScrollView.topEdgeEffect.style = .soft
+      profileScrollView.bottomEdgeEffect.isHidden = false
+      profileScrollView.bottomEdgeEffect.style = .soft
     } else {
-      backGlassView.effect = UIBlurEffect(style: .systemMaterial)
-      titleGlassView.effect = UIBlurEffect(style: .systemMaterial)
-      avatarGlassView.effect = UIBlurEffect(style: .systemMaterial)
-      menuGlassView.effect = UIBlurEffect(style: .systemMaterial)
-      savedSearchCancelGlassView.effect = UIBlurEffect(style: .systemMaterial)
-      rightActionsGlassView.effect = UIBlurEffect(style: .systemMaterial)
-      profileBackGlassView.effect = UIBlurEffect(style: .systemMaterial)
-      profileMenuGlassView.effect = UIBlurEffect(style: .systemMaterial)
+      // Forced Dark/Light materials = system chrome only, not adaptive content blur tint.
+      let material: UIBlurEffect.Style =
+        isDark ? .systemMaterialDark : .systemMaterialLight
+      backGlassView.effect = UIBlurEffect(style: material)
+      titleGlassView.effect = UIBlurEffect(style: material)
+      avatarGlassView.effect = UIBlurEffect(style: material)
+      menuGlassView.effect = UIBlurEffect(style: material)
+      savedSearchCancelGlassView.effect = UIBlurEffect(style: material)
+      rightActionsGlassView.effect = UIBlurEffect(style: material)
+      profileBackGlassView.effect = UIBlurEffect(style: material)
+      profileMenuGlassView.effect = UIBlurEffect(style: material)
     }
   }
 
@@ -3777,20 +3934,20 @@ public final class ChatMainView: UIView,
       ? UIColor(white: 1.0, alpha: 0.06) : UIColor(white: 0.0, alpha: 0.04)
 
     backgroundColor = .clear
-    headerMaskBlurView.effect =
-      UIBlurEffect(style: isDarkTheme ? .systemThickMaterialDark : .systemThickMaterialLight)
-    headerMaskOverlayView.backgroundColor =
-      chatBackground.withAlphaComponent(isDarkTheme ? 0.78 : 0.70)
     rootWallpaperLayer.isHidden = appearance.backgroundMode == "transparent"
     rootWallpaperLayer.colors = appearance.wallpaperGradient.map(\.cgColor)
     rootWallpaperLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
     rootWallpaperLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
     rootWallpaperLayer.opacity = Float(max(0.0, min(1.0, appearance.wallpaperOpacity)))
-    backGlassView.contentView.backgroundColor = chatBackground.withAlphaComponent(0.10)
+    // Glass contentViews stay clear — system light/dark tint is on UIGlassEffect / mask only.
+    // Do NOT use wallpaper or bubble colors here (that recolored chrome with list content).
+    backGlassView.contentView.backgroundColor = .clear
     titleGlassView.contentView.backgroundColor = .clear
-    avatarGlassView.contentView.backgroundColor = appearance.bubbleThemColor.withAlphaComponent(0.22)
-    menuGlassView.contentView.backgroundColor = chatBackground.withAlphaComponent(0.10)
-    savedSearchCancelGlassView.contentView.backgroundColor = chatBackground.withAlphaComponent(0.10)
+    avatarGlassView.contentView.backgroundColor = .clear
+    menuGlassView.contentView.backgroundColor = .clear
+    savedSearchCancelGlassView.contentView.backgroundColor = .clear
+    rightActionsGlassView.contentView.backgroundColor = .clear
+    // Header glass + mask follow system light/dark (not appearance.isDark / wallpaper).
     refreshHeaderGlass()
 
     profileHeaderContainer.backgroundColor = .clear
@@ -3950,15 +4107,29 @@ public final class ChatMainView: UIView,
     // read anymore, the leading dot already carries that as a color. While a run is
     // active this branch never wins: the live agent-progress subtitle above it renders
     // the working payload (Thinking / Reading …) as before.
+    //
+    // After a History pick: show **Loading…** until the session rows land — never the
+    // idle "Start session" default. Once loaded, show the session title (topic).
     let trimmedSessionTopic =
       (bridgeSessionTopic ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    let bridgeIdleAction: String? =
-      (!bridgeProvider.isEmpty && headerMode != .savedMessages)
-      ? (trimmedSessionTopic.isEmpty ? "Start session" : trimmedSessionTopic)
-      : nil
+    let historySessionScoped = chatListView.bridgeHistorySessionId() != nil
+    let historySessionLoading = chatListView.isBridgeHistorySessionLoading()
+    let bridgeIdleAction: String? = {
+      guard !bridgeProvider.isEmpty, headerMode != .savedMessages else { return nil }
+      // Explicit history load in flight → always Loading (spinner is also up).
+      if historySessionLoading { return "Loading…" }
+      // Scoped session already painted → its History title, or Loading if title unknown.
+      if historySessionScoped {
+        return trimmedSessionTopic.isEmpty ? "Loading…" : trimmedSessionTopic
+      }
+      // Fresh / no session → default entry point into History.
+      return "Start session"
+    }()
     let resolvedDirectTyping = resolvedDirectTypingSubtitle()
     let groupTypingSubtitle = resolvedGroupTypingSubtitle()
-    let connectionSubtitle = defersEngineStateRefreshes ? nil : resolvedEngineConnectionSubtitle()
+    // Synced with Home principal: Connecting → Updating (spinner left + text).
+    let connectionPhase =
+      defersEngineStateRefreshes ? ConnectionHeaderPhase.none : resolvedConnectionHeaderPhase()
     let engineSubtitle = defersEngineStateRefreshes ? nil : resolvedEnginePresenceSubtitle()
     let trimmedSubtitle = chatSubtitleText.trimmingCharacters(in: .whitespacesAndNewlines)
     let subtitleLower = trimmedSubtitle.lowercased()
@@ -3967,6 +4138,16 @@ public final class ChatMainView: UIView,
       resolvedSubtitle = ""
     } else if let resolvedApproval {
       resolvedSubtitle = resolvedApproval
+    } else if connectionPhase == .connecting {
+      // Offline / socket down — never show "Updating" here.
+      resolvedSubtitle = "Connecting"
+    } else if connectionPhase == .updating,
+      resolvedAgentProgress == nil,
+      resolvedDirectTyping == nil,
+      groupTypingSubtitle == nil
+    {
+      // List/history catch-up while connected; yield to live typing/agent work.
+      resolvedSubtitle = "Updating"
     } else if isGroupOrChannel, let groupTypingSubtitle {
       // In a group the agents run in parallel, so surface "Claude & Codex typing…"
       // (all active participants) instead of a single agent's working/thinking label.
@@ -3980,8 +4161,8 @@ public final class ChatMainView: UIView,
       resolvedSubtitle = resolvedDirectTyping
     } else if let groupTypingSubtitle {
       resolvedSubtitle = groupTypingSubtitle
-    } else if let connectionSubtitle {
-      resolvedSubtitle = connectionSubtitle
+    } else if connectionPhase == .updating {
+      resolvedSubtitle = "Updating"
     } else if let engineSubtitle {
       resolvedSubtitle = engineSubtitle
     } else if isOnline && shouldShowDirectPresence()
@@ -4006,7 +4187,33 @@ public final class ChatMainView: UIView,
 
     chatTitleLabel.text = resolvedTitle
     chatSubtitleLabel.text = resolvedSubtitle
-    chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
+    // Dot + line spinner + Connecting/Updating (synced with Home). Spinner/dot
+    // slots stay in layout (alpha only) so subtitle text doesn't jump.
+    let showsConnectionChrome =
+      connectionPhase != .none
+      && (resolvedSubtitle == "Connecting" || resolvedSubtitle == "Updating")
+    if showsConnectionChrome {
+      chatConnectingSpinner.color = appearance.timeColorThem.withAlphaComponent(0.9)
+      chatConnectingSpinner.isHidden = false
+      chatConnectingSpinner.startAnimating()
+      chatConnectingSpinner.alpha = 1
+      chatSubtitleLabel.isHidden = false
+      // Status dot for Connecting (amber) / Updating (accent) — same idea as Home.
+      chatSubtitleDotView.isHidden = false
+      chatSubtitleDotView.backgroundColor =
+        connectionPhase == .connecting
+        ? UIColor(red: 1.0, green: 0.72, blue: 0.18, alpha: 1.0)
+        : (appearance.bubbleMeGradient.last
+          ?? appearance.bubbleMeGradient.first
+          ?? UIColor.systemBlue)
+      setSubtitleDotPulsing(connectionPhase == .connecting)
+    } else {
+      chatConnectingSpinner.stopAnimating()
+      // Keep the slot: do not collapse with isHidden (that shifts text left).
+      chatConnectingSpinner.isHidden = false
+      chatConnectingSpinner.alpha = 0
+      chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
+    }
 
     // Bridge (agent) chats get a small leading dot: solid green/red for connected state,
     // breathing while blocked on an approval (a static state that needs the user). Live
@@ -4014,21 +4221,24 @@ public final class ChatMainView: UIView,
     // setSubtitleTextShimmering) so the dot stays a steady "still connected" read.
     // Everything here is a friendly state, never the raw tool/command payload the bridge
     // streams internally.
-    let showsBridgeDot = !bridgeProvider.isEmpty && !resolvedSubtitle.isEmpty
-    chatSubtitleDotView.isHidden = !showsBridgeDot
-    if showsBridgeDot {
-      let dotColor: UIColor
-      if resolvedApproval != nil {
-        dotColor = UIColor(red: 1.0, green: 0.62, blue: 0.04, alpha: 1.0)
-      } else if resolvedAgentProgress != nil || AgentPairingService.lastConnected {
-        dotColor = UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
+    let showsBridgeDot =
+      !showsConnectionChrome && !bridgeProvider.isEmpty && !resolvedSubtitle.isEmpty
+    if !showsConnectionChrome {
+      chatSubtitleDotView.isHidden = !showsBridgeDot
+      if showsBridgeDot {
+        let dotColor: UIColor
+        if resolvedApproval != nil {
+          dotColor = UIColor(red: 1.0, green: 0.62, blue: 0.04, alpha: 1.0)
+        } else if resolvedAgentProgress != nil || AgentPairingService.lastConnected {
+          dotColor = UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
+        } else {
+          dotColor = UIColor(red: 1.0, green: 0.27, blue: 0.27, alpha: 1.0)
+        }
+        chatSubtitleDotView.backgroundColor = dotColor
+        setSubtitleDotPulsing(resolvedApproval != nil)
       } else {
-        dotColor = UIColor(red: 1.0, green: 0.27, blue: 0.27, alpha: 1.0)
+        setSubtitleDotPulsing(false)
       }
-      chatSubtitleDotView.backgroundColor = dotColor
-      setSubtitleDotPulsing(resolvedApproval != nil)
-    } else {
-      setSubtitleDotPulsing(false)
     }
     // Groups shimmer on the named typing label (their live signal); DMs on agent progress.
     setSubtitleTextShimmering(
@@ -4057,18 +4267,21 @@ public final class ChatMainView: UIView,
         }
         if resolvedDirectTyping != nil
           || groupTypingSubtitle != nil
-          || (connectionSubtitle == nil && bridgeIdleAction == nil && isOnline && shouldShowDirectPresence())
+          || (bridgeIdleAction == nil && isOnline && shouldShowDirectPresence())
         {
           return UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
         }
         if bridgeIdleAction != nil, resolvedSubtitle == bridgeIdleAction {
           return appearance.timeColorThem.withAlphaComponent(0.85)
         }
-        if connectionSubtitle != nil {
-          return appearance.textColorThem.withAlphaComponent(0.9)
+        if showsConnectionChrome {
+          return appearance.timeColorThem.withAlphaComponent(0.9)
         }
         return appearance.timeColorThem.withAlphaComponent(0.85)
       }()
+    if showsConnectionChrome {
+      chatConnectingSpinner.color = chatSubtitleLabel.textColor
+    }
   }
 
   /// Drives the header's leading status dot: a soft breathing opacity loop while the
@@ -4485,38 +4698,57 @@ public final class ChatMainView: UIView,
     return formatLastSeenSubtitle(lastSeen)
   }
 
-  private func resolvedEngineConnectionSubtitle() -> String? {
-    guard shouldShowDirectPresence() else { return nil }
-    if isOnline { return nil }
+  private enum ConnectionHeaderPhase {
+    case none
+    case connecting
+    case updating
+  }
 
+  /// Same tree as Home principal: Connecting (offline/socket) → Updating (history
+  /// / catch-up while connected) → none (ready).
+  private func resolvedConnectionHeaderPhase() -> ConnectionHeaderPhase {
+    if isEngineConnectedForHeader() {
+      if isHistoryOrCatchUpUpdating() { return .updating }
+      return .none
+    }
+    return .connecting
+  }
+
+  private func isEngineConnectedForHeader() -> Bool {
     let status = ChatEngine.shared.getStatus()
-    let connected = (status["connected"] as? Bool) == true
-    if connected { return nil }
-
+    if (status["connected"] as? Bool) == true { return true }
     let stateValue =
       (status["state"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased() ?? ""
+    return stateValue == "native-socket-open" || stateValue == "connected-shadow"
+  }
 
-    if stateValue == "native-socket-open" || stateValue == "connected-shadow" {
-      return nil
+  /// True while history / session payload is applying for this chat (Updating only).
+  private func isHistoryOrCatchUpUpdating() -> Bool {
+    if chatListView.isBridgeHistorySessionLoading() { return true }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !chatId.isEmpty, ChatEngine.shared.isChatHistoryLoading(chatId: chatId) {
+      return true
     }
+    return isHistoryLoadingSpinnerActive()
+  }
 
-    switch stateValue {
-    case "connecting-native-presence":
-      return nil
-    case "configured", "configured-native-bootstrap", "native-config-missing":
-      return "updating..."
-    case "native-socket-closed", "disconnected":
-      return "waiting for network"
-    default:
-      if stateValue.contains("connect") { return nil }
-      if stateValue.contains("config") || stateValue.contains("bootstrap")
-        || stateValue.contains("update")
-      {
-        return "updating..."
-      }
-      return "connection issue"
+  private func isHistoryLoadingSpinnerActive() -> Bool {
+    false
+  }
+
+  /// Legacy name kept for call sites; connection chrome is phase-driven now.
+  private func shouldShowConnectingSpinner() -> Bool {
+    resolvedConnectionHeaderPhase() != .none
+  }
+
+  /// Legacy name kept for call sites that still want a string.
+  private func resolvedEngineConnectionSubtitle() -> String? {
+    switch resolvedConnectionHeaderPhase() {
+    case .connecting: return "Connecting"
+    case .updating: return "Updating"
+    case .none: return nil
     }
   }
 
@@ -5099,6 +5331,12 @@ public final class ChatMainView: UIView,
 
   @objc private func handleNewChatPressed() {
     chatListView.startNewBridgeSession()
+    // Drop the History-session title so the idle header returns to "Start session"
+    // instead of the previous pick's topic / "Loading…".
+    if bridgeSessionTopic != nil {
+      bridgeSessionTopic = nil
+      updateHeaderTexts()
+    }
     // A history session can be opened while the bridge-connect gate owns the input
     // state. Starting a fresh session from that already-connected chat must restore
     // the native composer; otherwise the view is left as an unusable blank surface.
@@ -5255,6 +5493,12 @@ public final class ChatMainView: UIView,
     updateHeaderTexts()
     updateProfileTexts()
     updateAvatarViews()
+  }
+
+  /// Broadcast channel vs multi-member group. Forwarded so History loading can
+  /// pick skeleton (channel) vs modern spinner (direct / group).
+  func setIsChannel(_ value: Bool) {
+    chatListView.setIsChannel(value)
   }
 
   private func getAgentDocuments() -> [(id: String, name: String, url: String)] {

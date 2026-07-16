@@ -557,6 +557,9 @@ struct ChatRoute: Identifiable, Hashable {
   }
 
   init(row: ChatHomeListRow) {
+    // Route creation IS the tap: anchor every [ChatOpen] host-stage log to it so the
+    // full tap→settled timeline reads out of one log stream.
+    VibeChatOpenTap.uptime = ProcessInfo.processInfo.systemUptime
     // Groups never resolve to a bridge agent — even if a stale/cached row leaked an
     // agent peerUserId (pre-fix "group opens Codex" bug). See the designated init.
     let resolvedBridge =
@@ -572,11 +575,11 @@ struct ChatRoute: Identifiable, Hashable {
       ? (row.initialMessages.isEmpty ? row.previewRows : row.initialMessages)
       : []
     NSLog(
-      "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ isGroup=%@ isChannel=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@ members=%d myRole=%@",
+      "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ isGroup=%@ isChannel=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@ members=%d myRole=%@ initial=%d",
       row.chatId, row.title, row.isGroup ? "Y" : "N", row.isChannel ? "Y" : "N",
       row.peerUserId ?? "nil",
       row.peerAgentId ?? "nil", row.isAgentFriend ? "true" : "false", resolvedBridge ?? "nil",
-      row.members.count, row.myRole ?? "<nil>")
+      row.members.count, row.myRole ?? "<nil>", cachedRows.count)
     self.init(
       chatId: row.chatId,
       title: row.title,
@@ -1239,6 +1242,19 @@ final class AppShellCoordinator: ObservableObject {
         nav.popViewController(animated: true)
       }
     )
+    // Commit-first push: load the view (route apply + engine bind + seed stash,
+    // ~15-40ms) but never force a layout here. Forcing it materialized every visible
+    // transcript cell synchronously before the slide's first frame — 114-547ms of
+    // dead screen between tap and slide, the exact felt delay — and measured bubbles
+    // at detached-view width (no safe area → w[365→385] height-cache misses).
+    // ChatListView stashes the seed and mounts it one tick after the transition
+    // commits, so the slide starts immediately and content joins it mid-flight.
+    let prePushStartedAt = ProcessInfo.processInfo.systemUptime
+    controller.loadViewIfNeeded()
+    NSLog(
+      "[ChatOpen] host-stage pre-push loadView %dms chatId=%@",
+      Int((ProcessInfo.processInfo.systemUptime - prePushStartedAt) * 1000),
+      String(route.chatId.prefix(12)))
     // The conversation is full-screen above the tab bar controller, so it
     // covers the tab bar by z-order; no hidesBottomBarWhenPushed needed.
     nav.pushViewController(controller, animated: true)
@@ -1295,14 +1311,28 @@ final class AppShellCoordinator: ObservableObject {
 
 @MainActor
 private final class ChatsViewModel: ObservableObject {
+  /// Home carries only enough recent raw rows to paint the first chat viewport. The
+  /// complete history remains in ChatEngine and attaches after the navigation push.
+  private static let chatFirstPaintTailLimit = 16
   @Published var rows: [ChatHomeListRow] = []
   @Published var archivedRows: [ChatHomeListRow] = []
   @Published var isLoading = false
   @Published var isLoadingArchived = false
+  /// True while ChatEngine is not connected (socket bootstrap / reconnect / offline).
+  @Published var isConnecting = false
+  /// True while a home-list fetch is in flight *and* we are already connected.
+  @Published var isListUpdating = false
   @Published var isWaitingForNetwork = false
   @Published var errorMessage: String?
   @Published var hasLoaded = false
   @Published var hasLoadedArchived = false
+
+  /// Hard-refreshed principal header: Connecting → Updating → Chats.
+  var headerState: AppHomeHeaderState {
+    if isConnecting || isWaitingForNetwork { return .connecting }
+    if isListUpdating || isLoading { return .updating }
+    return .ready
+  }
 
   private var backgroundRefreshTask: Task<Void, Never>?
   private var agentConversationObserver: NSObjectProtocol?
@@ -1311,8 +1341,11 @@ private final class ChatsViewModel: ObservableObject {
   private var realtimeRefreshTask: Task<Void, Never>?
   private var locallyRemovedChatIDs = Set<String>()
   private var projectedMessageIDsByChat = [String: String]()
+  private var warmingFirstPaintTailChatIDs = Set<String>()
 
   init() {
+    refreshConnectionState()
+
     agentConversationObserver = NotificationCenter.default.addObserver(
       forName: ChatNativeAgentView.conversationsDidChangeNotification,
       object: nil,
@@ -1337,6 +1370,13 @@ private final class ChatsViewModel: ObservableObject {
         guard let self else { return }
         let reason = note.userInfo?["reason"] as? String
         let chatID = Self.normalizedString(note.userInfo?["chatId"])
+        // Connection tree always hard-refreshes on engine status churn.
+        if reason == "connectionStateChanged"
+          || reason == "configure"
+          || reason == "engineError"
+        {
+          self.refreshConnectionState()
+        }
         switch reason {
         case "chatCleared":
           if let chatID {
@@ -1409,6 +1449,29 @@ private final class ChatsViewModel: ObservableObject {
     }
     if let bridgeStatusObserver {
       NotificationCenter.default.removeObserver(bridgeStatusObserver)
+    }
+  }
+
+  /// Mirrors ChatMainView connection detection so Home + chat headers stay in sync.
+  static func isEngineConnected() -> Bool {
+    let status = ChatEngine.shared.getStatus()
+    if (status["connected"] as? Bool) == true { return true }
+    let stateValue =
+      (status["state"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased() ?? ""
+    return stateValue == "native-socket-open" || stateValue == "connected-shadow"
+  }
+
+  private func refreshConnectionState() {
+    let connected = Self.isEngineConnected()
+    let next = !connected
+    if isConnecting != next {
+      isConnecting = next
+    }
+    // Offline never shows "Updating" — clear list-update flag when we drop offline.
+    if next, isListUpdating {
+      isListUpdating = false
     }
   }
 
@@ -1500,14 +1563,22 @@ private final class ChatsViewModel: ObservableObject {
       ?? (message["timestamp_ms"] as? NSNumber)?.doubleValue
       ?? Date().timeIntervalSince1970 * 1000
 
+    let firstPaintTail = Array(engineRows.suffix(Self.chatFirstPaintTailLimit))
     let changed = mutateRow(chatID: normalizedChatID) { row in
-      row.withHomeState(
+      // Bridge/built-in agent surfaces keep their existing volatility/session behavior.
+      // Normal chats only need a bounded latest tail in Home; the complete engine
+      // snapshot stays engine-side for asynchronous attachment after the push begins.
+      let projectedRows =
+        row.isBuiltInAgentSurface || row.isBridgeAgentSurface
+        ? engineRows
+        : firstPaintTail
+      return row.withHomeState(
         preview: preview,
         timeLabel: timeLabel.isEmpty ? row.timeLabel : timeLabel,
         unreadCount: shouldIncrementUnread ? row.unreadCount + 1 : row.unreadCount,
         markedUnread: shouldIncrementUnread ? true : row.markedUnread,
-        previewRows: engineRows,
-        initialMessages: engineRows,
+        previewRows: projectedRows,
+        initialMessages: projectedRows,
         lastMessageAt: max(row.lastMessageAt, messageAt)
       )
     }
@@ -1545,7 +1616,10 @@ private final class ChatsViewModel: ObservableObject {
         isAgent: row.isAgentFriend,
         agentId: row.peerAgentId
       ) ?? row.title
-      return row.withHomeState(preview: "\(ChatRoute.bridgeDisplayName(for: provider)) is \(label)")
+      return row.withHomeState(
+        preview: "\(ChatRoute.bridgeDisplayName(for: provider)) is \(label)",
+        lastMessageAt: max(row.lastMessageAt, Date().timeIntervalSince1970 * 1000.0)
+      )
     }
     if changed {
       persistHomeRows()
@@ -1586,7 +1660,9 @@ private final class ChatsViewModel: ObservableObject {
       rows = cachedRows
       hasLoaded = true
       isLoading = false
+      isListUpdating = false
       isWaitingForNetwork = false
+      refreshConnectionState()
       errorMessage = nil
       warmCachedRows(cachedRows, shouldFetchHistory: false)
       scheduleArchivedLoadIfNeeded()
@@ -1636,14 +1712,44 @@ private final class ChatsViewModel: ObservableObject {
       return
     }
 
+    refreshConnectionState()
     isLoading = rows.isEmpty && !preserveRows
+    // "Updating" only while connected and a list fetch is running. Offline/connecting
+    // stays on Connecting — never both at once.
+    isListUpdating = !isConnecting
     isWaitingForNetwork = false
     errorMessage = nil
-    defer { isLoading = false }
+    defer {
+      isLoading = false
+      isListUpdating = false
+    }
 
     do {
       let fetchedRows = try await ChatHomeService.fetchChats(config: config)
-      let nextRows = fetchedRows.filter { !locallyRemovedChatIDs.contains($0.chatId) }
+      let existingRowsByChatID = Dictionary(
+        rows.map { ($0.chatId, $0) },
+        uniquingKeysWith: { current, _ in current }
+      )
+      let nextRows = fetchedRows
+        .filter { !locallyRemovedChatIDs.contains($0.chatId) }
+        .map { fetchedRow in
+          guard !fetchedRow.isBuiltInAgentSurface, !fetchedRow.isBridgeAgentSurface,
+            let existingRow = existingRowsByChatID[fetchedRow.chatId]
+          else { return fetchedRow }
+          let fetchedTail = fetchedRow.initialMessages.isEmpty
+            ? fetchedRow.previewRows
+            : fetchedRow.initialMessages
+          let existingTail = existingRow.initialMessages.isEmpty
+            ? existingRow.previewRows
+            : existingRow.initialMessages
+          // Home responses intentionally carry only a tiny preview. Do not shrink a
+          // richer device-restored first-paint tail on every background refresh.
+          guard existingTail.count > fetchedTail.count else { return fetchedRow }
+          return fetchedRow.withHomeState(
+            previewRows: existingTail,
+            initialMessages: existingTail
+          )
+        }
       if Self.rowsSnapshotSignature(nextRows) != Self.rowsSnapshotSignature(rows) {
         // [EmptyTrace] Main (home) list jumps to empty here: a fetch that returned nothing
         // (or everything filtered out) replaces a populated list. Log the transition so the
@@ -1664,11 +1770,17 @@ private final class ChatsViewModel: ObservableObject {
       }
       hasLoaded = true
       isWaitingForNetwork = false
+      refreshConnectionState()
       warmCachedRows(nextRows, shouldFetchHistory: true)
       scheduleArchivedLoadIfNeeded()
     } catch {
       let offline = ChatHomeService.isOfflineError(error)
       isWaitingForNetwork = offline
+      refreshConnectionState()
+      // Offline path: Connecting only — never leave "Updating" stuck on.
+      if offline {
+        isConnecting = true
+      }
       if rows.isEmpty {
         errorMessage = error.localizedDescription
       } else {
@@ -1720,7 +1832,7 @@ private final class ChatsViewModel: ObservableObject {
   }
 
   private func warmCachedRows(_ rows: [ChatHomeListRow], shouldFetchHistory: Bool) {
-    let visibleRows = Array(rows.prefix(4))
+    let visibleRows = Array(rows.prefix(8))
     for row in visibleRows
     where !row.isBuiltInAgentSurface && !row.isBridgeAgentSurface && !row.initialMessages.isEmpty {
       ChatEngine.shared.seedRecentChatHistory(
@@ -1729,6 +1841,13 @@ private final class ChatsViewModel: ObservableObject {
         limit: 3
       )
     }
+
+    // Home's API/cache may carry only the newest preview message even though the
+    // complete encrypted transcript is already persisted on this device. Restore a
+    // bounded raw tail off-main while Home is visible, then persist it back into the
+    // Home row. The first chat route can now paint eight rows before its first layout
+    // pass without ever blocking navigation on ChatEngine's serial queue.
+    warmFirstPaintTailsFromEngineCache(visibleRows)
 
     guard shouldFetchHistory else { return }
     let preloadChatIds =
@@ -1740,6 +1859,59 @@ private final class ChatsViewModel: ObservableObject {
       "ChatsViewModel warmCachedRows rows=\(rows.count) preload=\(preloadChatIds.map { String($0.prefix(12)) }.joined(separator: ","))"
     )
     ChatEngine.shared.prefetchChatHistories(chatIds: preloadChatIds)
+  }
+
+  private func warmFirstPaintTailsFromEngineCache(_ rows: [ChatHomeListRow]) {
+    let tailLimit = Self.chatFirstPaintTailLimit
+    // The most recent chats also get a complete parsed warm snapshot so their first
+    // open after relaunch mounts the whole transcript during the push (paired with
+    // disk-persisted heights) instead of a 16-row tail plus a late ~100-row insert.
+    var fullPrewarmBudget = 3
+    for row in rows where !row.isBuiltInAgentSurface && !row.isBridgeAgentSurface {
+      let chatID = row.chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !chatID.isEmpty, !warmingFirstPaintTailChatIDs.contains(chatID) else { continue }
+      warmingFirstPaintTailChatIDs.insert(chatID)
+      let allowFullPrewarm = fullPrewarmBudget > 0
+      let peerDisplayName = row.title
+      if allowFullPrewarm { fullPrewarmBudget -= 1 }
+
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let engineRows = ChatEngine.shared.getChatRows(["chatId": chatID])
+        if allowFullPrewarm {
+          ChatListView.prewarmWarmTranscriptSnapshot(
+            chatId: chatID,
+            sourceRows: engineRows,
+            peerDisplayName: peerDisplayName
+          )
+        }
+        let tail = Array(engineRows.suffix(tailLimit))
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
+          self.warmingFirstPaintTailChatIDs.remove(chatID)
+          guard !tail.isEmpty else { return }
+
+          guard let existingRow = self.rows.first(where: { $0.chatId == chatID }) else { return }
+          let existingTail = existingRow.initialMessages.isEmpty
+            ? existingRow.previewRows
+            : existingRow.initialMessages
+          guard tail.count > existingTail.count else { return }
+          var previousCount = 0
+          let changed = self.mutateRow(chatID: chatID) { current in
+            let currentTail = current.initialMessages.isEmpty
+              ? current.previewRows
+              : current.initialMessages
+            previousCount = currentTail.count
+            guard tail.count > currentTail.count else { return current }
+            return current.withHomeState(previewRows: tail, initialMessages: tail)
+          }
+          guard changed, tail.count > previousCount else { return }
+          self.persistHomeRows()
+          NSLog(
+            "[ChatOpen] home-tail WARM chat=%@ previous=%d cached=%d tail=%d",
+            String(chatID.prefix(12)), previousCount, engineRows.count, tail.count)
+        }
+      }
+    }
   }
 
   private func mutateRow(
@@ -1835,6 +2007,7 @@ private final class ChatsViewModel: ObservableObject {
         "\(row.isOnline)",
         row.avatarUri ?? "",
         row.peerTier ?? "",
+        "\(row.lastMessageAt)",
       ].joined(separator: "\u{1F}")
     }.joined(separator: "\u{1E}")
   }
@@ -1963,6 +2136,8 @@ private struct ChatHomeScreen: View {
   @State private var isShowingGroupCreation = false
   @State private var homeSearchQuery = ""
   @State private var isHomeSearchFocused = false
+  /// Shared geometry for the search field morph (list entry → focused bar + close).
+  @Namespace private var homeSearchNamespace
   @State private var locallyHiddenChatIDs = Set<String>()
   @State private var pendingDeleteConfirmation: ChatHomeDeleteConfirmation?
   @State private var pendingDeletion: ChatHomePendingDeletion?
@@ -1988,8 +2163,9 @@ private struct ChatHomeScreen: View {
     Self.sortedForHome(model.rows.filter { !locallyHiddenChatIDs.contains($0.chatId) })
   }
 
-  /// Home ordering: Saved Messages, then the built-in agent quick-access row, then
-  /// user-pinned chats, then everything else — each bucket newest-activity-first.
+  /// Home ordering: pinned chats (Saved Messages included), then every other chat by
+  /// newest activity. Agent surfaces intentionally share the same recency rules as
+  /// people/groups, so a new Claude/Codex/Grok message lands immediately below pins.
   /// Stable within equal keys via `chatId` (not the transient source index) so a
   /// full refresh with the same timestamps cannot reshuffle rows and "jump" the list.
   private static func sortedForHome(_ rows: [ChatHomeListRow]) -> [ChatHomeListRow] {
@@ -2006,10 +2182,8 @@ private struct ChatHomeScreen: View {
   }
 
   private static func homeSortRank(_ row: ChatHomeListRow) -> Int {
-    if row.isSavedMessages { return 0 }
-    if row.isBuiltInAgentSurface { return 1 }
-    if row.pinned { return 2 }
-    return 3
+    if row.isSavedMessages || row.pinned { return 0 }
+    return 1
   }
 
   private var visibleArchivedRows: [ChatHomeListRow] {
@@ -2135,21 +2309,91 @@ private struct ChatHomeScreen: View {
     Task { _ = await openChat(for: user) }
   }
 
+  /// Rows shown in the home table: full list, or filtered when searching with a query.
+  /// Focus alone does not swap the table away (avoids flash) — recent avatars open in-header.
+  private var homeListDisplayRows: [ChatHomeListRow] {
+    if isHomeSearchFocused && !trimmedHomeQuery.isEmpty {
+      return filteredRows
+    }
+    return filteredRows
+  }
+
+  private var recentSearchRows: [ChatHomeListRow] {
+    filteredRows.filter { !$0.isArchiveEntry }.prefix(16).map { $0 }
+  }
+
+  private var homeSearchSpring: Animation {
+    .spring(response: 0.34, dampingFraction: 0.88)
+  }
+
+  private func openHomeSearch() {
+    setTabBarHidden(true, animated: true)
+    if isEditingHome {
+      isEditingHome = false
+      selectedChatIDs.removeAll()
+    }
+    withAnimation(homeSearchSpring) {
+      isHomeSearchFocused = true
+    }
+  }
+
+  private func closeHomeSearch() {
+    withAnimation(homeSearchSpring) {
+      isHomeSearchFocused = false
+      homeSearchQuery = ""
+      globalResults = []
+    }
+    setTabBarHidden(isEditingHome, animated: true)
+  }
+
   var body: some View {
     NavigationStack {
       ZStack {
-        // Home UITableView extends under the transparent nav/search chrome and
-        // manages its own top contentInset. Search results use a native SwiftUI
-        // List that must KEEP safe-area padding so rows don't sit under the bar.
-        Group {
-          if trimmedHomeQuery.isEmpty {
-            listContent
-              .ignoresSafeArea(.container, edges: .top)
-          } else {
-            listContent
-          }
+        // Home list stays put. Fades under the shared search morph (no list Y translate).
+        listContent
+          .ignoresSafeArea(.container, edges: [.top, .bottom])
+          .background(palette.background.ignoresSafeArea())
+          .opacity(isHomeSearchFocused ? 0 : 1)
+          .allowsHitTesting(!isHomeSearchFocused)
+          .zIndex(0)
+
+        // Focused search surface: same field id as the entry (matchedGeometry),
+        // close control slides in from the trailing edge (Telegram).
+        if isHomeSearchFocused {
+          HomeTelegramSearchView(
+            query: $homeSearchQuery,
+            isFocused: $isHomeSearchFocused,
+            recentRows: recentSearchRows,
+            filteredChats: filteredRows.filter { !$0.isArchiveEntry || trimmedHomeQuery.isEmpty },
+            people: combinedPeopleResults,
+            isGlobalSearching: isGlobalSearching,
+            isDark: colorScheme == .dark,
+            palette: palette,
+            searchNamespace: homeSearchNamespace,
+            onSelectChat: { openLocalChatRow($0) },
+            onSelectPerson: { handleGlobalUserTap($0) },
+            onClose: closeHomeSearch
+          )
+          .transition(.opacity)
+          .zIndex(1)
         }
-        .background(palette.background.ignoresSafeArea())
+
+        // Edit pills: fixed overlay in the tab-bar band (tab bar only fades).
+        if isEditingHome && !isHomeSearchFocused {
+          VStack {
+            Spacer(minLength: 0)
+            ChatHomeEditActionBar(
+              selectedCount: selectedChatIDs.count,
+              isDark: colorScheme == .dark,
+              onMarkRead: { Task { await performHomeEditAction(.markRead) } },
+              onMute: { Task { await performHomeEditAction(.mute) } },
+              onDelete: { Task { await performHomeEditAction(.delete) } }
+            )
+            .padding(.bottom, 49)
+          }
+          .ignoresSafeArea(.container, edges: .bottom)
+          .zIndex(2)
+        }
 
         if let pendingDeletion {
           VStack {
@@ -2165,6 +2409,7 @@ private struct ChatHomeScreen: View {
           }
           .frame(maxWidth: .infinity, maxHeight: .infinity)
           .allowsHitTesting(true)
+          .zIndex(4)
         }
 
         if let confirmation = pendingDeleteConfirmation {
@@ -2183,86 +2428,113 @@ private struct ChatHomeScreen: View {
             }
           )
           .transition(.opacity.combined(with: .scale(scale: 0.98)))
-          .zIndex(3)
+          .zIndex(5)
         }
       }
+        .animation(homeSearchSpring, value: isHomeSearchFocused)
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: pendingDeletion?.id)
         .animation(.spring(response: 0.22, dampingFraction: 0.9), value: pendingDeleteConfirmation?.id)
         .navigationBarTitleDisplayMode(.inline)
-        // Keep toolbar slots stable so Edit ↔ Done and trailing icons animate
-        // inside SwiftUI's navigation chrome (no custom overlay / no slot teardown).
+        // Always keep toolbar items mounted. Search focus hides the bar via
+        // `.toolbar(.hidden)` (SwiftUI) — no item teardown, no custom Y offset.
         .toolbar {
           ToolbarItem(placement: .topBarLeading) {
             Button(isEditingHome ? "Done" : "Edit") {
-              withAnimation(.snappy(duration: 0.22)) {
-                isEditingHome.toggle()
-                if !isEditingHome {
-                  selectedChatIDs.removeAll()
-                }
+              isEditingHome.toggle()
+              if !isEditingHome {
+                selectedChatIDs.removeAll()
               }
             }
-            .font(.system(size: 17, weight: .semibold))
-            .tint(
-              (filteredRows.isEmpty && !isEditingHome)
-                ? (colorScheme == .dark ? Color.white.opacity(0.3) : Color.black.opacity(0.3))
-                : (colorScheme == .dark ? .white : .black)
-            )
+            .fontWeight(.semibold)
+            .tint(colorScheme == .dark ? .white : .black)
             .disabled(filteredRows.isEmpty && !isEditingHome)
           }
 
           ToolbarItem(placement: .principal) {
             AppHomeStatusHeaderView(
-              state: model.isWaitingForNetwork ? .waitingForNetwork : .ready,
+              state: model.headerState,
               palette: palette
             )
           }
 
-          ToolbarItemGroup(placement: .topBarTrailing) {
-            if !isEditingHome {
-              Button {
-                openAgentChat()
-              } label: {
-                Image("BrandLogo")
-                  .renderingMode(.template)
-                  .resizable()
-                  .scaledToFit()
-                  .foregroundStyle(colorScheme == .dark ? .white : .black)
-                  .frame(width: 22, height: 22)
-              }
-              .buttonStyle(.plain)
-              .contentShape(Rectangle())
+          if !isEditingHome {
+            // Single ToolbarItem + HStack (same as Contacts/Calls). ToolbarItemGroup
+            // uses the system glass inter-item gap which is wider on Home.
+            ToolbarItem(placement: .topBarTrailing) {
+              HStack(spacing: 18) {
+                Button {
+                  openAgentChat()
+                } label: {
+                  Image("BrandLogo")
+                    .renderingMode(.template)
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(colorScheme == .dark ? .white : .black)
+                    .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
 
-              Button {
-                isShowingStoryCamera = true
-              } label: {
-                AppVectorIcon(glyph: .story, tint: colorScheme == .dark ? .white : .black)
-                  .frame(width: 22, height: 22)
-              }
-              .buttonStyle(.plain)
-              .contentShape(Rectangle())
+                Button {
+                  isShowingStoryCamera = true
+                } label: {
+                  AppVectorIcon(glyph: .story, tint: colorScheme == .dark ? .white : .black)
+                    .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
 
-              Button {
-                isShowingSearch = true
-              } label: {
-                AppVectorIcon(glyph: .compose, tint: colorScheme == .dark ? .white : .black)
-                  .frame(width: 22, height: 22)
+                Button {
+                  isShowingSearch = true
+                } label: {
+                  AppVectorIcon(glyph: .compose, tint: colorScheme == .dark ? .white : .black)
+                    .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
               }
-              .buttonStyle(.plain)
-              .contentShape(Rectangle())
+              .padding(.horizontal, 6)
             }
           }
         }
-        .animation(.snappy(duration: 0.22), value: isEditingHome)
-        .searchable(
-          text: $homeSearchQuery,
-          isPresented: $isHomeSearchFocused,
-          // Native nav-bar drawer search (SwiftUI owns Cancel / focus animation).
-          placement: .navigationBarDrawer(displayMode: .always),
-          prompt: "Search Chats"
-        )
+        .toolbarBackground(.hidden, for: .navigationBar)
+        // Hide the system nav header on search focus (shared field morph owns the top).
+        .toolbar(isHomeSearchFocused ? .hidden : .visible, for: .navigationBar)
+        // Unfocused entry under the nav — system-searchable fill + matchedGeometry id
+        // shared with the focused bar (Telegram-style one field, not two glass pieces).
+        .safeAreaInset(edge: .top, spacing: 0) {
+          if !isEditingHome && !isHomeSearchFocused {
+            HomeSearchEntryField(
+              palette: palette,
+              searchNamespace: homeSearchNamespace
+            ) {
+              openHomeSearch()
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 6)
+          }
+        }
         .onChange(of: isHomeSearchFocused) { _, isPresented in
-          if !isPresented {
-            homeSearchQuery = ""
+          if isPresented {
+            setTabBarHidden(true, animated: true)
+            if isEditingHome {
+              isEditingHome = false
+              selectedChatIDs.removeAll()
+            }
+          } else {
+            if !homeSearchQuery.isEmpty {
+              homeSearchQuery = ""
+            }
+            globalResults = []
+            setTabBarHidden(isEditingHome, animated: true)
+          }
+        }
+        .onChange(of: isEditingHome) { _, editing in
+          setTabBarHidden(editing, animated: true)
+        }
+        .onDisappear {
+          if isEditingHome {
+            setTabBarHidden(false, animated: false)
           }
         }
         .navigationDestination(isPresented: $isShowingArchivedChats) {
@@ -2313,7 +2585,7 @@ private struct ChatHomeScreen: View {
       AppUITrace.notice(
         "ChatHomeScreen searchRequest changed requestId=\(coordinator.chatSearchPresentationRequestID) selectedTab=\(coordinator.selectedTab)"
       )
-      isHomeSearchFocused = true
+      openHomeSearch()
     }
     .sheet(isPresented: $isShowingSearch) {
       if let config = AppSessionConfig.current {
@@ -2352,12 +2624,8 @@ private struct ChatHomeScreen: View {
 
   @ViewBuilder
   private var listContent: some View {
-    if !trimmedHomeQuery.isEmpty {
-      searchResultsView
-    } else if !hasHomeRowsForAnyScope && (!model.hasLoaded || model.isLoading) {
-      ProgressView()
-        .controlSize(.regular)
-        .tint(palette.secondaryText)
+    if !hasHomeRowsForAnyScope && (!model.hasLoaded || model.isLoading) {
+      AppListLoadingView(palette: palette, caption: "Loading chats")
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(palette.background)
     } else if !hasHomeRowsForAnyScope {
@@ -2365,7 +2633,7 @@ private struct ChatHomeScreen: View {
         icon: """
         <?xml version="1.0" encoding="utf-8"?><svg fill="none" viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="cp-800-600"><rect height="600" width="800" y="0" x="0" /></clipPath><g id="comp_0"><g opacity="0" id="planete Outlines - Group 5"><animate repeatCount="indefinite" attributeName="opacity" dur="3s" begin="0s" calcMode="spline" values="0; 1; 1; 0" keyTimes="0; 0.3; 0.68; 1" keySplines="0.333 0 0.667 1; 0.333 0 0.667 1; 0.333 0 0.667 1" fill="freeze" /><g transform="translate(327.38,267.583)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="327.38 267.583; 482.38 267.583" keyTimes="0; 1" keySplines="0 0 1 1" fill="freeze" /><g transform="scale(0.5,0.5) translate(-171.76,-193.166)"><g id="Group 5" transform="matrix(1,0,0,1,171.76,193.166)"><path fill="#d0d2d3" fill-opacity="1" d="M59.669,-8.242C53.143,-8.242,47.22,-5.677,42.84,-1.506C42.047,-23.225,24.2,-40.592,2.287,-40.592C-17.519,-40.592,-34.001,-26.403,-37.576,-7.638C-39.31,-8.029,-41.111,-8.242,-42.962,-8.242C-56.447,-8.242,-67.378,2.69,-67.378,16.174C-67.378,16.467,-67.367,16.758,-67.356,17.049C-68.756,16.49,-70.279,16.174,-71.878,16.174C-78.62,16.174,-84.086,21.64,-84.086,28.383C-84.086,35.125,-78.62,40.591,-71.878,40.591L59.669,40.591C73.154,40.591,84.086,29.659,84.086,16.174C84.086,2.69,73.154,-8.242,59.669,-8.242Z" /></g></g></g></g><g id="Merged Shape Layer"><g transform="translate(390.319,298.2)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="390.319 298.2; 390.319 282.7; 390.319 319.25; 390.319 298.2" keyTimes="0; 0.293; 0.733; 1" keySplines="0.333 0 0.667 1; 0.333 0 0.667 1; 0.333 0 0.667 1" fill="freeze" /><g transform="rotate(0)"><animateTransform repeatCount="indefinite" type="rotate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="0; 35; 0" keyTimes="0; 0.513; 1" keySplines="0.547 0 0.667 1; 0.333 0 0.845 1" fill="freeze" /><g transform="scale(1,1) translate(-664.319,-256.2)"><g id="planete Outlines - Group 3" transform="matrix(0.5,0,0,0.5,515.5,129)"><g id="Group 3" transform="matrix(1,0,0,1,297.638,254.4)"><path fill="#5d68f9" fill-opacity="1" d="M-133.812,-42.171L133.812,-75.141L5.765,75.141L-61.708,18.402L124.227,-71.307L-87.011,-1.534L-133.812,-42.171Z" /></g></g><g id="planete Outlines - Group 2" transform="matrix(0.5,0,0,0.5,515.5,129)"><g id="Group 2" transform="matrix(1,0,0,1,316.247,247.882)"><path fill="#474bd8" fill-opacity="1" d="M-98.335,64.79L-105.619,4.984L105.619,-64.79L-80.316,24.919L-98.335,64.79Z" /></g></g><g id="planete Outlines - Group 1" transform="matrix(0.5,0,0,0.5,515.5,129.001)"><g id="Group 1" transform="matrix(1,0,0,1,236.879,292.737)"><path fill="#3931ac" fill-opacity="1" d="M18.967,-3.189L-18.967,19.935L-0.949,-19.935L18.967,-3.189Z" /></g></g></g></g></g></g><g opacity="0" id="planete Outlines - Group 4"><animate repeatCount="indefinite" attributeName="opacity" dur="2.4s" begin="0s" calcMode="spline" values="0; 0.5; 0.5; 0" keyTimes="0; 0.317; 0.733; 1" keySplines="0 0 1 1; 0 0 1 1; 0 0 1 1" fill="freeze" /><g transform="translate(468.336,323.378)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="2.04s" begin="0s" calcMode="spline" values="468.336 323.378; 294.336 323.378" keyTimes="0; 1" keySplines="0 0 1 1" fill="freeze" /><g transform="scale(0.5,0.5) translate(-453.672,-304.756)"><g id="Group 4" transform="matrix(1,0,0,1,453.672,304.756)"><path fill="#d0d2d3" fill-opacity="1" d="M75.134,16.175C74.353,16.175,73.591,16.256,72.85,16.396C72.851,16.322,72.856,16.249,72.856,16.175C72.856,2.691,61.924,-8.241,48.44,-8.241C46.662,-8.241,44.931,-8.046,43.262,-7.685C39.668,-26.427,23.196,-40.591,3.406,-40.591C-16.624,-40.591,-33.254,-26.077,-36.571,-6.995C-38.992,-7.799,-41.578,-8.241,-44.269,-8.241C-57.754,-8.241,-68.685,2.691,-68.685,16.175C-68.685,16.817,-68.652,17.45,-68.604,18.079C-70.494,16.88,-72.728,16.175,-75.133,16.175C-81.875,16.175,-87.341,21.641,-87.341,28.383C-87.341,35.126,-81.875,40.592,-75.133,40.592L75.134,40.592C81.876,40.592,87.342,35.126,87.342,28.383C87.342,21.641,81.876,16.175,75.134,16.175Z" /></g></g></g></g></g></defs><g transform="matrix(1.79,0,0,1.79,-310,-231)" id="Pre-comp 1"><use clip-path="url(#cp-800-600)" height="600" width="800" y="0" x="0" xlink:href="#comp_0" href="#comp_0" /></g></svg>
         """,
-        title: model.isWaitingForNetwork ? "Waiting for Network" : "No Messages Yet",
+        title: (model.isConnecting || model.isWaitingForNetwork) ? "Connecting" : "No Messages Yet",
         message: errorMessage ?? model.errorMessage
           ?? (model.isWaitingForNetwork
             ? "Your chats will stay here when the connection returns."
@@ -2381,7 +2649,7 @@ private struct ChatHomeScreen: View {
       ChatHomeNativeListRepresentable(
         rows: filteredRows,
         isDark: colorScheme == .dark,
-        isEditing: isEditingHome,
+        isEditing: isEditingHome && !isHomeSearchFocused,
         showsRightCheckmark: false,
         selectedChatIDs: selectedChatIDs,
         onSelect: { row in
@@ -2422,70 +2690,6 @@ private struct ChatHomeScreen: View {
     }
   }
 
-
-  @ViewBuilder
-  private var searchResultsView: some View {
-    let chats = filteredRows
-    let people = combinedPeopleResults
-    if chats.isEmpty && people.isEmpty {
-      ContactSearchStatusView(
-        isLoading: isGlobalSearching,
-        hasSearched: !isGlobalSearching,
-        message: isGlobalSearching ? "" : "No chats or people match \"\(trimmedHomeQuery)\".",
-        palette: palette
-      )
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .background(palette.background)
-    } else {
-      List {
-        if !chats.isEmpty {
-          Section {
-            ForEach(chats, id: \.chatId) { row in
-              Button { openLocalChatRow(row) } label: {
-                HomeSearchChatRow(row: row, palette: palette, isDark: colorScheme == .dark)
-              }
-              .buttonStyle(.plain)
-              .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-              .listRowSeparator(.hidden)
-              .listRowBackground(palette.background)
-            }
-          } header: {
-            Text("Chats")
-              .font(.system(size: 13, weight: .semibold))
-              .foregroundStyle(palette.secondaryText)
-              .textCase(nil)
-          }
-        }
-        if !people.isEmpty {
-          Section {
-            ForEach(people) { user in
-              Button { handleGlobalUserTap(user) } label: {
-                ContactSearchResultRow(user: user, isSaved: false, palette: palette)
-              }
-              .buttonStyle(.plain)
-              .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-              .listRowSeparator(.hidden)
-              .listRowBackground(palette.background)
-            }
-          } header: {
-            Text("People")
-              .font(.system(size: 13, weight: .semibold))
-              .foregroundStyle(palette.secondaryText)
-              .textCase(nil)
-          }
-        }
-      }
-      .listStyle(.plain)
-      .listSectionSpacing(8)
-      .scrollContentBackground(.hidden)
-      .background(palette.background)
-      // Match the home list's bottom breathing room; top is handled by the
-      // NavigationStack safe area (search results deliberately do NOT ignore it).
-      .contentMargins(.bottom, 24, for: .scrollContent)
-      .contentMargins(.top, 4, for: .scrollContent)
-    }
-  }
-
   private func toggleHomeSelection(_ chatID: String) {
     AppUITrace.notice(
       "ChatsRootView toggleSelection chatId=\(String(chatID.prefix(12))) selectedBefore=\(selectedChatIDs.count)"
@@ -2522,11 +2726,33 @@ private struct ChatHomeScreen: View {
       try await ChatHomeEditService.apply(action: action, chatIDs: chatIDs, config: config)
       selectedChatIDs.removeAll()
       isEditingHome = false
+      setTabBarHidden(false, animated: true)
       await model.refresh()
       AppUITrace.notice("ChatsRootView bulkAction done action=\(action)")
     } catch {
       AppUITrace.error("ChatsRootView bulkAction error action=\(action) error=\(error.localizedDescription)")
       AppToastController.shared.show(error.localizedDescription)
+    }
+  }
+
+  private func setTabBarHidden(_ hidden: Bool, animated: Bool) {
+    guard let tab = coordinator.tabBarController else { return }
+    let tabBar = tab.tabBar
+    // Fade only — never isHidden. Hiding the tab bar collapses safe area and
+    // jumps edit pills / list content. Keep layout band; fade like trailing icons.
+    tabBar.isHidden = false
+    tabBar.isUserInteractionEnabled = !hidden
+    let target: CGFloat = hidden ? 0 : 1
+    if animated {
+      UIView.animate(
+        withDuration: 0.22,
+        delay: 0,
+        options: [.beginFromCurrentState, .curveEaseInOut, .allowUserInteraction]
+      ) {
+        tabBar.alpha = target
+      }
+    } else {
+      tabBar.alpha = target
     }
   }
 
@@ -3326,9 +3552,7 @@ private struct ArchivedChatHomeListScreen: View {
   var body: some View {
     Group {
       if visibleRows.isEmpty && model.isLoadingArchived {
-        ProgressView()
-          .controlSize(.regular)
-          .tint(palette.secondaryText)
+        AppListLoadingView(palette: palette, caption: "Loading archive")
           .frame(maxWidth: .infinity, maxHeight: .infinity)
           .background(palette.background)
       } else if visibleRows.isEmpty {
@@ -3375,44 +3599,681 @@ private struct ArchivedChatHomeListScreen: View {
   }
 }
 
+/// Glass text pills: one left · one center · one right. Glass tint is constant;
+/// only label opacity reflects enabled/disabled.
+// MARK: - Home search (Telegram-style shared field + close slide-in)
+
+/// System-searchable fill (not liquid glass) — matches Telegram's default search chrome.
+private enum HomeSearchChrome {
+  static let fieldCorner: CGFloat = 12
+  static let fieldHeight: CGFloat = 40
+  static let closeSize: CGFloat = 34
+  static let matchedFieldID = "homeSearchField"
+
+  static var fieldFill: Color {
+    Color(uiColor: UIColor { traits in
+      traits.userInterfaceStyle == .dark
+        ? UIColor(white: 0.18, alpha: 1.0)
+        : UIColor.tertiarySystemFill
+    })
+  }
+
+  static var closeFill: Color {
+    Color(uiColor: UIColor { traits in
+      traits.userInterfaceStyle == .dark
+        ? UIColor(white: 0.22, alpha: 1.0)
+        : UIColor.tertiarySystemFill
+    })
+  }
+}
+
+/// Unfocused entry under the nav — same geometry id as the focused field.
+private struct HomeSearchEntryField: View {
+  let palette: AppThemePalette
+  let searchNamespace: Namespace.ID
+  let onTap: () -> Void
+
+  var body: some View {
+    Button(action: onTap) {
+      HStack(spacing: 8) {
+        Image(systemName: "magnifyingglass")
+          .font(.system(size: 16, weight: .medium))
+          .foregroundStyle(palette.secondaryText)
+        Text("Search")
+          .font(.system(size: 17, weight: .regular))
+          .foregroundStyle(palette.secondaryText)
+        Spacer(minLength: 0)
+      }
+      .padding(.horizontal, 12)
+      .frame(height: HomeSearchChrome.fieldHeight)
+      .background(
+        RoundedRectangle(cornerRadius: HomeSearchChrome.fieldCorner, style: .continuous)
+          .fill(HomeSearchChrome.fieldFill)
+      )
+    }
+    .buttonStyle(.plain)
+    .matchedGeometryEffect(id: HomeSearchChrome.matchedFieldID, in: searchNamespace)
+  }
+}
+
+// MARK: - Telegram-style search surface (shared field morph + compact results)
+
+/// Full-screen search UI. Field uses `matchedGeometryEffect` with the list entry;
+/// close control slides in from outside the trailing edge (not a second glass island).
+private struct HomeTelegramSearchView: View {
+  @Binding var query: String
+  @Binding var isFocused: Bool
+  let recentRows: [ChatHomeListRow]
+  let filteredChats: [ChatHomeListRow]
+  let people: [ContactSearchUser]
+  let isGlobalSearching: Bool
+  let isDark: Bool
+  let palette: AppThemePalette
+  let searchNamespace: Namespace.ID
+  let onSelectChat: (ChatHomeListRow) -> Void
+  let onSelectPerson: (ContactSearchUser) -> Void
+  let onClose: () -> Void
+
+  @FocusState private var fieldFocused: Bool
+  /// Close starts off-screen then slides in beside the field (Telegram).
+  @State private var closeRevealed = false
+
+  private var showRecentsStrip: Bool {
+    query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      // Pinned top chrome: shared search field + trailing close that enters from off-window.
+      HStack(spacing: 10) {
+        HStack(spacing: 8) {
+          Image(systemName: "magnifyingglass")
+            .font(.system(size: 16, weight: .medium))
+            .foregroundStyle(palette.secondaryText)
+          TextField("Search", text: $query)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .focused($fieldFocused)
+            .font(.system(size: 17))
+            .foregroundStyle(palette.text)
+            .submitLabel(.search)
+          if !query.isEmpty {
+            Button {
+              query = ""
+            } label: {
+              Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 16))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(palette.secondaryText.opacity(0.75))
+            }
+            .buttonStyle(.plain)
+          }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: HomeSearchChrome.fieldHeight)
+        .background(
+          RoundedRectangle(cornerRadius: HomeSearchChrome.fieldCorner, style: .continuous)
+            .fill(HomeSearchChrome.fieldFill)
+        )
+        .matchedGeometryEffect(id: HomeSearchChrome.matchedFieldID, in: searchNamespace)
+
+        Button(action: onClose) {
+          Image(systemName: "xmark")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(palette.text.opacity(0.9))
+            .frame(width: HomeSearchChrome.closeSize, height: HomeSearchChrome.closeSize)
+            .background(
+              Circle().fill(HomeSearchChrome.closeFill)
+            )
+        }
+        .buttonStyle(.plain)
+        .opacity(closeRevealed ? 1 : 0)
+        .offset(x: closeRevealed ? 0 : 56)
+        .accessibilityLabel("Close search")
+      }
+      .padding(.horizontal, 16)
+      .padding(.top, 6)
+      .padding(.bottom, 10)
+
+      // Results scroll under the pinned bar (searchable-like).
+      ScrollView {
+        LazyVStack(alignment: .leading, spacing: 0) {
+          if showRecentsStrip && !recentRows.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+              HStack(spacing: 14) {
+                ForEach(recentRows, id: \.chatId) { row in
+                  Button {
+                    onSelectChat(row)
+                  } label: {
+                    VStack(spacing: 5) {
+                      HomeSearchAvatarView(row: row, isDark: isDark, size: 54)
+                      Text(row.title)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(palette.secondaryText)
+                        .lineLimit(1)
+                        .frame(width: 62)
+                    }
+                  }
+                  .buttonStyle(.plain)
+                }
+              }
+              .padding(.horizontal, 16)
+              .padding(.bottom, 10)
+            }
+
+            HStack {
+              Text("Recent")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(palette.secondaryText)
+                .textCase(.uppercase)
+              Spacer()
+              Button("Clear") {
+                // Local recents are derived from the live list — clear just resets query focus.
+                query = ""
+              }
+              .font(.system(size: 14, weight: .regular))
+              .foregroundStyle(palette.secondaryText)
+              .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 4)
+            .padding(.bottom, 6)
+
+            ForEach(Array(recentRows.prefix(24)), id: \.chatId) { row in
+              Button { onSelectChat(row) } label: {
+                HomeSearchCompactRow(row: row, palette: palette, isDark: isDark)
+              }
+              .buttonStyle(.plain)
+            }
+          } else if showRecentsStrip {
+            // Empty query, no recents yet.
+            ContactSearchStatusView(
+              isLoading: false,
+              hasSearched: true,
+              message: "Search chats and people",
+              palette: palette
+            )
+            .frame(maxWidth: .infinity)
+            .padding(.top, 40)
+          } else {
+            if !filteredChats.isEmpty {
+              sectionHeader("Chats")
+              ForEach(filteredChats, id: \.chatId) { row in
+                Button { onSelectChat(row) } label: {
+                  HomeSearchCompactRow(row: row, palette: palette, isDark: isDark)
+                }
+                .buttonStyle(.plain)
+              }
+            }
+            if !people.isEmpty {
+              sectionHeader("People")
+              ForEach(people) { user in
+                Button { onSelectPerson(user) } label: {
+                  HomeSearchCompactPersonRow(user: user, palette: palette, isDark: isDark)
+                }
+                .buttonStyle(.plain)
+              }
+            }
+            if filteredChats.isEmpty && people.isEmpty {
+              ContactSearchStatusView(
+                isLoading: isGlobalSearching,
+                hasSearched: !isGlobalSearching,
+                message: isGlobalSearching
+                  ? ""
+                  : "No chats or people match \"\(query)\".",
+                palette: palette
+              )
+              .frame(maxWidth: .infinity)
+              .padding(.top, 40)
+            }
+          }
+        }
+        .padding(.bottom, 24)
+      }
+      .opacity(closeRevealed ? 1 : 0.35)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(palette.background.ignoresSafeArea())
+    .onAppear {
+      // Field morph runs with parent spring; close slides in one beat later from off-trailing.
+      fieldFocused = true
+      closeRevealed = false
+      withAnimation(.spring(response: 0.36, dampingFraction: 0.86).delay(0.02)) {
+        closeRevealed = true
+      }
+    }
+  }
+
+  private func sectionHeader(_ title: String) -> some View {
+    Text(title)
+      .font(.system(size: 13, weight: .semibold))
+      .foregroundStyle(palette.secondaryText)
+      .padding(.horizontal, 16)
+      .padding(.top, 10)
+      .padding(.bottom, 4)
+      .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+/// Thin search result row — smaller avatar + tighter spacing (not home card cell).
+private struct HomeSearchCompactRow: View {
+  let row: ChatHomeListRow
+  let palette: AppThemePalette
+  let isDark: Bool
+
+  var body: some View {
+    HStack(spacing: 12) {
+      HomeSearchAvatarView(row: row, isDark: isDark, size: 42)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(row.title)
+          .font(.system(size: 16, weight: .medium))
+          .foregroundStyle(palette.text)
+          .lineLimit(1)
+        if !row.preview.isEmpty {
+          Text(row.preview)
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(palette.secondaryText)
+            .lineLimit(1)
+        }
+      }
+      Spacer(minLength: 0)
+      if row.unreadCount > 0 {
+        Text("\(row.unreadCount)")
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundStyle(palette.secondaryText)
+      }
+    }
+    .padding(.horizontal, 16)
+    .padding(.vertical, 8)
+    .contentShape(Rectangle())
+  }
+}
+
+private struct HomeSearchCompactPersonRow: View {
+  let user: ContactSearchUser
+  let palette: AppThemePalette
+  let isDark: Bool
+
+  var body: some View {
+    HStack(spacing: 12) {
+      ZStack {
+        let colors = ChatProfileAppearanceStore.avatarColors(
+          title: user.username, peerUserId: user.userID, chatId: nil)
+        Circle()
+          .fill(
+            LinearGradient(
+              colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
+              startPoint: .topLeading,
+              endPoint: .bottomTrailing
+            )
+          )
+        Text(String(user.username.prefix(1)).uppercased())
+          .font(.system(size: 15, weight: .semibold))
+          .foregroundStyle(.white)
+      }
+      .frame(width: 42, height: 42)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(user.username)
+          .font(.system(size: 16, weight: .medium))
+          .foregroundStyle(palette.text)
+          .lineLimit(1)
+        if !user.userID.isEmpty {
+          Text(user.userID)
+            .font(.system(size: 13, weight: .regular))
+            .foregroundStyle(palette.secondaryText)
+            .lineLimit(1)
+        }
+      }
+      Spacer(minLength: 0)
+    }
+    .padding(.horizontal, 16)
+    .padding(.vertical, 8)
+    .contentShape(Rectangle())
+  }
+}
+
+private struct HomeSearchAvatarView: View {
+  let row: ChatHomeListRow
+  let isDark: Bool
+  var size: CGFloat = 56
+
+  var body: some View {
+    ZStack {
+      let colors = ChatProfileAppearanceStore.avatarColors(
+        title: row.title, peerUserId: row.peerUserId, chatId: row.chatId)
+      Circle()
+        .fill(
+          LinearGradient(
+            colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          )
+        )
+      Text(ChatHomeCardCell.getFallbackInitials(from: row.title))
+        .font(.system(size: size * 0.32, weight: .semibold))
+        .foregroundStyle(.white)
+      if let uri = row.avatarUri, let url = URL(string: uri) {
+        AsyncImage(url: url) { phase in
+          if case .success(let image) = phase {
+            image.resizable().scaledToFill()
+          }
+        }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+      }
+    }
+    .frame(width: size, height: size)
+  }
+}
+
+// MARK: - In-list search header (legacy header helper; unused when nav searchable is active)
+
+/// Search field + optional horizontal Recent avatars. Lives in `tableHeaderView`
+/// so it scrolls with the list (no nav-drawer flash).
+private final class ChatHomeInListSearchHeader: UIView, UISearchBarDelegate,
+  UICollectionViewDataSource, UICollectionViewDelegateFlowLayout
+{
+  var onTextChange: ((String) -> Void)?
+  var onFocusChange: ((Bool) -> Void)?
+  var onSelectRecent: ((ChatHomeListRow) -> Void)?
+
+  private let searchBar = UISearchBar(frame: .zero)
+  private let recentsLabel = UILabel()
+  private let collectionView: UICollectionView
+  private var recentRows: [ChatHomeListRow] = []
+  private var isDark = true
+  private var showsRecents = false
+
+  var preferredHeight: CGFloat {
+    let searchH: CGFloat = 52
+    guard showsRecents else { return searchH + 4 }
+    return searchH + 18 + 78 + 8
+  }
+
+  override init(frame: CGRect) {
+    let layout = UICollectionViewFlowLayout()
+    layout.scrollDirection = .horizontal
+    layout.minimumLineSpacing = 14
+    layout.minimumInteritemSpacing = 14
+    layout.sectionInset = UIEdgeInsets(top: 0, left: 16, bottom: 0, right: 16)
+    collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
+    super.init(frame: frame)
+    setup()
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  private func setup() {
+    backgroundColor = .clear
+    searchBar.searchBarStyle = .minimal
+    searchBar.placeholder = "Search"
+    searchBar.delegate = self
+    searchBar.autocapitalizationType = .none
+    searchBar.autocorrectionType = .no
+    searchBar.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(searchBar)
+
+    recentsLabel.text = "Recent"
+    recentsLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+    recentsLabel.translatesAutoresizingMaskIntoConstraints = false
+    recentsLabel.alpha = 0
+    addSubview(recentsLabel)
+
+    collectionView.backgroundColor = .clear
+    collectionView.showsHorizontalScrollIndicator = false
+    collectionView.dataSource = self
+    collectionView.delegate = self
+    collectionView.register(
+      ChatHomeRecentAvatarCell.self,
+      forCellWithReuseIdentifier: ChatHomeRecentAvatarCell.reuseId
+    )
+    collectionView.translatesAutoresizingMaskIntoConstraints = false
+    collectionView.alpha = 0
+    addSubview(collectionView)
+
+    NSLayoutConstraint.activate([
+      searchBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+      searchBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+      searchBar.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+      searchBar.heightAnchor.constraint(equalToConstant: 48),
+
+      recentsLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+      recentsLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+      recentsLabel.topAnchor.constraint(equalTo: searchBar.bottomAnchor, constant: 2),
+
+      collectionView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      collectionView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      collectionView.topAnchor.constraint(equalTo: recentsLabel.bottomAnchor, constant: 6),
+      collectionView.heightAnchor.constraint(equalToConstant: 72),
+    ])
+  }
+
+  func apply(
+    text: String,
+    isFocused: Bool,
+    isDark: Bool,
+    recentRows: [ChatHomeListRow],
+    animated: Bool
+  ) {
+    self.isDark = isDark
+    self.recentRows = recentRows
+    if searchBar.text != text {
+      searchBar.text = text
+    }
+    searchBar.barStyle = isDark ? .black : .default
+    searchBar.tintColor = isDark ? .white : .black
+    recentsLabel.textColor = (isDark ? UIColor.white : UIColor.black).withAlphaComponent(0.55)
+
+    let showRecents =
+      isFocused && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && !recentRows.isEmpty
+    let changed = showRecents != showsRecents
+    showsRecents = showRecents
+    collectionView.reloadData()
+
+    let applyVisibility = {
+      self.recentsLabel.alpha = showRecents ? 1 : 0
+      self.collectionView.alpha = showRecents ? 1 : 0
+    }
+    if animated && changed {
+      UIView.animate(
+        withDuration: 0.22,
+        delay: 0,
+        options: [.beginFromCurrentState, .curveEaseInOut],
+        animations: applyVisibility
+      )
+    } else {
+      applyVisibility()
+    }
+  }
+
+  func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
+    searchBar.setShowsCancelButton(true, animated: true)
+    onFocusChange?(true)
+  }
+
+  func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
+    onTextChange?(searchText)
+  }
+
+  func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
+    searchBar.text = ""
+    searchBar.resignFirstResponder()
+    searchBar.setShowsCancelButton(false, animated: true)
+    onTextChange?("")
+    onFocusChange?(false)
+  }
+
+  func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
+    searchBar.resignFirstResponder()
+  }
+
+  func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int)
+    -> Int
+  {
+    recentRows.count
+  }
+
+  func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath)
+    -> UICollectionViewCell
+  {
+    let cell =
+      collectionView.dequeueReusableCell(
+        withReuseIdentifier: ChatHomeRecentAvatarCell.reuseId, for: indexPath)
+      as! ChatHomeRecentAvatarCell
+    let row = recentRows[indexPath.item]
+    cell.configure(row: row, isDark: isDark)
+    return cell
+  }
+
+  func collectionView(
+    _ collectionView: UICollectionView,
+    layout collectionViewLayout: UICollectionViewLayout,
+    sizeForItemAt indexPath: IndexPath
+  ) -> CGSize {
+    CGSize(width: 64, height: 72)
+  }
+
+  func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+    guard recentRows.indices.contains(indexPath.item) else { return }
+    onSelectRecent?(recentRows[indexPath.item])
+  }
+}
+
+private final class ChatHomeRecentAvatarCell: UICollectionViewCell {
+  static let reuseId = "ChatHomeRecentAvatarCell"
+  private let avatar = UIImageView()
+  private let fallback = UILabel()
+  private let nameLabel = UILabel()
+  private var gradientLayer: CAGradientLayer?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    avatar.translatesAutoresizingMaskIntoConstraints = false
+    avatar.contentMode = .scaleAspectFill
+    avatar.clipsToBounds = true
+    avatar.layer.cornerRadius = 28
+    contentView.addSubview(avatar)
+
+    fallback.translatesAutoresizingMaskIntoConstraints = false
+    fallback.font = .systemFont(ofSize: 18, weight: .semibold)
+    fallback.textAlignment = .center
+    fallback.textColor = .white
+    contentView.addSubview(fallback)
+
+    nameLabel.translatesAutoresizingMaskIntoConstraints = false
+    nameLabel.font = .systemFont(ofSize: 11, weight: .medium)
+    nameLabel.textAlignment = .center
+    nameLabel.lineBreakMode = .byTruncatingTail
+    contentView.addSubview(nameLabel)
+
+    NSLayoutConstraint.activate([
+      avatar.topAnchor.constraint(equalTo: contentView.topAnchor),
+      avatar.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+      avatar.widthAnchor.constraint(equalToConstant: 56),
+      avatar.heightAnchor.constraint(equalToConstant: 56),
+      fallback.centerXAnchor.constraint(equalTo: avatar.centerXAnchor),
+      fallback.centerYAnchor.constraint(equalTo: avatar.centerYAnchor),
+      nameLabel.topAnchor.constraint(equalTo: avatar.bottomAnchor, constant: 4),
+      nameLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+      nameLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+    ])
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  func configure(row: ChatHomeListRow, isDark: Bool) {
+    nameLabel.text = row.title
+    nameLabel.textColor = (isDark ? UIColor.white : UIColor.black).withAlphaComponent(0.75)
+    fallback.text = ChatHomeCardCell.getFallbackInitials(from: row.title)
+    let colors = ChatProfileAppearanceStore.avatarColors(
+      title: row.title, peerUserId: row.peerUserId, chatId: row.chatId)
+    gradientLayer?.removeFromSuperlayer()
+    let g = CAGradientLayer()
+    g.colors = [colors.0.cgColor, colors.1.cgColor]
+    g.frame = CGRect(x: 0, y: 0, width: 56, height: 56)
+    g.cornerRadius = 28
+    avatar.layer.insertSublayer(g, at: 0)
+    gradientLayer = g
+    avatar.image = nil
+    fallback.isHidden = false
+    gradientLayer?.isHidden = false
+    if let uri = row.avatarUri, let cached = ChatAvatarImageStore.cached(for: uri) {
+      avatar.image = cached
+      fallback.isHidden = true
+      gradientLayer?.isHidden = true
+    } else if let uri = row.avatarUri, !uri.isEmpty {
+      Task { [weak self] in
+        let image = await ChatAvatarImageStore.load(from: uri)
+        await MainActor.run {
+          guard let self else { return }
+          if let image {
+            self.avatar.image = image
+            self.fallback.isHidden = true
+            self.gradientLayer?.isHidden = true
+          }
+        }
+      }
+    }
+  }
+}
+
 private struct ChatHomeEditActionBar: View {
   let selectedCount: Int
-  let palette: AppThemePalette
+  let isDark: Bool
   let onMarkRead: () -> Void
   let onMute: () -> Void
   let onDelete: () -> Void
 
+  private var enabled: Bool { selectedCount > 0 }
+
   var body: some View {
-    HStack(spacing: 20) {
-      editActionButton(title: "Read", systemImage: "envelope.open", action: onMarkRead)
-      editActionButton(title: "Mute", systemImage: "bell.slash", action: onMute)
-      Text("\(selectedCount) selected")
-        .font(.system(size: 13, weight: .semibold))
-        .foregroundStyle(palette.secondaryText)
-        .frame(maxWidth: .infinity)
-      editActionButton(title: "Delete", systemImage: "trash", role: .destructive, action: onDelete)
+    HStack(spacing: 0) {
+      pill("Read All", action: onMarkRead)
+        .frame(maxWidth: .infinity, alignment: .leading)
+      pill("Mute", action: onMute)
+        .frame(maxWidth: .infinity, alignment: .center)
+      pill("Delete", action: onDelete)
+        .frame(maxWidth: .infinity, alignment: .trailing)
     }
-    .padding(.horizontal, 18)
-    .padding(.vertical, 10)
-    .background(.bar)
+    .padding(.horizontal, 16)
+    .padding(.top, 6)
+    .padding(.bottom, 4)
   }
 
-  private func editActionButton(
-    title: String,
-    systemImage: String,
-    role: ButtonRole? = nil,
-    action: @escaping () -> Void
-  ) -> some View {
-    Button(role: role, action: action) {
-      VStack(spacing: 3) {
-        Image(systemName: systemImage)
-          .font(.system(size: 18, weight: .medium))
-        Text(title)
-          .font(.system(size: 11, weight: .medium))
-      }
-      .frame(minWidth: 48)
+  private func pill(_ title: String, action: @escaping () -> Void) -> some View {
+    Button {
+      guard enabled else { return }
+      action()
+    } label: {
+      Text(title)
+        .font(.system(size: 15, weight: .semibold))
+        // Only text reacts to off/on — glass stays fully visible.
+        .foregroundStyle(
+          (isDark ? Color.white : Color.primary).opacity(enabled ? 1.0 : 0.38)
+        )
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .background {
+          // Constant glass (never dimmed by disabled state).
+          if #available(iOS 26.0, *) {
+            Capsule(style: .continuous)
+              .fill(.clear)
+              .glassEffect(.regular.interactive(true), in: .capsule)
+          } else {
+            Capsule(style: .continuous)
+              .fill(.regularMaterial)
+          }
+        }
     }
-    .disabled(selectedCount == 0)
+    .buttonStyle(.plain)
+    // Avoid .disabled — it greys the whole control including glass on some OS versions.
+    .allowsHitTesting(enabled)
+    .fixedSize(horizontal: true, vertical: false)
   }
 }
 
@@ -3499,9 +4360,7 @@ private struct ShareChatSelectionView: View {
   @ViewBuilder
   private var listContent: some View {
     if model.rows.isEmpty && (!model.hasLoaded || model.isLoading) {
-      ProgressView()
-        .controlSize(.regular)
-        .tint(palette.secondaryText)
+      AppListLoadingView(palette: palette, caption: "Loading chats")
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
     } else if model.rows.isEmpty {
@@ -3549,9 +4408,15 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   let isEditing: Bool
   let showsRightCheckmark: Bool
   let selectedChatIDs: Set<String>
+  var searchText: Binding<String>? = nil
+  var isSearchFocused: Binding<Bool>? = nil
+  var recentRows: [ChatHomeListRow] = []
+  var peopleResults: [ContactSearchUser] = []
+  var isGlobalSearching: Bool = false
   let onSelect: (ChatHomeListRow) -> Void
   let onToggleSelection: (String) -> Void
   let onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void
+  var onSelectPerson: ((ContactSearchUser) -> Void)? = nil
   let onRefresh: () async -> Void
   let onUnavailableAction: (String) -> Void
 
@@ -3562,12 +4427,19 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
     controller.onAction = onAction
     controller.onRefresh = onRefresh
     controller.onUnavailableAction = onUnavailableAction
+    controller.onSelectPerson = onSelectPerson
+    controller.searchTextBinding = searchText
+    controller.isSearchFocusedBinding = isSearchFocused
+    controller.showsInListSearch = searchText != nil
     controller.apply(
       rows: rows,
       isDark: isDark,
       isEditing: isEditing,
       showsRightCheckmark: showsRightCheckmark,
-      selectedChatIDs: selectedChatIDs
+      selectedChatIDs: selectedChatIDs,
+      recentRows: recentRows,
+      peopleResults: peopleResults,
+      isGlobalSearching: isGlobalSearching
     )
     return controller
   }
@@ -3578,12 +4450,19 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
     uiViewController.onAction = onAction
     uiViewController.onRefresh = onRefresh
     uiViewController.onUnavailableAction = onUnavailableAction
+    uiViewController.onSelectPerson = onSelectPerson
+    uiViewController.searchTextBinding = searchText
+    uiViewController.isSearchFocusedBinding = isSearchFocused
+    uiViewController.showsInListSearch = searchText != nil
     uiViewController.apply(
       rows: rows,
       isDark: isDark,
       isEditing: isEditing,
       showsRightCheckmark: showsRightCheckmark,
-      selectedChatIDs: selectedChatIDs
+      selectedChatIDs: selectedChatIDs,
+      recentRows: recentRows,
+      peopleResults: peopleResults,
+      isGlobalSearching: isGlobalSearching
     )
   }
 }
@@ -3592,7 +4471,6 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   UITableViewDelegate, UIGestureRecognizerDelegate, ChatHomeCardCellSwipeDelegate
 {
   private let tableView = UITableView(frame: .zero, style: .plain)
-  private let refreshControl = UIRefreshControl()
   private lazy var previewLongPressRecognizer: UILongPressGestureRecognizer = {
     let recognizer = UILongPressGestureRecognizer(
       target: self,
@@ -3612,17 +4490,25 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   fileprivate var onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void = { _, _ in }
   fileprivate var onRefresh: (() async -> Void)?
   fileprivate var onUnavailableAction: (String) -> Void = { _ in }
+  fileprivate var onSelectPerson: ((ContactSearchUser) -> Void)?
+  fileprivate var searchTextBinding: Binding<String>?
+  fileprivate var isSearchFocusedBinding: Binding<Bool>?
+  fileprivate var showsInListSearch = false
 
   private var rows: [ChatHomeListRow] = []
+  private var recentRows: [ChatHomeListRow] = []
+  private var peopleResults: [ContactSearchUser] = []
+  private var isGlobalSearching = false
   private var isDark = false
   private var isEditingMode = false
   private var showsRightCheckmark = false
+  private var searchHeader: ChatHomeInListSearchHeader?
+  private var lastSearchHeaderSignature = ""
 
   override var preferredStatusBarStyle: UIStatusBarStyle {
     return isDark ? .lightContent : .darkContent
   }
   private var selectedChatIDs = Set<String>()
-  private var isRunningRefresh = false
   private var lastAppliedSignature = ""
   private weak var openSwipeCell: ChatHomeCardCell?
   private weak var heldPreviewCell: ChatHomeCardCell?
@@ -3635,19 +4521,61 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     updateTopContentInset()
   }
 
-  override func viewDidLayoutSubviews() {
-    super.viewDidLayoutSubviews()
-    updateTopContentInset()
-  }
-
   // The SwiftUI host lets the table background extend under the transparent
   // navigation area. The row content still needs UIKit's safe-area clearance so
   // cells do not clip under the nav/search chrome.
-  private func updateTopContentInset() {
+  private func updateTopContentInset(force: Bool = false) {
     let topInset = view.safeAreaInsets.top
-    guard tableView.contentInset.top != topInset else { return }
-    tableView.contentInset = UIEdgeInsets(top: topInset, left: 0, bottom: 24, right: 0)
-    tableView.scrollIndicatorInsets = UIEdgeInsets(top: topInset, left: 0, bottom: 24, right: 0)
+    // Extra room for edit pills (safeAreaInset is SwiftUI-side; UITableView with
+    // .never adjustment won't see it unless we reserve bottom contentInset).
+    // Edit pills overlay the tab-bar band (tab bar only fades). No extra inset
+    // so the list does not jump when entering edit mode.
+    let bottomInset: CGFloat = 0
+    let next = UIEdgeInsets(top: topInset, left: 0, bottom: bottomInset, right: 0)
+    guard force || tableView.contentInset != next else { return }
+    tableView.contentInset = next
+    tableView.scrollIndicatorInsets = next
+  }
+
+  private func updateInListSearchHeader(animated: Bool) {
+    guard showsInListSearch else {
+      if tableView.tableHeaderView != nil {
+        tableView.tableHeaderView = nil
+        searchHeader = nil
+      }
+      return
+    }
+    let header: ChatHomeInListSearchHeader
+    if let existing = searchHeader {
+      header = existing
+    } else {
+      header = ChatHomeInListSearchHeader(frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: 56))
+      header.onTextChange = { [weak self] text in
+        self?.searchTextBinding?.wrappedValue = text
+      }
+      header.onFocusChange = { [weak self] focused in
+        self?.isSearchFocusedBinding?.wrappedValue = focused
+      }
+      header.onSelectRecent = { [weak self] row in
+        self?.onSelect(row)
+      }
+      searchHeader = header
+    }
+    header.bounds.size.width = tableView.bounds.width > 0 ? tableView.bounds.width : view.bounds.width
+    header.apply(
+      text: searchTextBinding?.wrappedValue ?? "",
+      isFocused: isSearchFocusedBinding?.wrappedValue == true,
+      isDark: isDark,
+      recentRows: recentRows,
+      animated: animated
+    )
+    header.layoutIfNeeded()
+    let targetHeight = header.preferredHeight
+    if abs(header.bounds.height - targetHeight) > 0.5 {
+      header.frame = CGRect(x: 0, y: 0, width: header.bounds.width, height: targetHeight)
+    }
+    // Re-assign so UITableView picks up new header size without a body flash.
+    tableView.tableHeaderView = header
   }
 
   override func viewDidLoad() {
@@ -3661,13 +4589,21 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     tableView.sectionHeaderTopPadding = 0
     tableView.contentInsetAdjustmentBehavior = .never
     tableView.rowHeight = 84
-    tableView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 24, right: 0)
+    tableView.estimatedRowHeight = 84
+    // Smooth scroll: avoid large estimated→actual height pops.
+    tableView.estimatedSectionHeaderHeight = 0
+    tableView.estimatedSectionFooterHeight = 0
+    if #available(iOS 15.0, *) {
+      tableView.sectionHeaderTopPadding = 0
+    }
+    tableView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
     tableView.dataSource = self
     tableView.delegate = self
     tableView.register(ChatHomeCardCell.self, forCellReuseIdentifier: ChatHomeCardCell.reuseIdentifier)
-    tableView.refreshControl = refreshControl
+    // No UIRefreshControl — pull-to-refresh spinner removed from home.
+    tableView.refreshControl = nil
+    tableView.keyboardDismissMode = .onDrag
     tableView.addGestureRecognizer(previewLongPressRecognizer)
-    refreshControl.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
     bridgeStatusObserver = NotificationCenter.default.addObserver(
       forName: AgentPairingService.statusDidChangeNotification,
       object: nil,
@@ -3693,9 +4629,24 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     if !rows.isEmpty {
       tableView.reloadData()
     }
+    updateInListSearchHeader(animated: false)
     AppUIStallWatchdog.shared.updateContext(
       "ChatHomeNativeListController viewDidLoad rows=\(rows.count)"
     )
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    updateTopContentInset()
+    // Keep header width in sync when rotating / first layout.
+    if showsInListSearch, let header = searchHeader,
+      abs(header.bounds.width - tableView.bounds.width) > 0.5, tableView.bounds.width > 0
+    {
+      header.bounds.size.width = tableView.bounds.width
+      header.layoutIfNeeded()
+      header.frame.size.height = header.preferredHeight
+      tableView.tableHeaderView = header
+    }
   }
 
   override func viewWillAppear(_ animated: Bool) {
@@ -3761,7 +4712,10 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     isDark: Bool,
     isEditing: Bool,
     showsRightCheckmark: Bool,
-    selectedChatIDs: Set<String>
+    selectedChatIDs: Set<String>,
+    recentRows: [ChatHomeListRow] = [],
+    peopleResults: [ContactSearchUser] = [],
+    isGlobalSearching: Bool = false
   ) {
     let nextSignature = Self.signature(
       rows: rows,
@@ -3770,9 +4724,13 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       showsRightCheckmark: showsRightCheckmark,
       selectedChatIDs: selectedChatIDs
     )
-    guard nextSignature != lastAppliedSignature else { return }
+    let searchSig =
+      "\(searchTextBinding?.wrappedValue ?? "")|\(isSearchFocusedBinding?.wrappedValue == true)|\(recentRows.count)|\(peopleResults.count)|\(isGlobalSearching)"
+    let signatureUnchanged = nextSignature == lastAppliedSignature
+    let searchUnchanged = searchSig == lastSearchHeaderSignature
+    if signatureUnchanged && searchUnchanged { return }
+
     let startedAt = ProcessInfo.processInfo.systemUptime
-    let previousRows = self.rows
     let previousRowCount = self.rows.count
     let previousContentOffset = tableView.contentOffset
     AppUITrace.notice(
@@ -3782,15 +4740,15 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       "ChatHomeNativeListController apply nextRows=\(rows.count) previousRows=\(previousRowCount)"
     )
     lastAppliedSignature = nextSignature
-    let previousIDs = previousRows.map(\.chatId)
+    lastSearchHeaderSignature = searchSig
+    let previousIDs = self.rows.map(\.chatId)
     let nextIDs = rows.map(\.chatId)
     let orderUnchanged = previousIDs == nextIDs
-    let rowDelta = orderUnchanged ? nil : Self.animatableRowDelta(from: previousRows, to: rows)
-    let canAnimateRowDelta = rowDelta != nil && isViewLoaded && view.window != nil && !isRunningRefresh
-    let deletionOverlays = canAnimateRowDelta
-      ? captureDeletionOverlays(for: rowDelta?.removedIndexPaths ?? [])
-      : []
+    let previousEditing = self.isEditingMode
     self.rows = rows
+    self.recentRows = recentRows
+    self.peopleResults = peopleResults
+    self.isGlobalSearching = isGlobalSearching
     self.isDark = isDark
     self.isEditingMode = isEditing
     self.showsRightCheckmark = showsRightCheckmark
@@ -3806,28 +4764,77 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       return
     }
 
+    updateInListSearchHeader(animated: true)
+
+    // Search-only header/recents update — don't reload the table body.
+    if signatureUnchanged {
+      return
+    }
+
+    // Editing / selection-only signature change with same order → soft reconfigure.
+    // Allow edit-layout animation so checkmarks slide in instead of "pop".
     if orderUnchanged, previousRowCount == rows.count, !rows.isEmpty {
-      // Same identity order — reconfigure visible cells in place so previews /
-      // unread / online dots update without a full reload that jumps the list.
-      reconfigureVisibleCellsInPlace()
-    } else if canAnimateRowDelta, let rowDelta {
-      performAnimatedRowDelta(rowDelta, deletionOverlays: deletionOverlays)
-    } else {
-      deletionOverlays.forEach { $0.removeFromSuperview() }
-      let shouldPreserveOffset = previousRowCount == rows.count && !rows.isEmpty && view.window != nil
-      UIView.performWithoutAnimation {
-        tableView.reloadData()
-        if shouldPreserveOffset {
-          tableView.layoutIfNeeded()
-          let minY = -tableView.adjustedContentInset.top
-          let maxY = max(
-            minY,
-            tableView.contentSize.height - tableView.bounds.height + tableView.adjustedContentInset.bottom
-          )
-          let y = min(max(previousContentOffset.y, minY), maxY)
-          tableView.setContentOffset(CGPoint(x: previousContentOffset.x, y: y), animated: false)
+      let editingChanged = previousEditing != isEditing
+      reconfigureVisibleCellsInPlace(animateEditLayout: editingChanged)
+      if editingChanged {
+        UIView.animate(
+          withDuration: 0.28,
+          delay: 0,
+          options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction]
+        ) {
+          self.updateTopContentInset(force: true)
+          self.tableView.layoutIfNeeded()
         }
+      } else {
+        updateTopContentInset()
       }
+      return
+    }
+
+    // Prefer LCS-based insert/delete so chat bumps animate instead of reload pop.
+    if previousRowCount > 0, !rows.isEmpty, view.window != nil,
+      let delta = Self.animatableRowDelta(fromIDs: previousIDs, toIDs: nextIDs)
+    {
+      tableView.performBatchUpdates({
+        if !delta.deletedIndexPaths.isEmpty {
+          tableView.deleteRows(at: delta.deletedIndexPaths, with: .fade)
+        }
+        if !delta.insertedIndexPaths.isEmpty {
+          tableView.insertRows(at: delta.insertedIndexPaths, with: .fade)
+        }
+      }, completion: { [weak self] _ in
+        guard let self else { return }
+        let minY = -self.tableView.adjustedContentInset.top
+        let maxY = max(
+          minY,
+          self.tableView.contentSize.height - self.tableView.bounds.height
+            + self.tableView.adjustedContentInset.bottom
+        )
+        let y = min(max(previousContentOffset.y, minY), maxY)
+        self.tableView.setContentOffset(
+          CGPoint(x: previousContentOffset.x, y: y), animated: false)
+        self.reconfigureVisibleCellsInPlace()
+      })
+      return
+    }
+
+    let shouldPreserveOffset = !rows.isEmpty && view.window != nil
+    UIView.performWithoutAnimation {
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      tableView.reloadData()
+      tableView.layoutIfNeeded()
+      if shouldPreserveOffset {
+        let minY = -tableView.adjustedContentInset.top
+        let maxY = max(
+          minY,
+          tableView.contentSize.height - tableView.bounds.height
+            + tableView.adjustedContentInset.bottom
+        )
+        let y = min(max(previousContentOffset.y, minY), maxY)
+        tableView.setContentOffset(CGPoint(x: previousContentOffset.x, y: y), animated: false)
+      }
+      CATransaction.commit()
     }
     AppUITrace.notice(
       "ChatHomeNativeListController apply done rows=\(rows.count) durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)) contentSize=\(Int(tableView.contentSize.height)) offsetY=\(Int(tableView.contentOffset.y))"
@@ -3857,8 +4864,13 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     from previousRows: [ChatHomeListRow],
     to nextRows: [ChatHomeListRow]
   ) -> AnimatableRowDelta? {
-    let previousIDs = previousRows.map(\.chatId)
-    let nextIDs = nextRows.map(\.chatId)
+    animatableRowDelta(fromIDs: previousRows.map(\.chatId), toIDs: nextRows.map(\.chatId))
+  }
+
+  private static func animatableRowDelta(
+    fromIDs previousIDs: [String],
+    toIDs nextIDs: [String]
+  ) -> AnimatableRowDelta? {
     let previousSet = Set(previousIDs)
     let nextSet = Set(nextIDs)
 
@@ -3951,7 +4963,9 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 
   /// Update visible cells without `reloadData` so scroll position and cell
   /// identity stay put when only content (preview/unread/online) changed.
-  private func reconfigureVisibleCellsInPlace() {
+  /// When `animateEditLayout` is true, do **not** wrap in `performWithoutAnimation`
+  /// so `ChatHomeCardCell.updateEditingLayout` can spring the checkmark gutter.
+  private func reconfigureVisibleCellsInPlace(animateEditLayout: Bool = false) {
     guard let visible = tableView.indexPathsForVisibleRows, !visible.isEmpty else {
       // Nothing on screen yet (or empty) — still need dataSource count in sync.
       if tableView.numberOfRows(inSection: 0) != rows.count {
@@ -3959,22 +4973,27 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       }
       return
     }
-    UIView.performWithoutAnimation {
+    let apply: () -> Void = {
       for indexPath in visible {
-        guard rows.indices.contains(indexPath.row),
-          let cell = tableView.cellForRow(at: indexPath) as? ChatHomeCardCell
+        guard self.rows.indices.contains(indexPath.row),
+          let cell = self.tableView.cellForRow(at: indexPath) as? ChatHomeCardCell
         else { continue }
-        let row = rows[indexPath.row]
+        let row = self.rows[indexPath.row]
         cell.configure(
           row: row,
-          isDark: isDark,
+          isDark: self.isDark,
           avatarBackgroundColor: nil,
-          avatarGradientColors: resolvedAvatarGradientColors(for: row),
-          isEditing: isEditingMode,
-          isEditSelected: selectedChatIDs.contains(row.chatId),
-          showsRightCheckmark: showsRightCheckmark
+          avatarGradientColors: self.resolvedAvatarGradientColors(for: row),
+          isEditing: self.isEditingMode,
+          isEditSelected: self.selectedChatIDs.contains(row.chatId),
+          showsRightCheckmark: self.showsRightCheckmark
         )
       }
+    }
+    if animateEditLayout {
+      apply()
+    } else {
+      UIView.performWithoutAnimation(apply)
     }
   }
 
@@ -4000,26 +5019,42 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         "\(row.isOnline)",
         row.avatarUri ?? "",
         row.peerTier ?? "",
+        "\(row.lastMessageAt)",
+        firstPaintTailFingerprint(for: row),
       ].joined(separator: "\u{1F}")
     }
     return rowSignature.joined(separator: "||") + "||\(isDark ? "dark" : "light")||\(isEditing ? "edit" : "normal")||\(showsRightCheckmark ? "check" : "no_check")||\(selectedChatIDs.sorted().joined(separator: ","))"
   }
 
-  @objc private func handleRefresh() {
-    guard !isRunningRefresh else { return }
-    isRunningRefresh = true
-    AppUITrace.notice("ChatHomeNativeListController refresh start rows=\(rows.count)")
-    AppUIStallWatchdog.shared.updateContext("ChatHomeNativeListController refresh rows=\(rows.count)")
-    Task { @MainActor [weak self] in
-      guard let self else { return }
-      let startedAt = ProcessInfo.processInfo.systemUptime
-      await onRefresh?()
-      isRunningRefresh = false
-      refreshControl.endRefreshing()
-      AppUITrace.notice(
-        "ChatHomeNativeListController refresh done rows=\(rows.count) durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000))"
-      )
+  /// The visible Home text can stay identical while its background-prefetched chat tail
+  /// grows from one row to sixteen. Include only a cheap boundary fingerprint so the
+  /// native controller adopts that new first-paint payload without hashing full history.
+  private static func firstPaintTailFingerprint(for row: ChatHomeListRow) -> String {
+    let tail = row.initialMessages.isEmpty ? row.previewRows : row.initialMessages
+    guard !tail.isEmpty else { return "tail:0" }
+
+    func token(_ value: Any?) -> String {
+      if let text = value as? String { return text }
+      if let number = value as? NSNumber { return number.stringValue }
+      return ""
     }
+    func messageToken(_ raw: [String: Any]) -> String {
+      let message = (raw["message"] as? [String: Any]) ?? raw
+      return token(
+        message["id"] ?? message["messageId"] ?? message["message_id"]
+          ?? raw["id"] ?? raw["messageId"] ?? raw["message_id"] ?? raw["key"])
+    }
+
+    let firstID = messageToken(tail[0])
+    let newest = tail[tail.count - 1]
+    let newestMessage = (newest["message"] as? [String: Any]) ?? newest
+    let newestID = messageToken(newest)
+    let revision = token(
+      newestMessage["updatedAt"] ?? newestMessage["updated_at"]
+        ?? newestMessage["editedAt"] ?? newestMessage["edited_at"]
+        ?? newestMessage["timestampMs"] ?? newestMessage["timestamp_ms"]
+        ?? newestMessage["timestamp"])
+    return "tail:\(tail.count):\(firstID):\(newestID):\(revision)"
   }
 
   @objc private func handlePreviewLongPress(_ recognizer: UILongPressGestureRecognizer) {
@@ -4076,18 +5111,19 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   }
 
   private func setPreviewHoldFeedback(_ cell: ChatHomeCardCell, held: Bool, animated: Bool) {
+    // Uniform spring scale only (no Y-stretch / morph). ~2% shrink from list.
     let changes = {
-      cell.transform = held ? CGAffineTransform(scaleX: 0.965, y: 0.965) : .identity
+      cell.transform = held ? CGAffineTransform(scaleX: 0.98, y: 0.98) : .identity
     }
     if !animated {
       changes()
       return
     }
     UIView.animate(
-      withDuration: held ? 0.18 : 0.24,
+      withDuration: held ? 0.22 : 0.28,
       delay: 0.0,
-      usingSpringWithDamping: held ? 0.96 : 0.86,
-      initialSpringVelocity: 0.0,
+      usingSpringWithDamping: 0.78,
+      initialSpringVelocity: 0.4,
       options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut],
       animations: changes
     )
@@ -4174,9 +5210,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       tableView.reloadRows(at: [indexPath], with: .none)
       return
     }
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.045) { [weak self] in
-      self?.onSelect(row)
-    }
+    onSelect(row)
     tableView.deselectRow(at: indexPath, animated: true)
   }
 
@@ -4665,20 +5699,33 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     let sourceFrame = view.convert(sourceFrameInWindow, from: nil)
     let finalCenter = CGPoint(x: finalPreviewFrame.midX, y: finalPreviewFrame.midY)
     let sourceCenter = CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)
-    let scaleX = max(0.12, min(1.0, sourceFrame.width / finalPreviewFrame.width))
-    let scaleY = max(0.12, min(1.0, sourceFrame.height / finalPreviewFrame.height))
+    // Uniform scale from the list row — never non-uniform X/Y stretch.
+    let uniformScale = max(
+      0.12,
+      min(
+        1.0,
+        min(
+          sourceFrame.width / max(1, finalPreviewFrame.width),
+          sourceFrame.height / max(1, finalPreviewFrame.height)
+        )
+      )
+    )
 
     previewGroupView.alpha = 1
     previewContainerView.center = sourceCenter
     previewContainerView.bounds = CGRect(origin: .zero, size: finalPreviewFrame.size)
-    previewContainerView.transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
+    previewContainerView.transform = CGAffineTransform(scaleX: uniformScale, y: uniformScale)
     previewController.view.frame = previewContainerView.bounds
+    // Glass is present immediately (no fade) — scale only.
+    backgroundGlassView.alpha = 1
 
     let finalMenuFrame = menuView.frame
     menuView.frame = finalMenuFrame
     menuView.layer.anchorPoint = CGPoint(x: finalMenuFrame.midX >= view.bounds.midX ? 1.0 : 0.0, y: 0.0)
     menuView.center = CGPoint(x: finalMenuFrame.midX, y: finalMenuFrame.midY)
-    menuView.transform = CGAffineTransform(translationX: 0, y: -4).scaledBy(x: 0.92, y: 0.92)
+    // Glass menu: scale only, never opacity fade.
+    menuView.alpha = 1
+    menuView.transform = CGAffineTransform(scaleX: 0.92, y: 0.92)
 
     menuView.isUserInteractionEnabled = false
     ignoreBackdropTapUntil = CACurrentMediaTime() + 0.65
@@ -4688,38 +5735,14 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     }
 
     UIView.animate(
-      withDuration: 0.20,
+      withDuration: 0.38,
       delay: 0.0,
-      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
-    ) {
-      self.backgroundGlassView.alpha = 1
-    }
-
-    UIView.animate(
-      withDuration: 0.36,
-      delay: 0.0,
-      usingSpringWithDamping: 0.86,
-      initialSpringVelocity: 0.0,
+      usingSpringWithDamping: 0.82,
+      initialSpringVelocity: 0.35,
       options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
     ) {
       self.previewContainerView.transform = .identity
       self.previewContainerView.center = finalCenter
-    }
-
-    UIView.animate(
-      withDuration: 0.20,
-      delay: 0.06,
-      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
-    ) {
-      self.menuView.alpha = 1
-    }
-    UIView.animate(
-      withDuration: 0.34,
-      delay: 0.06,
-      usingSpringWithDamping: 0.84,
-      initialSpringVelocity: 0.0,
-      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
-    ) {
       self.menuView.transform = .identity
     }
   }
@@ -4756,21 +5779,31 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
 
     let sourceFrame = view.convert(sourceFrameInWindow, from: nil)
     let finalPreviewFrame = previewContainerView.frame
-    let scaleX = max(0.12, min(1.0, sourceFrame.width / max(1, finalPreviewFrame.width)))
-    let scaleY = max(0.12, min(1.0, sourceFrame.height / max(1, finalPreviewFrame.height)))
+    let uniformScale = max(
+      0.12,
+      min(
+        1.0,
+        min(
+          sourceFrame.width / max(1, finalPreviewFrame.width),
+          sourceFrame.height / max(1, finalPreviewFrame.height)
+        )
+      )
+    )
 
+    // Scale-only close — no glass fade (fade breaks the glass material).
     UIView.animate(
-      withDuration: 0.18,
+      withDuration: 0.28,
       delay: 0.0,
+      usingSpringWithDamping: 0.9,
+      initialSpringVelocity: 0.2,
       options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
     ) {
-      self.backgroundGlassView.alpha = 0
-      self.menuView.alpha = 0
-      self.menuView.transform = CGAffineTransform(translationX: 0, y: -3).scaledBy(x: 0.94, y: 0.94)
+      self.menuView.transform = CGAffineTransform(scaleX: 0.92, y: 0.92)
       self.previewContainerView.center = CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)
-      self.previewContainerView.transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
-      self.previewContainerView.alpha = 0.0
+      self.previewContainerView.transform = CGAffineTransform(
+        scaleX: uniformScale, y: uniformScale)
     } completion: { _ in
+      self.backgroundGlassView.alpha = 0
       self.dismiss(animated: false, completion: action)
     }
   }
@@ -4819,11 +5852,21 @@ private final class ChatHomePreviewActionMenuView: UIView {
     self.row = row
     self.isDark = isDark
 
-    let style: UIBlurEffect.Style = isDark ? .systemMaterialDark : .systemMaterialLight
-    self.glassView = UIVisualEffectView(effect: UIBlurEffect(style: style))
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect()
+      glass.isInteractive = true
+      self.glassView = UIVisualEffectView(effect: glass)
+    } else {
+      let style: UIBlurEffect.Style = isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
+      self.glassView = UIVisualEffectView(effect: UIBlurEffect(style: style))
+    }
     self.glassView.layer.cornerRadius = 18
     self.glassView.clipsToBounds = true
     self.glassView.layer.cornerCurve = .continuous
+    // Near-black wash in dark mode so glass doesn't read gray.
+    if isDark {
+      self.glassView.backgroundColor = UIColor.black.withAlphaComponent(0.28)
+    }
     super.init(frame: .zero)
     setup()
   }
@@ -5056,6 +6099,7 @@ private final class ChatHomeMiniPreviewController: UIViewController {
     mainView.setIsOnline(Self.isOnline(for: row))
     mainView.setIsChatMuted(row.muted)
     mainView.setIsGroupOrChannel(row.isGroup)
+    mainView.setIsChannel(row.isChannel)
     mainView.setStatusAuthorityEnabled(true)
     mainView.setInputBarEnabled(false)
     mainView.isUserInteractionEnabled = true
@@ -5249,13 +6293,7 @@ private final class ChatHomeMiniPreviewController: UIViewController {
   }
 
   private static func previewAppearance(isDark: Bool) -> [String: Any] {
-    [
-      "theme": isDark ? "dark" : "light",
-      "backgroundMode": "gradient",
-      "wallpaperOpacity": 1.0,
-      "nativeThemeId": AppThemePlateController.currentOption.rawValue,
-      "nativeThemeIsDark": isDark,
-    ]
+    ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
   }
 
   private static func collectScrollViews(in view: UIView) -> [UIScrollView] {
@@ -5986,13 +7024,7 @@ final class ChatProfileRootController: UIViewController {
   }
 
   private static func resolvedAppearance(isDark: Bool) -> [String: Any] {
-    [
-      "theme": isDark ? "dark" : "light",
-      "backgroundMode": "gradient",
-      "wallpaperOpacity": 1.0,
-      "nativeThemeId": AppThemePlateController.currentOption.rawValue,
-      "nativeThemeIsDark": isDark,
-    ]
+    ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
   }
 
   private static func routeOnlyHeaderSubtitle(for route: ChatRoute) -> String {
@@ -6071,6 +7103,10 @@ final class ChatConversationController: UIViewController {
   /// This prevents a stale disconnected route state from flashing the panel for a
   /// second while the daemon is already online.
   private var pendingConnectStatusTask: Task<Void, Never>?
+  /// Home stops its status poll as soon as this page is pushed. Keep group/provider task
+  /// authority alive while the conversation is visible so a cloud-only phone still
+  /// retires stale CLI/team state even if a terminal stream frame was missed.
+  private var bridgeStatusPollTask: Task<Void, Never>?
 
   /// The isolated full-screen agent runtime surface (Claude/Codex), hosted as a child VC
   /// over `mainView` when this DM's Default view is Agent or the user taps "See progress".
@@ -6150,7 +7186,12 @@ final class ChatConversationController: UIViewController {
       object: nil
     )
 
+    let applyRouteStartedAt = ProcessInfo.processInfo.systemUptime
     applyRoute(forceChannelRefresh: true)
+    NSLog(
+      "[ChatOpen] host-stage viewDidLoad applyRouteMs=%d sinceTapMs=%d",
+      Int((ProcessInfo.processInfo.systemUptime - applyRouteStartedAt) * 1000),
+      VibeChatOpenTap.msSinceTap())
   }
 
   override func viewWillAppear(_ animated: Bool) {
@@ -6162,30 +7203,45 @@ final class ChatConversationController: UIViewController {
     // binding (~0.28s after viewDidAppear), which would show the chat first and then morph the
     // agent in over it. ChatListView gates on the per-provider Default-view setting and is
     // one-shot + idempotent, so calling this on every appear is safe.
+    let mountDoneAt = ProcessInfo.processInfo.systemUptime
     mountPreferredAgentSurfaceIfNeeded(reason: "viewWillAppear")
     // Flush deferred appearance + rows BEFORE the push animation runs (viewWillAppear
     // fires while the view is already in the window but pre-transition), so the wallpaper
     // and the seeded messages are painted as the chat slides in — not applied a beat later
     // in viewDidAppear, which reads as an empty flash + a soft wallpaper color shift.
     applyPendingAppearanceAfterAttachment(reason: "viewWillAppear")
+    let appearanceDoneAt = ProcessInfo.processInfo.systemUptime
     applyPendingRowsAfterAttachment(reason: "viewWillAppear")
+    let rowsDoneAt = ProcessInfo.processInfo.systemUptime
     // Resolve the composer/connect-gate as early as possible too: for a Claude/Codex DM
     // this reads the (now proactively warmed) bridge status and lands on a stable input
     // or connect panel before the chat is even fully on screen, instead of activating a
     // beat later in viewDidAppear and visibly swapping in.
     applyPendingInputActivationAfterAttachment(reason: "viewWillAppear")
+    NSLog(
+      "[ChatOpen] host-stage viewWillAppear appearanceMs=%d rowsMs=%d inputMs=%d sinceTapMs=%d",
+      Int((appearanceDoneAt - mountDoneAt) * 1000),
+      Int((rowsDoneAt - appearanceDoneAt) * 1000),
+      Int((ProcessInfo.processInfo.systemUptime - rowsDoneAt) * 1000),
+      VibeChatOpenTap.msSinceTap())
   }
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
     guard !isDismantled else { return }
     hasAppeared = true
+    NSLog(
+      "[ChatOpen] host-stage viewDidAppear sinceTapMs=%d", VibeChatOpenTap.msSinceTap())
     logLifecycle("viewDidAppear")
     logVisualState("viewDidAppear", force: true)
     applyPendingAppearanceAfterAttachment(reason: "viewDidAppear")
     applyPendingInputActivationAfterAttachment(reason: "viewDidAppear")
     applyPendingRowsAfterAttachment(reason: "viewDidAppear")
     settleInitialBottomIfNeeded(reason: "viewDidAppear")
+    // The navigation transaction is finished. Release the newest coalesced transcript
+    // independently of the push; header/masking/composer were already painted locally.
+    mainView.completeTranscriptPresentation()
+    startVisibleBridgeStatusPollingIfNeeded()
     schedulePostPresentationActivation(reason: "viewDidAppear")
     refreshPersistentAgentInboxSummary()
   }
@@ -6206,8 +7262,18 @@ final class ChatConversationController: UIViewController {
     logVisualState("viewDidLayoutSubviews")
   }
 
+  override func viewWillDisappear(_ animated: Bool) {
+    super.viewWillDisappear(animated)
+    // Capture while the transcript is still on screen (drawHierarchy needs live
+    // content) — this bitmap becomes the next open's first frame.
+    mainView.captureReopenSnapshot()
+  }
+
   override func viewDidDisappear(_ animated: Bool) {
     super.viewDidDisappear(animated)
+    mainView.persistViewportState()
+    bridgeStatusPollTask?.cancel()
+    bridgeStatusPollTask = nil
     logLifecycle("viewDidDisappear")
     logVisualState("viewDidDisappear", force: true)
   }
@@ -6231,6 +7297,7 @@ final class ChatConversationController: UIViewController {
     )
     postPresentationActivationWorkItem?.cancel()
     pendingConnectStatusTask?.cancel()
+    bridgeStatusPollTask?.cancel()
     closeOpenedChatChannel()
   }
 
@@ -6239,6 +7306,8 @@ final class ChatConversationController: UIViewController {
     isDismantled = true
     postPresentationActivationWorkItem?.cancel()
     postPresentationActivationWorkItem = nil
+    bridgeStatusPollTask?.cancel()
+    bridgeStatusPollTask = nil
     removeAgentConnectPanel()
     closeOpenedChatChannel()
   }
@@ -6259,6 +7328,20 @@ final class ChatConversationController: UIViewController {
         reason: "themeChanged",
         allowDeferUntilAttached: true
       )
+    }
+  }
+
+  private func startVisibleBridgeStatusPollingIfNeeded() {
+    bridgeStatusPollTask?.cancel()
+    bridgeStatusPollTask = nil
+    guard route.isGroup || route.isChannel || route.bridgeProvider != nil else { return }
+    bridgeStatusPollTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled, let self, !self.isDismantled {
+        if let config = AppSessionConfig.current {
+          _ = try? await AgentPairingService.status(config: config)
+        }
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+      }
     }
   }
 
@@ -6298,10 +7381,36 @@ final class ChatConversationController: UIViewController {
     }
 
     let surfaceId = "native_chat_\(route.chatId)"
+    let routeMemberCount = route.members.count
+    let resolvedRouteMembers: [[String: Any]] =
+      route.isGroup
+      ? ChatRoute.resolvedMembers(chatId: route.chatId, routeMembers: route.members)
+      : []
+    if route.isGroup, route.members.isEmpty, !resolvedRouteMembers.isEmpty {
+      // Keep route in sync so the profile push doesn't re-open with 0 members.
+      self.route = route.withMembers(resolvedRouteMembers)
+    }
     latestProfileRows = route.initialRows
     lastAppliedRowsToSurfaceCount = 0
     mainView.surfaceId = surfaceId
     mainView.setDefersEngineStateRefreshes(true)
+    mainView.setDefersTranscriptUpdatesForPresentation(!hasAppeared)
+    // Stamp group/channel layout before binding the chat id. setEngineChatId can restore
+    // cached row/height state into the presentation queue; setting these flags afterward
+    // would invalidate that cache before the post-transition transcript commit.
+    mainView.setIsGroupOrChannel(route.isGroup)
+    mainView.setIsChannel(route.isChannel)
+    mainView.setGroupMembers(resolvedRouteMembers)
+    mainView.setGroupMemberCount(
+      route.isGroup && !resolvedRouteMembers.isEmpty ? resolvedRouteMembers.count : nil)
+    if route.isGroup {
+      NSLog(
+        "[WhoAmI] ChatConversation.applyRoute groupMembers chatId=%@ route=%d resolved=%d",
+        String(route.chatId.prefix(12)),
+        routeMemberCount,
+        resolvedRouteMembers.count
+      )
+    }
     // Seed route identity before any header/avatar paint. The chat header fallback
     // color is keyed by peer/chat identity, and waiting for the deferred engine
     // binding lets it briefly render from the title-only default seed.
@@ -6315,10 +7424,12 @@ final class ChatConversationController: UIViewController {
     } else {
       configureEngineBindingIfNeeded(reason: "applyRoute", enableStatusAuthority: false)
     }
+    // Theme/header masking is local UI state. Paint it before presentation instead of
+    // tying the safe-area chrome to engine attachment or the first transcript layout.
     applySurfaceAppearance(
       Self.resolvedAppearance(isDark: isDark),
       reason: "applyRoute",
-      allowDeferUntilAttached: deferSurfaceUntilAttached
+      allowDeferUntilAttached: false
     )
     appShellRouteLog(
       "ChatConversationController configureRouteSurfaceStart chatId=\(route.chatId) reason=applyRoute")
@@ -6328,38 +7439,13 @@ final class ChatConversationController: UIViewController {
     mountPreferredAgentSurfaceIfNeeded(reason: "applyRoute")
     mainView.setHeaderTitle(route.title)
     mainView.setHeaderUnreadCount(route.unreadCount)
+    mainView.setOpeningUnreadCount(route.unreadCount)
     mainView.setProfileName(route.title)
     mainView.setProfileHandle(Self.profileHandle(for: route))
     mainView.setProfileBio("")
     markRouteSurfaceStep("avatar")
     mainView.setAvatarUri(route.avatarURI)
     markRouteSurfaceStep("groupAndInput")
-    mainView.setIsGroupOrChannel(route.isGroup)
-    // Group roster must land on the chat surface too (not only the profile push).
-    // Without this, sender directory / role / agent-membership stay empty until
-    // something else re-binds, and the profile's admin/member state flickers.
-    if route.isGroup {
-      let routeMemberCount = route.members.count
-      let resolvedMembers = ChatRoute.resolvedMembers(
-        chatId: route.chatId, routeMembers: route.members)
-      if route.members.isEmpty, !resolvedMembers.isEmpty {
-        // Keep route in sync so the profile push doesn't re-open with 0 members.
-        self.route = route.withMembers(resolvedMembers)
-      }
-      mainView.setGroupMembers(resolvedMembers)
-      if !resolvedMembers.isEmpty {
-        mainView.setGroupMemberCount(resolvedMembers.count)
-      }
-      NSLog(
-        "[WhoAmI] ChatConversation.applyRoute groupMembers chatId=%@ route=%d resolved=%d",
-        String(route.chatId.prefix(12)),
-        routeMemberCount,
-        resolvedMembers.count
-      )
-    } else {
-      mainView.setGroupMembers([])
-      mainView.setGroupMemberCount(nil)
-    }
     // When the chat talks to an AI agent, bind the agent id so the engine routes
     // sends to the agent backend (peerAgentId) instead of E2E-encrypting to a
     // human peer. Empty string clears it for normal peer/group chats.
@@ -6374,18 +7460,15 @@ final class ChatConversationController: UIViewController {
       route.chatId == "saved_messages"
         ? "Saved Message"
         : (route.isAgentChat ? "Message \(route.title)" : "Message"))
-    if deferSurfaceUntilAttached {
-      pendingInputActivationForAttachment = true
-      appShellRouteLog(
-        "ChatConversationController deferInputActivation chatId=\(route.chatId) reason=prePresentation")
-    } else {
-      applyInputActivation(reason: "applyRoute")
-    }
+    // Mount the composer while the controller is being configured. Normal/group chats
+    // are immediately usable; bridge chats still pass through applyAgentConnectGate and
+    // therefore preserve their paired-computer requirement.
+    applyInputActivation(reason: deferSurfaceUntilAttached ? "applyRoute-prePresentation" : "applyRoute")
     markRouteSurfaceStep("page")
     mainView.setStandaloneProfileMode(false)
     // setStandaloneProfileMode(false) re-enables the composer — re-assert the
     // bridge-agent gate so an unconnected Claude/Codex/Grok chat stays input-less.
-    if !deferSurfaceUntilAttached, let provider = route.bridgeProvider, !provider.isEmpty,
+    if let provider = route.bridgeProvider, !provider.isEmpty,
       !bridgeConnectedThisSession
     {
       applyAgentConnectGate(provider: provider, reason: "applyRoute-afterProfileMode")
@@ -6699,15 +7782,11 @@ final class ChatConversationController: UIViewController {
   private func loadBridgeSessionIntoChat(provider: String, session: AgentBridgeHistorySession) {
     let sessionId = session.resolvedSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !sessionId.isEmpty, !sessionId.hasPrefix("running:") else { return }
-    // Scope the chat list's fresh-surface filter to THIS session so follow-ups
-    // stay visible and other sessions' bridge rows do not mix into the list.
-    mainView.setBridgeLoadedSessionId(sessionId)
-    _ = ChatEngine.shared.loadAgentBridgeSessionIntoChat([
-      "chatId": route.chatId,
-      "provider": provider,
-      "sessionId": sessionId,
-      "topic": session.topic,
-    ])
+    // One path with ChatListView: seed header title, show the custom skeleton
+    // spinner until rows land, scope historical isolation, and request detail.
+    // (Previously this only set the session id + engine load — list went empty
+    // with no spinner and the header stayed on "Start session".)
+    mainView.loadBridgeHistorySession(provider: provider, session: session)
   }
 
   /// Clears any active connect gate (used when the host is reused for another chat).
@@ -6904,9 +7983,9 @@ final class ChatConversationController: UIViewController {
       // engine read. getChatRows() blocks on the engine's serial queue, which is busy
       // loading history when a chat opens, so calling it here (viewDidLoad, before the
       // push animation) stalled the push by 1–2s for content-heavy chats. The full
-      // cached transcript is fetched OFF-THREAD by the async block below and rendered
-      // immediately on arrival via applyRowsToSurface's forced-layout path — so the push
-      // stays instant and warm chats still fill in without an empty flash.
+      // cached transcript is fetched OFF-THREAD by the async block below. The list
+      // coalesces it with this bounded seed and commits only after viewDidAppear, keeping
+      // all transcript measurement outside the navigation transaction.
       let firstRowID =
         Self.normalizedString(initialRows.first?["id"])
         ?? Self.normalizedString(initialRows.first?["messageId"])
@@ -6915,37 +7994,69 @@ final class ChatConversationController: UIViewController {
         "[ChatOpen] refreshRows seed chatId=%@ initialRows=%d source=initial window=%@ up=%.2f",
         String(chatId.prefix(12)), initialRows.count, view.window != nil ? "Y" : "N",
         ProcessInfo.processInfo.systemUptime)
-      let didApply = applyRowsToSurface(
-        initialRows,
-        chatId: chatId,
-        source: "initial",
-        firstRowID: firstRowID,
-        allowDeferUntilAttached: true
-      )
-      if didApply {
-        deferredEngineRowsReadyChatId = chatId
-        completeDeferredEngineStateRefreshIfNeeded(chatId: chatId)
-        settleInitialBottomIfNeeded(reason: "initialRows")
+      // Empty initial seed is worse than nothing — skip applying 0 rows so we don't
+      // force an empty paint before the async engine seed lands.
+      if !initialRows.isEmpty {
+        let didApply = applyRowsToSurface(
+          initialRows,
+          chatId: chatId,
+          source: "initial",
+          firstRowID: firstRowID,
+          // ChatListView safely accepts rows at 0×0 and explicitly reloads them on
+          // its first real-bounds layout. Pre-applying this bounded tail prevents the
+          // child list from rendering one empty wallpaper frame before the parent
+          // controller consumes its attachment queue.
+          allowDeferUntilAttached: false
+        )
+        if didApply {
+          deferredEngineRowsReadyChatId = chatId
+          completeDeferredEngineStateRefreshIfNeeded(chatId: chatId)
+          settleInitialBottomIfNeeded(reason: "initialRows")
+        }
       }
     }
 
+    // Kick the engine read ASAP off-main, but let ChatListView hold its result until the
+    // navigation transaction has completed. This overlaps I/O with the push without
+    // allowing collection measurement to steal animation frames.
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let nativeRows = ChatEngine.shared.getChatRows(["chatId": chatId])
       DispatchQueue.main.async { [weak self] in
         guard let self, self.route.chatId == chatId, self.rowsRefreshGeneration == generation else {
           return
         }
-        // Bridge DMs are driven by a local, live session transcript. A transient empty
-        // engine read must not replace a visible optimistic prompt / settled response with
-        // the route's original (often empty) snapshot while that session re-pushes. Normal
-        // chats retain their existing empty-state behavior, including an explicit clear.
+        // Never wipe a visible transcript with a transient empty engine read.
+        // ChatListView early-seeds from disk/engine during push; a concurrent empty
+        // getChatRows (history still loading) used to apply 0 rows and flash wallpaper.
         let isBridgeDM = !(self.route.bridgeProvider ?? "")
           .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let fallbackSource =
-          isBridgeDM && !self.latestProfileRows.isEmpty ? "retained" : "initial"
+        let hasVisibleRows =
+          !self.latestProfileRows.isEmpty || self.lastAppliedRowsToSurfaceCount > 0
+        if nativeRows.isEmpty, hasVisibleRows {
+          NSLog(
+            "[ChatOpen] refreshRows KEEP visible chat=%@ retained=%d lastApplied=%d initial=%d (skip empty wipe)",
+            String(chatId.prefix(12)),
+            self.latestProfileRows.count,
+            self.lastAppliedRowsToSurfaceCount,
+            initialRows.count)
+          return
+        }
+        let fallbackSource: String = {
+          if !self.latestProfileRows.isEmpty { return "retained" }
+          if isBridgeDM { return "initial" }
+          return "initial"
+        }()
         let fallbackRows =
-          isBridgeDM && !self.latestProfileRows.isEmpty ? self.latestProfileRows : initialRows
+          !self.latestProfileRows.isEmpty ? self.latestProfileRows : initialRows
         let rows = nativeRows.isEmpty ? fallbackRows : nativeRows
+        // Still empty after fallback — skip applying 0 so we don't force blank paint
+        // before history/chatRowsReloaded lands.
+        if rows.isEmpty {
+          NSLog(
+            "[ChatOpen] refreshRows SKIP empty chat=%@ native=0 initial=%d retained=%d",
+            String(chatId.prefix(12)), initialRows.count, self.latestProfileRows.count)
+          return
+        }
         let firstRowID =
           Self.normalizedString(rows.first?["id"])
           ?? Self.normalizedString(rows.first?["messageId"])
@@ -7036,10 +8147,14 @@ final class ChatConversationController: UIViewController {
     // finally sizes the list (the "empty for ~1s then pops in" flash). Force the whole
     // subtree to adopt the host's real bounds NOW so the rows render into a correctly
     // sized list on this runloop.
-    if view.window != nil, view.bounds.width > 1, view.bounds.height > 1 {
+    if hasAppeared, view.window != nil, view.bounds.width > 1, view.bounds.height > 1 {
       view.layoutIfNeeded()
     }
-    mainView.setRows(rows)
+    if source == "native" || source.hasPrefix("native-") {
+      mainView.setAuthoritativeRows(rows)
+    } else {
+      mainView.setRows(rows)
+    }
     lastAppliedRowsToSurfaceCount = rows.count
     if currentPage == .profile {
       profileView?.setRows(rows)
@@ -7734,7 +8849,7 @@ final class ChatConversationController: UIViewController {
         "chatId": route.chatId,
         "localOnly": true,
       ])
-      mainView.setRows([])
+      mainView.clearRows()
       profileView?.setRows([])
       latestProfileRows = []
       guard let config = AppSessionConfig.current else {
@@ -7757,7 +8872,7 @@ final class ChatConversationController: UIViewController {
     }
 
     _ = ChatEngine.shared.clearChat(["chatId": route.chatId])
-    mainView.setRows([])
+    mainView.clearRows()
     profileView?.setRows([])
     latestProfileRows = []
     AppToastController.shared.show("Chat cleared.")
@@ -7949,13 +9064,7 @@ final class ChatConversationController: UIViewController {
   }
 
   private static func resolvedAppearance(isDark: Bool) -> [String: Any] {
-    [
-      "theme": isDark ? "dark" : "light",
-      "backgroundMode": "gradient",
-      "wallpaperOpacity": 1.0,
-      "nativeThemeId": AppThemePlateController.currentOption.rawValue,
-      "nativeThemeIsDark": isDark,
-    ]
+    ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
   }
 }
 
@@ -8381,21 +9490,25 @@ private extension Color {
   }
 }
 
-private enum AppHomeHeaderState {
+/// Home principal header tree (hard-refreshed): Connecting → Updating → Chats.
+private enum AppHomeHeaderState: Equatable {
+  case connecting
+  case updating
   case ready
-  case waitingForNetwork
 
   var title: String {
     switch self {
-    case .ready:
-      return "Chats"
-    case .waitingForNetwork:
-      return "Waiting for Network"
+    case .connecting: return "Connecting"
+    case .updating: return "Updating"
+    case .ready: return "Chats"
     }
   }
 
   var showsProgress: Bool {
-    false
+    switch self {
+    case .ready: return false
+    case .connecting, .updating: return true
+    }
   }
 }
 
@@ -8403,18 +9516,49 @@ private struct AppHomeStatusHeaderView: View {
   let state: AppHomeHeaderState
   let palette: AppThemePalette
 
+  private static let spinnerSize: CGFloat = 12
+  private static let dotSize: CGFloat = 6
+
+  /// Status dot for Connecting / Updating (muted amber while connecting, soft accent while updating).
+  private var statusDotColor: Color {
+    switch state {
+    case .connecting:
+      return Color(red: 1.0, green: 0.72, blue: 0.18)
+    case .updating:
+      return palette.accent.opacity(0.95)
+    case .ready:
+      return .clear
+    }
+  }
+
   var body: some View {
-    HStack(spacing: 6) {
+    // Whole group is centered in the principal slot for every state.
+    HStack(spacing: 5) {
       if state.showsProgress {
-        ProgressView()
-          .controlSize(.small)
-          .tint(palette.secondaryText)
+        Circle()
+          .fill(statusDotColor)
+          .frame(width: Self.dotSize, height: Self.dotSize)
+          .accessibilityHidden(true)
+
+        AppLineLoadingSpinner(
+          size: Self.spinnerSize,
+          lineWidth: 1.65,
+          color: palette.secondaryText
+        )
+        .frame(width: Self.spinnerSize, height: Self.spinnerSize)
       }
 
       Text(state.title)
         .font(.system(size: 17, weight: .semibold))
         .foregroundStyle(palette.text)
+        .lineLimit(1)
+        .minimumScaleFactor(0.85)
+        .id(state)
     }
+    .frame(maxWidth: .infinity, minHeight: 22, alignment: .center)
+    .transaction { $0.animation = nil }
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel(state.title)
   }
 }
 
@@ -8455,6 +9599,60 @@ private struct AppShellEmptyStateView: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .padding(.horizontal, 30)
+  }
+}
+
+/// Centered home-list loading placeholder — thin line spinner (not system ProgressView).
+private struct AppListLoadingView: View {
+  let palette: AppThemePalette
+  var caption: String = "Loading"
+  @State private var appeared = false
+
+  var body: some View {
+    VStack(spacing: 16) {
+      AppLineLoadingSpinner(
+        size: 28,
+        lineWidth: 2.0,
+        color: palette.secondaryText.opacity(0.85)
+      )
+      Text(caption)
+        .font(.system(size: 14, weight: .medium))
+        .foregroundStyle(palette.secondaryText.opacity(0.85))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .opacity(appeared ? 1 : 0)
+    .scaleEffect(appeared ? 1 : 0.94)
+    .onAppear {
+      withAnimation(.easeOut(duration: 0.28)) {
+        appeared = true
+      }
+    }
+  }
+}
+
+/// Thin circular line spinner — open arc + continuous rotation (header + page load).
+private struct AppLineLoadingSpinner: View {
+  var size: CGFloat = 14
+  var lineWidth: CGFloat = 1.75
+  var color: Color = Color.secondary
+  /// Full rotation period in seconds.
+  var period: Double = 0.85
+
+  var body: some View {
+    TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: false)) { context in
+      let t = context.date.timeIntervalSinceReferenceDate
+      let angle = (t.truncatingRemainder(dividingBy: period) / period) * 360.0
+      Circle()
+        .trim(from: 0.08, to: 0.78)
+        .stroke(
+          color,
+          style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
+        )
+        .frame(width: size, height: size)
+        .rotationEffect(.degrees(angle))
+    }
+    .frame(width: size, height: size)
+    .accessibilityLabel("Loading")
   }
 }
 
@@ -10552,6 +11750,11 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     appearance.configureWithTransparentBackground()
     appearance.shadowColor = .clear
     appearance.backgroundColor = .clear
+    // Dark mode: keep chrome near-black so trailing liquid-glass doesn't sample gray list wash.
+    if traitCollection.userInterfaceStyle == .dark {
+      appearance.backgroundEffect = UIBlurEffect(style: .systemChromeMaterialDark)
+      appearance.backgroundColor = UIColor.black.withAlphaComponent(0.22)
+    }
     UINavigationBar.appearance().standardAppearance = appearance
     UINavigationBar.appearance().scrollEdgeAppearance = appearance
     UINavigationBar.appearance().compactAppearance = appearance
@@ -10786,13 +11989,7 @@ final class ChatAgentConversationController: UIViewController {
     super.viewDidLoad()
     view.backgroundColor = isDark ? .black : .white
 
-    let appearance: [String: Any] = [
-      "theme": isDark ? "dark" : "light",
-      "backgroundMode": "gradient",
-      "wallpaperOpacity": 1.0,
-      "nativeThemeId": AppThemePlateController.currentOption.rawValue,
-      "nativeThemeIsDark": isDark,
-    ]
+    let appearance: [String: Any] = ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
 
     // Headless transport: in the hierarchy so it gets a window and connects the
     // agent socket, but not a second full-screen chat UI. Full-screen + local
