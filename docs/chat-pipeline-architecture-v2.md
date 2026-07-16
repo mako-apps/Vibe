@@ -97,15 +97,25 @@ Engine:
 
 ### Stages
 
-- **A1 (engine, additive):** introduce `ingestMessagesLocked` + `ChatDelta` behind
-  the existing APIs. `applyChatHistoryResponseLocked`, live message handlers, and
-  channel-backlog ingest route through it. Old notifications still fire. Build green.
-- **A2 (engine):** all remaining writers rerouted; `mergedChatRowsLocked` reads the
-  index; view-overlay inputs become deltas. Build green.
-- **B (view):** `applyDelta` consumption; kill list deleted. Build green + device
-  smoke test (open/reopen the three test chats, send, receive, team run live tail).
-- **C (sweep):** dead-function inventory removal (evidence: zero references outside
-  the file, or only from other dead functions). Build green after every batch.
+- **A1 (engine, additive — DONE, under review):** `ingestHistoryRowsLocked` funnel
+  with the generalized field-merge policy (+ transient-key denylist: `isStreaming`,
+  `uploadProgress` — absence means OFF, never carried) and the `chatDelta` event on
+  the history path. Old notifications still fire. Build green required.
+- **A2 (engine):** every remaining WRITE path (live new_message, edits, deletes,
+  bridge row upserts, stream settles) posts a `chatDelta` with the affected ids,
+  computed against the merged read (`mergedChatRowsLocked`). The internal
+  live/history dual store is NOT collapsed here — consumers already have a single
+  read view + deltas; unification is a later internal stage (A3) with no consumer
+  impact. Build green.
+- **B (view):** `applyDelta` consumption in ChatListView; kill list deleted. Build
+  green + device smoke test (open/reopen the three test chats, send, receive,
+  team run live tail, history pagination).
+- **C (sweep):** dead-function removal from the 2026-07-16 inventory. Batch 1:
+  private/fileprivate high-confidence only. Internal/public candidates require a
+  JS-bridge cross-check first (engine methods can be dispatched by name from the
+  Capacitor layer — a Swift-only grep cannot prove them dead). Build green per batch.
+- **A3 (optional, later):** collapse liveMessageRowsByChat/historyRowsByChat into
+  one ordered index behind the funnel. Internal-only; do after B has soaked.
 
 ### Non-goals
 

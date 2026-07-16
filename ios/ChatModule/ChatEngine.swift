@@ -22,6 +22,21 @@ private struct ChatEngineHybridPayload: Decodable {
   let g: String?
 }
 
+private struct ChatIngestDelta {
+  let insertedIds: [String]
+  let updatedIds: [String]
+  let deletedIds: [String]
+  let generation: Int
+}
+
+/// Message-dict keys whose ABSENCE means "off" — the ingest merge must never carry
+/// them forward from an older copy (see ingestHistoryRowsLocked's merge policy).
+extension ChatEngine {
+  fileprivate static let ingestTransientMessageKeys: Set<String> = [
+    "isStreaming", "is_streaming", "uploadProgress", "upload_progress",
+  ]
+}
+
 private func chatEngineReadDERLength(bytes: [UInt8], offset: inout Int) -> Int? {
   guard offset < bytes.count else { return nil }
   let first = Int(bytes[offset])
@@ -555,6 +570,7 @@ final class ChatEngine {
   private var pinnedMessagesByChatId: [String: [[String: Any]]] = [:]
   private var pinnedFetchInFlightChatIds = Set<String>()
   private var historyRowsByChat: [String: [[String: Any]]] = [:]
+  private var chatIngestGenerationByChat: [String: Int] = [:]
   private var historyFullyLoadedChats = Set<String>()
   private var historyRowsRestoredFromCacheChats = Set<String>()
   private var cachedSavedMessagesResponse: [[String: Any]]?
@@ -8981,13 +8997,20 @@ final class ChatEngine {
     return rowsByApplyingBubbleSequenceShapes(mergedRows)
   }
 
-  private func mergedStoredHistoryRowsLocked(
+  private func ingestHistoryRowsLocked(
     chatId: String,
     remoteRows: [[String: Any]]
-  ) -> [[String: Any]] {
+  ) -> (rows: [[String: Any]], delta: ChatIngestDelta) {
     let existingRows = historyRowsByChat[chatId] ?? []
     let deletedIds = deletedMessageIdsByChat[chatId] ?? []
-    guard !existingRows.isEmpty || !remoteRows.isEmpty else { return [] }
+    let generation = (chatIngestGenerationByChat[chatId] ?? 0) + 1
+    chatIngestGenerationByChat[chatId] = generation
+    guard !existingRows.isEmpty || !remoteRows.isEmpty else {
+      return (
+        [],
+        ChatIngestDelta(
+          insertedIds: [], updatedIds: [], deletedIds: [], generation: generation))
+    }
 
     var mergedById: [String: [String: Any]] = [:]
     var rowsWithoutIds: [[String: Any]] = []
@@ -9006,26 +9029,33 @@ final class ChatEngine {
         continue
       }
       guard !deletedIds.contains(messageId) else { continue }
-      // Reply previews only ride the live socket delivery; the history endpoint's
-      // JSON omits them, so a plain remote overwrite ERASES previews the app already
-      // rendered. Every refetch then flips replyPreview* nil↔value between the cached
-      // seed and the flush — 77-row reuse misses, sig height-promote misses, and a
-      // mode=batch changed=73 repaint after every open of a reply-heavy chat. Carry
-      // the known fields over so enrichment is monotone.
-      var remoteRow = row
-      if let existing = mergedById[messageId],
-        var remoteMessage = remoteRow["message"] as? [String: Any],
-        let existingMessage = existing["message"] as? [String: Any]
-      {
-        var carried = false
-        for key in ["replyToId", "replyPreview", "replyPreviewTitle", "replyPreviewText"]
-        where remoteMessage[key] == nil && existingMessage[key] != nil {
-          remoteMessage[key] = existingMessage[key]
-          carried = true
+      var mergedRow = row
+      if let existing = mergedById[messageId] {
+        if mergedRow["message"] is [String: Any] || existing["message"] is [String: Any] {
+          var mergedMessage = mergedRow["message"] as? [String: Any] ?? [:]
+          let existingMessage = existing["message"] as? [String: Any] ?? [:]
+          for (key, value) in existingMessage
+          where mergedMessage[key] == nil || mergedMessage[key] is NSNull {
+            // Transient liveness keys are OFF-by-absence: a settled remote copy omits
+            // them, and carrying a stale true/value forward would resurrect a dead
+            // live state (stuck shimmer — the team-run orphan bug class).
+            if Self.ingestTransientMessageKeys.contains(key) { continue }
+            if key == "metadata", var carriedMeta = value as? [String: Any] {
+              carriedMeta.removeValue(forKey: "isStreaming")
+              carriedMeta.removeValue(forKey: "is_streaming")
+              mergedMessage[key] = carriedMeta
+              continue
+            }
+            mergedMessage[key] = value
+          }
+          mergedRow["message"] = mergedMessage
         }
-        if carried { remoteRow["message"] = remoteMessage }
+        for (key, value) in existing
+        where key != "message" && (mergedRow[key] == nil || mergedRow[key] is NSNull) {
+          mergedRow[key] = value
+        }
       }
-      mergedById[messageId] = rowAdoptingSettleSlotTs(remoteRow, messageId: messageId)
+      mergedById[messageId] = rowAdoptingSettleSlotTs(mergedRow, messageId: messageId)
     }
 
     var mergedRows = Array(mergedById.values)
@@ -9038,7 +9068,44 @@ final class ChatEngine {
       return lt < rt
     }
     mergedRows.insert(contentsOf: rowsWithoutIds, at: 0)
-    return rowsByApplyingBubbleSequenceShapes(mergedRows)
+    let rows = rowsByApplyingBubbleSequenceShapes(mergedRows)
+
+    var previousRowsById: [String: [String: Any]] = [:]
+    for row in existingRows {
+      guard let messageId = messageId(fromRow: row) else { continue }
+      previousRowsById[messageId] = row
+    }
+    var rowsById: [String: [String: Any]] = [:]
+    for row in rows {
+      guard let messageId = messageId(fromRow: row) else { continue }
+      rowsById[messageId] = row
+    }
+
+    let previousIds = Set(previousRowsById.keys)
+    let ids = Set(rowsById.keys)
+    let insertedIds = ids.subtracting(previousIds).sorted()
+    let deltaDeletedIds = previousIds.subtracting(ids).sorted()
+    let updatedIds = ids.intersection(previousIds).filter { messageId in
+      guard let row = rowsById[messageId], let previousRow = previousRowsById[messageId] else {
+        return false
+      }
+      return !(row as NSDictionary).isEqual(to: previousRow)
+    }.sorted()
+    return (
+      rows,
+      ChatIngestDelta(
+        insertedIds: insertedIds,
+        updatedIds: updatedIds,
+        deletedIds: deltaDeletedIds,
+        generation: generation))
+  }
+
+  // v2: subsumed by ingestHistoryRowsLocked
+  private func mergedStoredHistoryRowsLocked(
+    chatId: String,
+    remoteRows: [[String: Any]]
+  ) -> [[String: Any]] {
+    ingestHistoryRowsLocked(chatId: chatId, remoteRows: remoteRows).rows
   }
 
   private func storeMergedChatHistoryIfLoadedLocked(chatId: String) {
@@ -11830,7 +11897,7 @@ final class ChatEngine {
     let existingRows = historyRowsByChat[chatId] ?? []
     let existingRowsCount = existingRows.count
     let liveRowsCount = liveMessageRowsByChat[chatId]?.count ?? 0
-    let rows = mergedStoredHistoryRowsLocked(chatId: chatId, remoteRows: remoteRows)
+    let (rows, delta) = ingestHistoryRowsLocked(chatId: chatId, remoteRows: remoteRows)
     // Refetch reconciliation that changed nothing must not repaint: the view already
     // rendered these exact rows from cache, and the reload notification would send the
     // whole transcript back through the full parse/diff/layout pipeline on main.
@@ -11863,6 +11930,23 @@ final class ChatEngine {
     guard !isUnchangedRefetch else { return }
     let snapshot = statusSnapshotLocked()
     postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId, "state": snapshot])
+    postChangeLocked(
+      reason: "chatDelta",
+      userInfo: [
+        "chatId": chatId,
+        "generation": delta.generation,
+        "insertedIds": delta.insertedIds,
+        "updatedIds": delta.updatedIds,
+        "deletedIds": delta.deletedIds,
+        "state": snapshot,
+      ])
+    NSLog(
+      "[ChatDelta] history chat=%@ gen=%d ins=%d upd=%d del=%d",
+      chatId,
+      delta.generation,
+      delta.insertedIds.count,
+      delta.updatedIds.count,
+      delta.deletedIds.count)
   }
 
   private func applySavedMessagesHistoryResponseLocked(data: Data) {
