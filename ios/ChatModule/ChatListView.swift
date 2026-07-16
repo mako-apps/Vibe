@@ -1015,6 +1015,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var nativeOutgoingRowsById: [String: [String: Any]] = [:]
   private var nativeOutgoingOrder: [String] = []
   private var nativeEngineRowsById: [String: [String: Any]] = [:]
+  /// Pipeline-v2 (stage B1): row updates arrive as engine `chatDelta` events and are
+  /// applied via ONE coalesced, off-main engine read — replacing the legacy per-message
+  /// path that did a synchronous engine-queue fetch per mutation on the main thread.
+  private var engineDeltaRefreshInFlight = false
+  private var engineDeltaRefreshPending = false
+  private var nextApplyBaseIsEngineAuthoritative = false
+  private var deltaStreamCoalesceWorkItem: DispatchWorkItem?
+  private var lastDeltaStreamApplyAt: CFTimeInterval = 0
   private var nativeEngineOrder: [String] = []
   /// Richest row seen for a still-live logical agent turn. Bridge transports can briefly
   /// deliver an older snapshot after a newer one (for example 29 nodes -> 32 -> 29). The
@@ -7361,6 +7369,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     deferredPresentationSeedSourceRows = nil
     deferredPresentationSeedPreferredRows = nil
     removeReopenSnapshotOverlay(reason: "chat-switch", animated: false)
+    deltaStreamCoalesceWorkItem?.cancel()
+    deltaStreamCoalesceWorkItem = nil
+    engineDeltaRefreshPending = false
+    nextApplyBaseIsEngineAuthoritative = false
     warmTranscriptBaselineActive = false
     warmTranscriptBaselineSourceRows = []
     windowedTranscriptSourceRows = nil
@@ -9066,27 +9078,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         refreshBridgeTaskBanner()
       }
     }
+    if reason == "chatDelta" {
+      applyChatDeltaFromEngine(note.userInfo)
+      return
+    }
     if reason == "chatMessageInserted"
       || reason == "chatMessageEdited"
       || reason == "chatMessageDeleted"
       || reason == "chatMessageChanged"
     {
-      let messageId = normalizedMessageId(note.userInfo?["messageId"])
-      let action = (note.userInfo?["action"] as? String)?.trimmingCharacters(
-        in: .whitespacesAndNewlines)
-      syncNativeEngineMessageMutation(reason: reason, messageId: messageId, action: action)
+      // Pipeline-v2: every engine write now posts a chatDelta (stage A2), which is
+      // handled above with ONE coalesced off-main refresh. The legacy per-message
+      // path (sync engine-queue fetch per mutation) remains only for the
+      // statusAuthority-OFF surfaces handled earlier in this observer.
       return
     }
     if reason == "messageStatusChanged" {
-      let messageId = normalizedMessageId(note.userInfo?["messageId"])
-      if messageId != nil {
-        syncNativeEngineMessageMutation(
-          reason: "chatMessageChanged",
-          messageId: messageId,
-          action: "updated"
-        )
-        return
-      }
+      // Row-dict status changes ride chatDelta (source=status). Receipt-index-only
+      // writes post no delta, so keep the cheap visible-cell tick repaint here.
+      refreshVisibleStatuses(reason: reason)
+      return
     }
     if reason == "chatRowsReloaded" {
       hydrateRowsFromNativeHistoryIfReady(trigger: "chatRowsReloaded")
@@ -10793,6 +10804,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func mergedRowsPayload(from baseRows: [[String: Any]]) -> [[String: Any]] {
     let effectiveBaseRows: [[String: Any]] = {
       guard statusAuthorityEnabled, !engineChatId.isEmpty else { return baseRows }
+      // Delta-driven applies (stage B1) already fetched a fresh engine read off-main;
+      // repeating the synchronous fetch below would re-add the main-thread
+      // engine-queue hop the delta path exists to remove.
+      if nextApplyBaseIsEngineAuthoritative {
+        nextApplyBaseIsEngineAuthoritative = false
+        return baseRows
+      }
       // Only use native engine rows as the primary source when native history
       // has actually been fetched from the server AND the native row count is
       // at least as large as what JS provides. If decryption failed for most
@@ -11016,6 +11034,82 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     mergedRow["message"] = mergedMessage
     return mergedRow
+  }
+
+  /// Pipeline-v2 stage B1: apply an engine `chatDelta`. The engine is authoritative
+  /// for every id in the delta, so stale overlay copies are dropped (the overlay
+  /// drains as deltas flow and remains only for statusAuthority-OFF surfaces), and
+  /// the transcript refreshes from ONE coalesced, off-main engine read — the
+  /// existing apply pipeline (parse reuse + render-aware equality) then repaints
+  /// only rows whose rendered content actually changed.
+  private func applyChatDeltaFromEngine(_ userInfo: [AnyHashable: Any]?) {
+    let inserted = (userInfo?["insertedIds"] as? [String]) ?? []
+    let updated = (userInfo?["updatedIds"] as? [String]) ?? []
+    let deleted = (userInfo?["deletedIds"] as? [String]) ?? []
+    guard !inserted.isEmpty || !updated.isEmpty || !deleted.isEmpty else { return }
+    for id in inserted { nativeEngineRowsById.removeValue(forKey: id) }
+    for id in updated { nativeEngineRowsById.removeValue(forKey: id) }
+    for id in deleted {
+      nativeEngineRowsById.removeValue(forKey: id)
+      nativeDeletedMessageIds.insert(id)
+    }
+    let source = (userInfo?["source"] as? String) ?? ""
+    if source == "stream" {
+      scheduleDeltaCoalescedEngineRefresh()
+    } else {
+      refreshRowsFromEngineDelta()
+    }
+  }
+
+  private func refreshRowsFromEngineDelta() {
+    guard !engineDeltaRefreshInFlight else {
+      engineDeltaRefreshPending = true
+      return
+    }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+    engineDeltaRefreshInFlight = true
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let rows = ChatEngine.shared.getChatRows(["chatId": chatId])
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.engineDeltaRefreshInFlight = false
+        defer {
+          if self.engineDeltaRefreshPending {
+            self.engineDeltaRefreshPending = false
+            self.refreshRowsFromEngineDelta()
+          }
+        }
+        guard self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines) == chatId,
+          !rows.isEmpty
+        else { return }
+        // These rows ARE a fresh engine read; mergedRowsPayload must not repeat the
+        // synchronous main-thread fetch it does for stale-source applies.
+        self.nextApplyBaseIsEngineAuthoritative = true
+        self.setRows(rows)
+      }
+    }
+  }
+
+  /// Stream ticks arrive many times per second; coalesce their refreshes to the same
+  /// ~20fps cadence the legacy path used, always ending on a trailing refresh.
+  private func scheduleDeltaCoalescedEngineRefresh() {
+    guard deltaStreamCoalesceWorkItem == nil else { return }
+    let now = CACurrentMediaTime()
+    if now - lastDeltaStreamApplyAt >= Self.streamSyncMinInterval {
+      lastDeltaStreamApplyAt = now
+      refreshRowsFromEngineDelta()
+      return
+    }
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.deltaStreamCoalesceWorkItem = nil
+      self.lastDeltaStreamApplyAt = CACurrentMediaTime()
+      self.refreshRowsFromEngineDelta()
+    }
+    deltaStreamCoalesceWorkItem = work
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + Self.streamSyncMinInterval, execute: work)
   }
 
   private func syncNativeEngineMessageMutation(reason: String, messageId: String?, action: String?)

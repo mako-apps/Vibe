@@ -12436,6 +12436,7 @@ final class ChatEngine {
         "insertedIds": inserted,
         "updatedIds": updated,
         "deletedIds": deleted,
+        "source": source,
         "state": statusSnapshotLocked(),
       ])
     NSLog(
