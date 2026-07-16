@@ -26,7 +26,6 @@ private struct ChatIngestDelta {
   let insertedIds: [String]
   let updatedIds: [String]
   let deletedIds: [String]
-  let generation: Int
 }
 
 /// Message-dict keys whose ABSENCE means "off" — the ingest merge must never carry
@@ -778,6 +777,8 @@ final class ChatEngine {
       event: "native-bridge-outgoing-drop-queue",
       payload: ["chatId": chatId, "count": ids.count, "reason": reason]
     )
+    postChatDeltaLocked(
+      chatId: chatId, inserted: [], updated: [], deleted: ids, source: "delete")
   }
 
   /// A bridge send that may already have reached the wire failed (ack timeout,
@@ -3124,6 +3125,9 @@ final class ChatEngine {
     let me = currentUserIdLocked()
     var lastMessageId: String?
     var ingestedIds = Set<String>()
+    var deltaInsertedIds: [String] = []
+    var deltaUpdatedIds: [String] = []
+    var deltaDeletedIds: [String] = []
     // Own NON-bridge user rows already in this chat's stores (the optimistic send row
     // and/or its persisted server twin). A transcript user turn matching one of these
     // is the CLI's mirror of a prompt this phone already renders. It must be skipped
@@ -3344,7 +3348,18 @@ final class ChatEngine {
         }
         synthetic["metadata"] = meta
       }
-      _ = applyNativeIncomingMessageEventLocked(chatId: chatId, payload: synthetic)
+      let wasPresent =
+        liveMessageRowsByChat[chatId]?[messageId] != nil
+        || (historyRowsByChat[chatId] ?? []).contains {
+          self.messageId(fromRow: $0) == messageId
+        }
+      _ = applyNativeIncomingMessageEventLocked(
+        chatId: chatId, payload: synthetic, postDelta: false)
+      if wasPresent {
+        deltaUpdatedIds.append(messageId)
+      } else {
+        deltaInsertedIds.append(messageId)
+      }
       ingestedIds.insert(messageId)
       if role != "user" { ingestedAgentRow = true }
       lastMessageId = messageId
@@ -3380,8 +3395,9 @@ final class ChatEngine {
         // equivalent to clearing everything; a group can have a SECOND agent concurrently
         // streaming under the same chatId, and clearing indiscriminately would wipe that
         // agent's still-live row out from under it.
-        removeAgentStreamRowsLocked(
+        let removal = removeAgentStreamRowsLocked(
           chatId: chatId, agentUserId: Self.bridgeAgentUserId(forProvider: provider))
+        deltaDeletedIds.append(contentsOf: removal.removedIds)
         agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
         clearAgentProgressLocked(chatId: chatId, reason: "ingestSettle(noRunningTurn)")
         // Latch the session settled so a subsequent growth re-push can't re-widen its
@@ -3479,6 +3495,7 @@ final class ChatEngine {
         }
         deletedMessageIdsByChat[chatId] = deleted
         storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+        deltaDeletedIds.append(contentsOf: staleIds.sorted())
       }
     }
 
@@ -3488,6 +3505,12 @@ final class ChatEngine {
         userInfo: ["chatId": chatId, "messageId": lastMessageId, "state": statusSnapshotLocked()]
       )
     }
+    postChatDeltaLocked(
+      chatId: chatId,
+      inserted: Array(Set(deltaInsertedIds)).sorted(),
+      updated: Array(Set(deltaUpdatedIds)).sorted(),
+      deleted: Array(Set(deltaDeletedIds)).sorted(),
+      source: "bridge")
   }
 
   func retryOutgoingMessage(_ payload: [String: Any]) -> [String: Any] {
@@ -3612,6 +3635,8 @@ final class ChatEngine {
           "action": "deleted",
           "state": snapshot,
         ])
+      postChatDeltaLocked(
+        chatId: resolvedChatId, inserted: [], updated: [], deleted: [messageId], source: "delete")
       return ["accepted": true, "messageId": messageId, "state": "removed"]
     }
   }
@@ -3812,6 +3837,8 @@ final class ChatEngine {
       postChangeLocked(
         reason: "messageStatusChanged",
         userInfo: ["chatId": chatId, "messageId": messageId, "status": "sending"])
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [messageId], updated: [], deleted: [], source: "optimistic")
       NSLog(
         "[ChatEngine] sendMessage optimistic row emitted in %dms chatId=%@ messageId=%@",
         Int(nowMs() - optimisticStartMs), chatId, messageId)
@@ -3906,11 +3933,18 @@ final class ChatEngine {
         if fileSize == nil, let localUri = mediaUrl, let localURL = localFileURL(from: localUri) {
           let attrs = try? FileManager.default.attributesOfItem(atPath: localURL.path)
           if let size = attrs?[.size] as? Int64, size > 0 {
-            mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
+            let fileSizeChanged = mutateLiveMessagePayloadLocked(
+              chatId: chatId, messageId: messageId
+            ) { message in
               message["fileSize"] = size
               var meta = (message["metadata"] as? [String: Any]) ?? [:]
               meta["fileSize"] = size
               message["metadata"] = meta
+            }
+            if fileSizeChanged {
+              postChatDeltaLocked(
+                chatId: chatId, inserted: [], updated: [messageId], deleted: [],
+                source: "optimistic")
             }
           }
         }
@@ -4062,11 +4096,14 @@ final class ChatEngine {
                 type
               )
               self.setLiveMessageUploadProgressLocked(
-                chatId: chatId, messageId: messageId, progress: 1.0)
+                chatId: chatId, messageId: messageId, progress: 1.0, postDelta: false)
               self.postChangeLocked(
                 reason: "chatMessageChanged",
                 userInfo: ["chatId": chatId, "messageId": messageId, "action": "updated"]
               )
+              self.postChatDeltaLocked(
+                chatId: chatId, inserted: [], updated: [messageId], deleted: [],
+                source: "optimistic")
               self.appendJournalLocked(
                 event: "native-media-upload-ok",
                 payload: [
@@ -4388,6 +4425,9 @@ final class ChatEngine {
           }
           self.upsertLiveMessageRowLocked(
             chatId: chatId, messageId: messageId, row: threadOptimisticRow)
+          self.postChatDeltaLocked(
+            chatId: chatId, inserted: [], updated: [messageId], deleted: [],
+            source: "optimistic")
           self.pendingOutboundDraftsByMessageId[messageId] = threadEffectivePayload
 
           guard let client = self.phoenixClient else {
@@ -4810,6 +4850,8 @@ final class ChatEngine {
       )
       postChangeLocked(
         reason: "chatMessageEdited", userInfo: ["chatId": chatId, "messageId": messageId])
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: [messageId], deleted: [], source: "edit")
       return result
     }
   }
@@ -5740,12 +5782,17 @@ final class ChatEngine {
     let next = allowDowngrade ? status : strongerDisplayStatus(current, status)
     chatMap[messageId] = next
     localStatusIndex[chatId] = chatMap
-    setLiveMessageStatusLocked(chatId: chatId, messageId: messageId, status: next)
+    var rowChanged = setLiveMessageStatusLocked(chatId: chatId, messageId: messageId, status: next)
     if next == "sent" || next == "delivered" || next == "read" || next == "error" {
-      setLiveMessageUploadProgressLocked(chatId: chatId, messageId: messageId, progress: nil)
+      rowChanged = setLiveMessageUploadProgressLocked(
+        chatId: chatId, messageId: messageId, progress: nil, postDelta: false) || rowChanged
     }
     state["localStatusCount"] = localStatusIndex.values.reduce(0) { $0 + $1.count }
     state["updatedAt"] = nowMs()
+    if rowChanged {
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: [messageId], deleted: [], source: "status")
+    }
   }
 
   private func removeMessageIndicesLocked(chatId: String, messageId: String) {
@@ -5996,6 +6043,7 @@ final class ChatEngine {
 
     guard !staleRows.isEmpty else { return }
     var changedChats = Set<String>()
+    var changedIdsByChat: [String: [String]] = [:]
     for stale in staleRows {
       if settleLiveBridgeMessageLocked(
         chatId: stale.chatId,
@@ -6003,6 +6051,7 @@ final class ChatEngine {
         terminalStatus: "done"
       ) {
         changedChats.insert(stale.chatId)
+        changedIdsByChat[stale.chatId, default: []].append(stale.messageId)
       }
       if let taskId = stale.taskId {
         removeBridgeTaskTrackingLocked(chatId: stale.chatId, taskId: taskId)
@@ -6031,6 +6080,9 @@ final class ChatEngine {
         reason: "chatRowsReloaded",
         userInfo: ["chatId": chatId, "state": statusSnapshotLocked()]
       )
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: changedIdsByChat[chatId] ?? [], deleted: [],
+        source: "bridgeStatus")
     }
     NSLog(
       "[AgentStatus] reconciled source=%@ staleRows=%d chats=%d activeTasks=%d",
@@ -6406,16 +6458,19 @@ final class ChatEngine {
       if let agentUserId, !agentUserId.isEmpty,
         hasFinishedBridgeSessionRowLocked(chatId: chatId, agentUserId: agentUserId)
       {
-        removeAgentStreamRowsLocked(chatId: chatId, agentUserId: agentUserId)
+        let removal = removeAgentStreamRowsLocked(chatId: chatId, agentUserId: agentUserId)
         postChangeLocked(
           reason: "chatRowsReloaded",
           userInfo: ["chatId": chatId, "state": statusSnapshotLocked()]
         )
+        postChatDeltaLocked(
+          chatId: chatId, inserted: [], updated: [], deleted: removal.removedIds,
+          source: "streamSettle")
         return
       }
       // Keep the accumulated text but stop the live indicator. The persisted
       // message (or its absence, on failure) takes over from here.
-      _ = settleLiveBridgeMessageLocked(
+      let changed = settleLiveBridgeMessageLocked(
         chatId: chatId,
         messageId: effectiveRowId,
         terminalStatus: status
@@ -6424,6 +6479,11 @@ final class ChatEngine {
         reason: "chatMessageChanged",
         userInfo: ["chatId": chatId, "messageId": effectiveRowId, "state": statusSnapshotLocked()]
       )
+      if changed {
+        postChatDeltaLocked(
+          chatId: chatId, inserted: [], updated: [effectiveRowId], deleted: [],
+          source: "streamSettle")
+      }
       return
     }
 
@@ -6647,17 +6707,25 @@ final class ChatEngine {
       }
     }
 
-    _ = applyNativeIncomingMessageEventLocked(chatId: chatId, payload: synthetic)
+    _ = applyNativeIncomingMessageEventLocked(
+      chatId: chatId, payload: synthetic, postDelta: false)
     mutateLiveMessagePayloadLocked(chatId: chatId, messageId: effectiveRowId) { message in
       message["isStreaming"] = true
     }
     // This live row now owns the in-flight turn — drop any running session row that a
     // history snapshot may have created for the same turn (order-independent dedup).
-    removeRunningBridgeSessionRowsLocked(chatId: chatId, agentUserId: agentUserId)
+    let removedBridgeIds = removeRunningBridgeSessionRowsLocked(
+      chatId: chatId, agentUserId: agentUserId)
     postChangeLocked(
       reason: hadExistingStreamRow ? "chatMessageChanged" : "chatMessageInserted",
       userInfo: ["chatId": chatId, "messageId": effectiveRowId, "state": statusSnapshotLocked()]
     )
+    postChatDeltaLocked(
+      chatId: chatId,
+      inserted: hadExistingStreamRow ? [] : [effectiveRowId],
+      updated: hadExistingStreamRow ? [effectiveRowId] : [],
+      deleted: removedBridgeIds,
+      source: "stream")
   }
 
   /// Fold an under-hood supervisor worker's stream into the lead row for `teamRunId`.
@@ -6694,7 +6762,7 @@ final class ChatEngine {
       return
     }
 
-    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: rowId) { message in
+    let changed = mutateLiveMessagePayloadLocked(chatId: chatId, messageId: rowId) { message in
       var metadata = (message["metadata"] as? [String: Any]) ?? [:]
       if !statusList.isEmpty {
         metadata["teamWorkersStatus"] = statusList
@@ -6719,6 +6787,10 @@ final class ChatEngine {
         teamWorkerProgressNodesByChatId[chatId] = chatCache
       }
       message["metadata"] = metadata
+    }
+    if changed {
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: [rowId], deleted: [], source: "stream")
     }
 
     postChangeLocked(
@@ -6821,8 +6893,12 @@ final class ChatEngine {
   /// none were stamped/removed) so the persisted reply that supersedes them can adopt
   /// the live bubble's list position instead of re-sorting to the bottom at settle.
   @discardableResult
-  private func removeAgentStreamRowsLocked(chatId: String, agentUserId: String?) -> Int64? {
-    guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return nil }
+  private func removeAgentStreamRowsLocked(
+    chatId: String, agentUserId: String?
+  ) -> (slotTs: Int64?, removedIds: [String]) {
+    guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else {
+      return (nil, [])
+    }
     let targetAgent = normalizedUpper(agentUserId)
     // Live cloud streams (`stream-…`) AND LAN dual-path rows (`lan-…`) both need
     // to drop when the real agent message lands — leaving either causes a second
@@ -6830,7 +6906,7 @@ final class ChatEngine {
     let streamIds = perChat.keys.filter {
       $0.hasPrefix("stream-") || $0.hasPrefix("lan-")
     }
-    guard !streamIds.isEmpty else { return nil }
+    guard !streamIds.isEmpty else { return (nil, []) }
     var removedIds = Set<String>()
     var inheritedSlotTs: Int64?
     for streamId in streamIds {
@@ -6847,7 +6923,7 @@ final class ChatEngine {
       perChat.removeValue(forKey: streamId)
       removedIds.insert(streamId)
     }
-    guard !removedIds.isEmpty else { return nil }
+    guard !removedIds.isEmpty else { return (nil, []) }
     // [EmptyTrace] This wipes the live streaming bubble(s). If it fires mid-stream and leaves
     // the live store empty, the agent list can jump to empty until history rehydrates.
     VibeDebugLog.log(
@@ -6879,7 +6955,7 @@ final class ChatEngine {
         liveStreamTaskRowIdByChatId[chatId] = perChatTaskRowIds
       }
     }
-    return inheritedSlotTs
+    return (inheritedSlotTs, removedIds.sorted())
   }
 
   /// Drop any session `bridge-…` rows currently flagged running. The live `agent-stream`
@@ -6891,8 +6967,10 @@ final class ChatEngine {
   /// `agentUserId` is given (a group running more than one agent concurrently), only that
   /// agent's own running session row is dropped — otherwise agent A's stream frame would
   /// retire agent B's still-legitimately-running session row out from under it.
-  private func removeRunningBridgeSessionRowsLocked(chatId: String, agentUserId: String? = nil) {
-    guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return }
+  private func removeRunningBridgeSessionRowsLocked(
+    chatId: String, agentUserId: String? = nil
+  ) -> [String] {
+    guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return [] }
     let targetAgent = normalizedUpper(agentUserId)
     var removed: [String] = []
     for (key, entry) in perChat where key.hasPrefix("bridge-") {
@@ -6906,13 +6984,14 @@ final class ChatEngine {
       }
       removed.append(key)
     }
-    guard !removed.isEmpty else { return }
+    guard !removed.isEmpty else { return [] }
     for key in removed { perChat.removeValue(forKey: key) }
     if perChat.isEmpty {
       liveMessageRowsByChat.removeValue(forKey: chatId)
     } else {
       liveMessageRowsByChat[chatId] = perChat
     }
+    return removed.sorted()
   }
 
   private func emitAgentProgressChangeLocked(
@@ -7892,15 +7971,23 @@ final class ChatEngine {
           )
           return
         }
+        let incomingMessageId = self.normalizedString(frame.payload["id"] ?? frame.payload["message_id"])
+        let incomingMessageWasPresent = incomingMessageId.map { messageId in
+          self.liveMessageRowsByChat[chatId]?[messageId] != nil
+            || (self.historyRowsByChat[chatId] ?? []).contains {
+              self.messageId(fromRow: $0) == messageId
+            }
+        } ?? false
         if frame.event == "message",
           let insertedMessageId = self.applyNativeIncomingMessageEventLocked(
-            chatId: chatId, payload: frame.payload)
+            chatId: chatId, payload: frame.payload, postDelta: false)
         {
           let fromId = self.normalizedString(frame.payload["fromId"] ?? frame.payload["from_id"])
           let isAgentMessage =
             (frame.payload["isAgentMessage"] as? Bool == true)
             || fromId?.lowercased() == Self.agentUserId
             || (fromId.map { Self.reservedBridgeAgentUserIds.contains($0.lowercased()) } ?? false)
+          var removedStreamIds: [String] = []
           if isAgentMessage {
             // Only clear the shared header progress when no other agent is still typing
             // in this group — otherwise Claude's finish blanks "Grok typing…".
@@ -7920,7 +8007,9 @@ final class ChatEngine {
             // live bubble's slot so the list keeps "who responded first" order instead
             // of reshuffling every reply to the bottom as it settles (multi-agent groups
             // settled 3 swaps in <1s — the jumping/overlap churn).
-            if let slotTs = self.removeAgentStreamRowsLocked(chatId: chatId, agentUserId: fromId) {
+            let removal = self.removeAgentStreamRowsLocked(chatId: chatId, agentUserId: fromId)
+            removedStreamIds = removal.removedIds
+            if let slotTs = removal.slotTs {
               self.adoptAgentSettleSlotTsLocked(
                 chatId: chatId, messageId: insertedMessageId, slotTs: slotTs)
             }
@@ -7970,6 +8059,12 @@ final class ChatEngine {
               "state": snapshot,
             ]
           )
+          self.postChatDeltaLocked(
+            chatId: chatId,
+            inserted: incomingMessageWasPresent ? [] : [insertedMessageId],
+            updated: incomingMessageWasPresent ? [insertedMessageId] : [],
+            deleted: removedStreamIds,
+            source: removedStreamIds.isEmpty ? "live" : "streamSettle")
           return
         }
         if let mutationUpdate = self.applyNativeChatMutationEventLocked(
@@ -7992,6 +8087,18 @@ final class ChatEngine {
               "state": snapshot,
             ]
           )
+          switch mutationUpdate.action {
+          case "edited":
+            self.postChatDeltaLocked(
+              chatId: chatId, inserted: [], updated: [mutationUpdate.messageId], deleted: [],
+              source: "edit")
+          case "deleted":
+            self.postChatDeltaLocked(
+              chatId: chatId, inserted: [], updated: [], deleted: [mutationUpdate.messageId],
+              source: "delete")
+          default:
+            break
+          }
           return
         }
         if let receiptUpdate = self.applyNativeChatEventLocked(
@@ -9003,13 +9110,10 @@ final class ChatEngine {
   ) -> (rows: [[String: Any]], delta: ChatIngestDelta) {
     let existingRows = historyRowsByChat[chatId] ?? []
     let deletedIds = deletedMessageIdsByChat[chatId] ?? []
-    let generation = (chatIngestGenerationByChat[chatId] ?? 0) + 1
-    chatIngestGenerationByChat[chatId] = generation
     guard !existingRows.isEmpty || !remoteRows.isEmpty else {
       return (
         [],
-        ChatIngestDelta(
-          insertedIds: [], updatedIds: [], deletedIds: [], generation: generation))
+        ChatIngestDelta(insertedIds: [], updatedIds: [], deletedIds: []))
     }
 
     var mergedById: [String: [String: Any]] = [:]
@@ -9096,8 +9200,7 @@ final class ChatEngine {
       ChatIngestDelta(
         insertedIds: insertedIds,
         updatedIds: updatedIds,
-        deletedIds: deltaDeletedIds,
-        generation: generation))
+        deletedIds: deltaDeletedIds))
   }
 
   // v2: subsumed by ingestHistoryRowsLocked
@@ -9115,7 +9218,15 @@ final class ChatEngine {
     storeCachedHistoryRowsLocked(chatId: chatId, rows: rows)
   }
 
-  private func upsertLiveMessageRowLocked(chatId: String, messageId: String, row: [String: Any]) {
+  @discardableResult
+  private func upsertLiveMessageRowLocked(
+    chatId: String, messageId: String, row: [String: Any]
+  ) -> Bool {
+    let wasPresent =
+      liveMessageRowsByChat[chatId]?[messageId] != nil
+      || (historyRowsByChat[chatId] ?? []).contains {
+        self.messageId(fromRow: $0) == messageId
+      }
     var perChat = liveMessageRowsByChat[chatId] ?? [:]
     perChat[messageId] = row
     liveMessageRowsByChat[chatId] = perChat
@@ -9128,23 +9239,28 @@ final class ChatEngine {
       }
     }
     storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+    return !wasPresent
   }
 
+  @discardableResult
   private func mutateLiveMessagePayloadLocked(
     chatId: String,
     messageId: String,
     mutate: (inout [String: Any]) -> Void
-  ) {
+  ) -> Bool {
     guard var perChat = liveMessageRowsByChat[chatId],
       var row = perChat[messageId],
       var message = row["message"] as? [String: Any]
     else {
-      return
+      return false
     }
+    let previousMessage = message
     mutate(&message)
+    guard !(message as NSDictionary).isEqual(to: previousMessage) else { return false }
     row["message"] = message
     perChat[messageId] = row
     liveMessageRowsByChat[chatId] = perChat
+    return true
   }
 
   /// Make every liveness field agree on a terminal state. Previously the top-level
@@ -9321,16 +9437,18 @@ final class ChatEngine {
           ?? metadata["agentTaskId"] ?? metadata["agent_task_id"])
       return rowTaskId == taskId ? messageId : nil
     }
-    var changed = false
+    var changedIds: [String] = []
     for messageId in matchingIds {
-      changed = settleLiveBridgeMessageLocked(
+      if settleLiveBridgeMessageLocked(
         chatId: chatId,
         messageId: messageId,
         terminalStatus: terminalStatus
-      ) || changed
+      ) {
+        changedIds.append(messageId)
+      }
     }
     removeBridgeTaskTrackingLocked(chatId: chatId, taskId: taskId)
-    guard changed else { return }
+    guard !changedIds.isEmpty else { return }
     agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
     clearAgentProgressLocked(chatId: chatId, status: terminalStatus, reason: reason)
     storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
@@ -9338,9 +9456,11 @@ final class ChatEngine {
       reason: "chatRowsReloaded",
       userInfo: ["chatId": chatId, "state": statusSnapshotLocked()]
     )
+    postChatDeltaLocked(
+      chatId: chatId, inserted: [], updated: changedIds, deleted: [], source: "bridgeSettle")
   }
 
-  private func setLiveMessageStatusLocked(chatId: String, messageId: String, status: String) {
+  private func setLiveMessageStatusLocked(chatId: String, messageId: String, status: String) -> Bool {
     mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
       message["status"] = status
     }
@@ -9418,6 +9538,8 @@ final class ChatEngine {
       reason: "chatMessageChanged",
       userInfo: ["chatId": chatId, "messageId": messageId, "state": statusSnapshotLocked()]
     )
+    postChatDeltaLocked(
+      chatId: chatId, inserted: [], updated: [messageId], deleted: [], source: "bridgeSettle")
   }
 
   /// Pin a settled agent reply to the slot its live stream bubble occupied. Rewrites the
@@ -9465,7 +9587,8 @@ final class ChatEngine {
   private func setLiveMessageUploadProgressLocked(
     chatId: String,
     messageId: String,
-    progress: Double?
+    progress: Double?,
+    postDelta: Bool = true
   ) -> Bool {
     let normalizedProgress: Double?
     if let progress, progress.isFinite {
@@ -9499,7 +9622,7 @@ final class ChatEngine {
       return false
     }
 
-    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
+    let changed = mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
       if let clamped = normalizedProgress {
         message["uploadProgress"] = clamped
         var metadata = (message["metadata"] as? [String: Any]) ?? [:]
@@ -9517,7 +9640,11 @@ final class ChatEngine {
         }
       }
     }
-    return true
+    if changed && postDelta {
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: [messageId], deleted: [], source: "upload")
+    }
+    return changed
   }
 
   private func markLiveMessageDeletedLocked(chatId: String, messageId: String) {
@@ -9668,7 +9795,9 @@ final class ChatEngine {
 
   private static let agentUserId = "00000000-0000-0000-0000-000000000001"
 
-  private func applyNativeIncomingMessageEventLocked(chatId: String, payload: [String: Any])
+  private func applyNativeIncomingMessageEventLocked(
+    chatId: String, payload: [String: Any], postDelta: Bool = true
+  )
     -> String?
   {
     guard let messageId = normalizedString(payload["id"] ?? payload["message_id"]) else {
@@ -9840,7 +9969,7 @@ final class ChatEngine {
         }
       }
     }
-    upsertLiveMessageRowLocked(chatId: chatId, messageId: messageId, row: row)
+    let inserted = upsertLiveMessageRowLocked(chatId: chatId, messageId: messageId, row: row)
     appendJournalLocked(
       event: "native-message-row-upsert",
       payload: [
@@ -9849,6 +9978,17 @@ final class ChatEngine {
         "type": type,
       ])
     state["updatedAt"] = nowMs()
+    if postDelta {
+      let source =
+        messageId.hasPrefix("stream-") || messageId.hasPrefix("lan-") ? "stream" :
+        messageId.hasPrefix("bridge-") ? "bridge" : "live"
+      postChatDeltaLocked(
+        chatId: chatId,
+        inserted: inserted ? [messageId] : [],
+        updated: inserted ? [] : [messageId],
+        deleted: [],
+        source: source)
+    }
     return messageId
   }
 
@@ -10293,19 +10433,27 @@ final class ChatEngine {
   }
 
   private func setMessagePinnedStateLocked(chatId: String, messageId: String, pinned: Bool) {
-    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
+    let liveChanged = mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
       message["isPinned"] = pinned
       message["pinned"] = pinned
     }
 
-    guard var rows = historyRowsByChat[chatId] else { return }
+    guard var rows = historyRowsByChat[chatId] else {
+      if liveChanged {
+        postChatDeltaLocked(
+          chatId: chatId, inserted: [], updated: [messageId], deleted: [], source: "pin")
+      }
+      return
+    }
     var changed = false
     for index in rows.indices {
       guard normalizedString(rows[index]["kind"]) == "message" else { continue }
       guard var message = rows[index]["message"] as? [String: Any] else { continue }
       guard normalizedString(message["id"]) == messageId else { continue }
+      let previousMessage = message
       message["isPinned"] = pinned
       message["pinned"] = pinned
+      guard !(message as NSDictionary).isEqual(to: previousMessage) else { continue }
       var row = rows[index]
       row["message"] = message
       rows[index] = row
@@ -10313,6 +10461,10 @@ final class ChatEngine {
     }
     if changed {
       historyRowsByChat[chatId] = rows
+    }
+    if liveChanged || changed {
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: [messageId], deleted: [], source: "pin")
     }
   }
 
@@ -10373,6 +10525,8 @@ final class ChatEngine {
           "messageId": messageId,
           "reason": "built_in_agent_surface:\(reason)",
         ])
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: [], deleted: [messageId], source: "delete")
       return
     }
     var payload = payload
@@ -11240,6 +11394,7 @@ final class ChatEngine {
     var perChat = liveMessageRowsByChat[chatId] ?? [:]
     let deletedIds = deletedMessageIdsByChat[chatId] ?? []
     var seeded = 0
+    var seededIds: [String] = []
     var settledOnRestore = 0
     for (rowMessageId, row) in cached {
       guard perChat[rowMessageId] == nil, !deletedIds.contains(rowMessageId) else { continue }
@@ -11256,6 +11411,7 @@ final class ChatEngine {
         perChat[rowMessageId] = row
       }
       seeded += 1
+      seededIds.append(rowMessageId)
     }
     if settledOnRestore > 0 {
       NSLog(
@@ -11270,6 +11426,9 @@ final class ChatEngine {
     appendJournalLocked(
       event: "bridge-rows-cache-restore",
       payload: ["chatId": chatId, "rows": seeded])
+    postChatDeltaLocked(
+      chatId: chatId, inserted: seededIds.sorted(), updated: [], deleted: [],
+      source: "bridgeRestore")
   }
 
   private func clearVolatileBridgeHistoryLocked(chatId: String, reason: String) {
@@ -11368,8 +11527,9 @@ final class ChatEngine {
     // message in a chat whose history was never loaded — e.g. the very first message
     // of a brand-new chat) is the ONLY copy the app has: wiping it makes the message
     // vanish from the chat list and the home preview until a full history round-trip.
+    let previousLive = liveMessageRowsByChat
     var nextLive: [String: [String: [String: Any]]] = [:]
-    for (chatId, perChat) in liveMessageRowsByChat {
+    for (chatId, perChat) in previousLive {
       if isVolatileBridgeAgentChatLocked(chatId: chatId) {
         nextLive[chatId] = perChat
         continue
@@ -11407,6 +11567,12 @@ final class ChatEngine {
     liveMessageRowsByChat = nextLive
     deletedMessageIdsByChat = deletedMessageIdsByChat.filter { chatId, _ in
       isVolatileBridgeAgentChatLocked(chatId: chatId) || liveMessageRowsByChat[chatId] != nil
+    }
+    for (chatId, perChat) in previousLive {
+      let remainingIds = Set(nextLive[chatId]?.keys ?? Dictionary<String, [String: Any]>().keys)
+      let removedIds = Set(perChat.keys).subtracting(remainingIds).sorted()
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: [], deleted: removedIds, source: "socketReset")
     }
   }
 
@@ -11510,7 +11676,7 @@ final class ChatEngine {
           (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any]
         }.filter { !isTransientStreamRow($0) }
         let existingCount = historyRowsByChat[chatId]?.count ?? 0
-        let rows = mergedStoredHistoryRowsLocked(chatId: chatId, remoteRows: olderRows)
+        let (rows, delta) = ingestHistoryRowsLocked(chatId: chatId, remoteRows: olderRows)
         historyRowsByChat[chatId] = rows
         historyLoadingOlderChats.remove(chatId)
         state["updatedAt"] = nowMs()
@@ -11532,6 +11698,9 @@ final class ChatEngine {
             "state": statusSnapshotLocked(),
             "prependedOlder": prependedCount,
           ])
+        postChatDeltaLocked(
+          chatId: chatId, inserted: delta.insertedIds, updated: delta.updatedIds,
+          deleted: delta.deletedIds, source: "history")
         return true
       }
     }
@@ -11668,7 +11837,7 @@ final class ChatEngine {
         }
 
         let existingCount = self.historyRowsByChat[chatId]?.count ?? 0
-        let rows = self.mergedStoredHistoryRowsLocked(chatId: chatId, remoteRows: olderRows)
+        let (rows, delta) = self.ingestHistoryRowsLocked(chatId: chatId, remoteRows: olderRows)
         self.historyRowsByChat[chatId] = rows
         _ = self.persistHistoryRowsToStoreLocked(
           chatId: chatId, rows: olderRows, skipPrune: true)
@@ -11693,6 +11862,9 @@ final class ChatEngine {
             "state": self.statusSnapshotLocked(),
             "prependedOlder": prependedCount,
           ])
+        self.postChatDeltaLocked(
+          chatId: chatId, inserted: delta.insertedIds, updated: delta.updatedIds,
+          deleted: delta.deletedIds, source: "history")
       }
     }.resume()
     return true
@@ -11930,23 +12102,12 @@ final class ChatEngine {
     guard !isUnchangedRefetch else { return }
     let snapshot = statusSnapshotLocked()
     postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId, "state": snapshot])
-    postChangeLocked(
-      reason: "chatDelta",
-      userInfo: [
-        "chatId": chatId,
-        "generation": delta.generation,
-        "insertedIds": delta.insertedIds,
-        "updatedIds": delta.updatedIds,
-        "deletedIds": delta.deletedIds,
-        "state": snapshot,
-      ])
-    NSLog(
-      "[ChatDelta] history chat=%@ gen=%d ins=%d upd=%d del=%d",
-      chatId,
-      delta.generation,
-      delta.insertedIds.count,
-      delta.updatedIds.count,
-      delta.deletedIds.count)
+    postChatDeltaLocked(
+      chatId: chatId,
+      inserted: delta.insertedIds,
+      updated: delta.updatedIds,
+      deleted: delta.deletedIds,
+      source: "history")
   }
 
   private func applySavedMessagesHistoryResponseLocked(data: Data) {
@@ -11972,6 +12133,7 @@ final class ChatEngine {
     }
     let normalized = normalizeSavedMessagesLocked(rawItems)
     cachedSavedMessagesResponse = normalized
+    let previousRows = historyRowsByChat[chatId] ?? []
     let rows = buildHistoryRowsLocked(chatId: chatId, rawMessages: normalized)
     historyRowsByChat[chatId] = rows
     historyFullyLoadedChats.insert(chatId)
@@ -11988,6 +12150,26 @@ final class ChatEngine {
     scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "history_loaded")
     let snapshot = statusSnapshotLocked()
     postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId, "state": snapshot])
+    let previousById = Dictionary(
+      uniqueKeysWithValues: previousRows.compactMap { row in
+        messageId(fromRow: row).map { ($0, row) }
+      })
+    let rowsById = Dictionary(
+      uniqueKeysWithValues: rows.compactMap { row in
+        messageId(fromRow: row).map { ($0, row) }
+      })
+    let previousIds = Set(previousById.keys)
+    let ids = Set(rowsById.keys)
+    let updatedIds = ids.intersection(previousIds).filter { id in
+      guard let previous = previousById[id], let row = rowsById[id] else { return false }
+      return !(row as NSDictionary).isEqual(to: previous)
+    }.sorted()
+    postChatDeltaLocked(
+      chatId: chatId,
+      inserted: ids.subtracting(previousIds).sorted(),
+      updated: updatedIds,
+      deleted: previousIds.subtracting(ids).sorted(),
+      source: "savedMessages")
   }
 
   private func buildHistoryRowsLocked(chatId: String, rawMessages: [[String: Any]]) -> [[String:
@@ -12234,6 +12416,31 @@ final class ChatEngine {
       }
     }
     return out
+  }
+
+  private func postChatDeltaLocked(
+    chatId: String,
+    inserted: [String],
+    updated: [String],
+    deleted: [String],
+    source: String
+  ) {
+    guard !inserted.isEmpty || !updated.isEmpty || !deleted.isEmpty else { return }
+    let generation = (chatIngestGenerationByChat[chatId] ?? 0) + 1
+    chatIngestGenerationByChat[chatId] = generation
+    postChangeLocked(
+      reason: "chatDelta",
+      userInfo: [
+        "chatId": chatId,
+        "generation": generation,
+        "insertedIds": inserted,
+        "updatedIds": updated,
+        "deletedIds": deleted,
+        "state": statusSnapshotLocked(),
+      ])
+    NSLog(
+      "[ChatDelta] %@ chat=%@ gen=%d ins=%d upd=%d del=%d",
+      source, chatId, generation, inserted.count, updated.count, deleted.count)
   }
 
   private func postChangeLocked(reason: String, userInfo: [String: Any]) {
