@@ -15,6 +15,7 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   alias Vibe.AgentBridge
   alias Vibe.AI.LocalAgentWorker
+  alias Vibe.Chat
   alias VibeWeb.Presence
 
   # Keep only the most recent stream-json lines per in-flight task so a long run
@@ -257,7 +258,15 @@ defmodule VibeWeb.AgentBridgeChannel do
       "[AgentBridge] result received user=#{socket.assigns.user_id} provider=#{inspect(provider)} chat=#{inspect(chat_id)} exit=#{inspect(payload["exitStatus"])} outputBytes=#{byte_size(payload["output"] || "")}"
     )
 
-    if is_binary(provider) and is_binary(chat_id) do
+    owner_in_chat = bridge_owns_chat?(socket, chat_id)
+
+    if is_binary(provider) and is_binary(chat_id) and not owner_in_chat do
+      Logger.warning(
+        "[AgentBridge] result REJECTED — bridge owner not a participant of chat user=#{socket.assigns.user_id} chat=#{inspect(chat_id)}"
+      )
+    end
+
+    if is_binary(provider) and owner_in_chat do
       output = payload["output"] || ""
       exit_status = payload["exitStatus"] || 0
       duration_ms = payload["durationMs"] || 0
@@ -323,11 +332,11 @@ defmodule VibeWeb.AgentBridgeChannel do
   def handle_in("history_result", payload, socket) when is_map(payload) do
     chat_id = payload["chatId"] || payload["chat_id"]
 
-    if is_binary(chat_id) and chat_id != "" do
+    if bridge_owns_chat?(socket, chat_id) do
       VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-history", payload)
     else
       Logger.info(
-        "[AgentBridge] history_result without chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
+        "[AgentBridge] history_result not relayed (no chatId or owner not a participant) user=#{socket.assigns.user_id} chat=#{inspect(chat_id)} requestId=#{inspect(payload["requestId"])}"
       )
     end
 
@@ -340,11 +349,11 @@ defmodule VibeWeb.AgentBridgeChannel do
   def handle_in("file_result", payload, socket) when is_map(payload) do
     chat_id = payload["chatId"] || payload["chat_id"]
 
-    if is_binary(chat_id) and chat_id != "" do
+    if bridge_owns_chat?(socket, chat_id) do
       VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-file", payload)
     else
       Logger.info(
-        "[AgentBridge] file_result without chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
+        "[AgentBridge] file_result not relayed (no chatId or owner not a participant) user=#{socket.assigns.user_id} chat=#{inspect(chat_id)} requestId=#{inspect(payload["requestId"])}"
       )
     end
 
@@ -357,11 +366,11 @@ defmodule VibeWeb.AgentBridgeChannel do
   def handle_in("usage_result", payload, socket) when is_map(payload) do
     chat_id = payload["chatId"] || payload["chat_id"]
 
-    if is_binary(chat_id) and chat_id != "" do
+    if bridge_owns_chat?(socket, chat_id) do
       VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-usage", payload)
     else
       Logger.info(
-        "[AgentBridge] usage_result without chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
+        "[AgentBridge] usage_result not relayed (no chatId or owner not a participant) user=#{socket.assigns.user_id} chat=#{inspect(chat_id)} requestId=#{inspect(payload["requestId"])}"
       )
     end
 
@@ -375,7 +384,7 @@ defmodule VibeWeb.AgentBridgeChannel do
   def handle_in("ask_request", payload, socket) when is_map(payload) do
     chat_id = payload["chatId"] || payload["chat_id"]
 
-    if is_binary(chat_id) and chat_id != "" do
+    if bridge_owns_chat?(socket, chat_id) do
       Logger.info(
         "[AgentBridge][ask] relay user=#{socket.assigns.user_id} chat=#{chat_id} " <>
           "requestId=#{inspect(payload["requestId"])} kind=#{inspect(payload["kind"])} " <>
@@ -407,7 +416,7 @@ defmodule VibeWeb.AgentBridgeChannel do
     chat_id = payload["chatId"] || payload["chat_id"]
     request_id = payload["requestId"] || payload["request_id"]
 
-    if is_binary(chat_id) and chat_id != "" do
+    if bridge_owns_chat?(socket, chat_id) do
       Logger.info(
         "[AgentBridge][ask] cancel user=#{socket.assigns.user_id} chat=#{chat_id} " <>
           "requestId=#{inspect(request_id)} reason=<redacted #{byte_size(inspect(payload["reason"] || ""))} bytes> " <>
@@ -448,7 +457,7 @@ defmodule VibeWeb.AgentBridgeChannel do
     focus = payload["focusByHandle"] || payload["focus_by_handle"] || %{}
     requester = payload["requesterUserId"] || to_string(socket.assigns.user_id)
 
-    if is_binary(chat_id) and is_binary(team_run_id) and is_list(handles) do
+    if bridge_owns_chat?(socket, chat_id) and is_binary(team_run_id) and is_list(handles) do
       LocalAgentWorker.spawn_supervisor_workers(
         chat_id,
         team_run_id,
@@ -469,22 +478,29 @@ defmodule VibeWeb.AgentBridgeChannel do
 
     message = payload["message"] || "The task could not be completed on your computer."
 
-    LocalAgentWorker.post_bridge_notice(
-      provider,
-      chat_id,
-      message,
-      to_string(socket.assigns.user_id),
-      payload["replyToId"]
-    )
+    if bridge_owns_chat?(socket, chat_id) do
+      LocalAgentWorker.post_bridge_notice(
+        provider,
+        chat_id,
+        message,
+        to_string(socket.assigns.user_id),
+        payload["replyToId"]
+      )
 
-    LocalAgentWorker.fail_bridge_team_run(
-      chat_id,
-      payload["teamRunId"] || payload["team_run_id"],
-      payload["teamWorker"] || payload["team_worker"] || provider,
-      message
-    )
+      LocalAgentWorker.fail_bridge_team_run(
+        chat_id,
+        payload["teamRunId"] || payload["team_run_id"],
+        payload["teamWorker"] || payload["team_worker"] || provider,
+        message
+      )
 
-    LocalAgentWorker.stop_activity(chat_id, agent_user_id_for(provider))
+      LocalAgentWorker.stop_activity(chat_id, agent_user_id_for(provider))
+    else
+      Logger.warning(
+        "[AgentBridge] error notice REJECTED — bridge owner not a participant of chat user=#{socket.assigns.user_id} chat=#{inspect(chat_id)}"
+      )
+    end
+
     {:reply, :ok, clear_stream(socket, chat_id, provider, payload)}
   end
 
@@ -531,7 +547,8 @@ defmodule VibeWeb.AgentBridgeChannel do
         lead = payload["leadWorker"] || payload["lead_worker"]
         worker = payload["teamWorker"] || payload["team_worker"] || payload["provider"]
 
-        if role == "lead" or (is_binary(lead) and lead == worker) or is_nil(role) do
+        if bridge_owns_chat?(socket, chat_id) and
+             (role == "lead" or (is_binary(lead) and lead == worker) or is_nil(role)) do
           LocalAgentWorker.spawn_supervisor_workers(
             chat_id,
             team_run_id,
@@ -644,5 +661,16 @@ defmodule VibeWeb.AgentBridgeChannel do
       nil -> LocalAgentWorker.agent_user_id()
       worker -> worker.agent_user_id
     end
+  end
+
+  # Bind every chat-targeted relay to the bridge owner's membership. join/3 already
+  # asserts the socket is bound to its owner (bridge:<user_id> == socket user); a
+  # bridge legitimately delivers ONLY into chats its owner takes part in — their own
+  # agent DMs and the team groups they belong to. Gating on membership blocks a paired
+  # bridge from injecting agent frames / broadcasts into a chat its owner is not in,
+  # without touching the legitimate agent use-case.
+  defp bridge_owns_chat?(socket, chat_id) do
+    is_binary(chat_id) and chat_id != "" and
+      Chat.is_participant?(chat_id, socket.assigns.user_id)
   end
 end
