@@ -851,20 +851,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let screenY: Double
     let atBottom: Bool
     let savedAt: Double
-    /// Session identity of the record. A same-run reopen always restores. Across a full
-    /// relaunch only a fresh mid-history anchor restores (see loadPersistedOpeningViewport
-    /// + crossLaunchViewportMaxAge) so returning to a chat lands where you left off, while
-    /// a bottom-saved or stale record still opens at the bottom / unread anchor. Optional
-    /// so pre-token records simply decode as cross-launch candidates.
+    /// Session identity of the record. Scroll memory is same-run only: a reopen within
+    /// this app process restores, a relaunch is a clean slate (record deleted, chat
+    /// opens at the bottom / unread anchor). See loadPersistedOpeningViewport.
     var bootToken: String?
   }
 
   /// One value per app process — the viewport records' session identity.
   private static let viewportBootToken = UUID().uuidString
-  /// A mid-history scroll anchor still restores after a full relaunch within this window;
-  /// older records fall through to bottom so a chat untouched for days opens on its newest
-  /// messages rather than a stale position.
-  private static let crossLaunchViewportMaxAge: TimeInterval = 72 * 60 * 60
   private static let persistedViewportKeyPrefix = "vibe.ios.chat.viewport.v1"
   private var persistedOpeningViewport: PersistedViewport?
   private var openingUnreadCount = 0
@@ -1963,6 +1957,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         guard target.intersects(CGRect(origin: .zero, size: size)) else { continue }
         avatarView.drawHierarchy(in: target, afterScreenUpdates: false)
       }
+      // Same for the expand/collapse glass chips and the jump-to-bottom button —
+      // both live on sibling overlays. Without them the raster covers the first
+      // ~300ms WITHOUT this chrome and it pops in when the live list mounts (the
+      // reported "expand button has a delay to appear" / perceived layout shift).
+      for chip in tallToggleViewsById.values where !chip.isHidden {
+        let frameInSelf = chip.convert(chip.bounds, to: self)
+        let target = frameInSelf.offsetBy(
+          dx: -collectionView.frame.minX, dy: -collectionView.frame.minY)
+        guard target.intersects(CGRect(origin: .zero, size: size)) else { continue }
+        chip.drawHierarchy(in: target, afterScreenUpdates: false)
+      }
+      if jumpToBottomButton.superview != nil, !jumpToBottomButton.isHidden {
+        let frameInSelf = jumpToBottomButton.frame
+        let target = frameInSelf.offsetBy(
+          dx: -collectionView.frame.minX, dy: -collectionView.frame.minY)
+        if target.intersects(CGRect(origin: .zero, size: size)) {
+          jumpToBottomButton.drawHierarchy(in: target, afterScreenUpdates: false)
+        }
+      }
     }
     // A capture with no drawable content (drawHierarchy teardown race → flat frame)
     // must never poison a good raster: overlaying a flat frame for the next open's
@@ -2095,6 +2108,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     insertSubview(overlay, aboveSubview: collectionView)
     reopenSnapshotOverlay = overlay
     removeSeedLoadingIndicator(reason: "raster")
+    // A mid-history reopen shows a mid-history raster — the jump-to-bottom button
+    // belongs on screen from this very frame (layoutSubviews keeps it above the
+    // overlay). Waiting for the seed mount to place it was the "scroll-to-bottom
+    // toggle has a delay to appear".
+    if let viewport = persistedOpeningViewport, viewport.atBottom == false,
+      openingUnreadCount == 0
+    {
+      setJumpButtonVisible(true)
+    }
     NSLog("[ChatOpen] reopen-snapshot SHOW chat=%@", String(engineChatId.prefix(12)))
   }
 
@@ -4739,40 +4761,37 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       persistedOpeningViewport = nil
       return
     }
-    // Same-run reopen always restores. Across a full relaunch, honor ONLY a genuine
-    // mid-history anchor (the user scrolled up and left it there) that is still recent — a
-    // bottom-saved record cold-opens at the bottom exactly as before, and a stale anchor
-    // falls through so we don't drop the user into ancient history. applyOpeningViewport
-    // still prefers unread and resolves the anchor by messageId with a bottom fallback, so
-    // this can only land on a real row the seed loaded; worst case is today's bottom.
+    // Scroll memory is SAME-RUN ONLY (explicit product decision): reopening a chat
+    // within one app run lands where you left off; a full app relaunch is a clean
+    // slate that opens at the bottom like a fresh conversation. Cross-launch restore
+    // was tried (72h mid-history anchors) and read as "the layout shifted" — the
+    // leftover session surprised more than it helped.
     let sameRun = viewport.bootToken == Self.viewportBootToken
     let ageSeconds = Date().timeIntervalSince1970 - viewport.savedAt
-    let freshMidHistory =
-      viewport.atBottom == false
-      && (viewport.messageId?.isEmpty == false)
-      && ageSeconds >= 0
-      && ageSeconds <= Self.crossLaunchViewportMaxAge
-    guard sameRun || freshMidHistory else {
+    guard sameRun else {
       NSLog(
-        "[ChatOpen] viewport LOAD chat=%@ dropped sameRun=%@ atBottom=%@ hasAnchor=%@ age=%.0fs",
-        String(chatId.prefix(12)), sameRun ? "Y" : "N", viewport.atBottom ? "Y" : "N",
+        "[ChatOpen] viewport LOAD chat=%@ dropped sameRun=N atBottom=%@ hasAnchor=%@ age=%.0fs",
+        String(chatId.prefix(12)), viewport.atBottom ? "Y" : "N",
         (viewport.messageId?.isEmpty == false) ? "Y" : "N", ageSeconds)
       if viewport.atBottom == false, let key = reopenSnapshotKey() {
         // The raster captured at that close shows the dropped record's mid-history
         // viewport; this open lands at the bottom, so the raster would flash the wrong
         // rows. Runs before preloadReopenSnapshotFromDiskIfNeeded, so the disk twin is
-        // gone before it could decode.
+        // gone before it could decode. Bottom-captured rasters stay: bottom ↔ bottom
+        // is aligned and still buys the frame-one cover after a relaunch.
         Self.reopenSnapshotCache.removeObject(forKey: key)
         if let url = Self.reopenSnapshotFileURL(for: key) {
           Self.reopenSnapshotIOQueue.async { try? FileManager.default.removeItem(at: url) }
         }
       }
+      // Clean up the dead record so every later open of this chat skips the decode.
+      UserDefaults.standard.removeObject(forKey: Self.persistedViewportKey(chatId: chatId))
       persistedOpeningViewport = nil
       return
     }
     NSLog(
-      "[ChatOpen] viewport LOAD chat=%@ restore=%@ atBottom=%@ hasAnchor=%@ age=%.0fs",
-      String(chatId.prefix(12)), sameRun ? "same-run" : "cross-launch",
+      "[ChatOpen] viewport LOAD chat=%@ restore=same-run atBottom=%@ hasAnchor=%@ age=%.0fs",
+      String(chatId.prefix(12)),
       viewport.atBottom ? "Y" : "N", (viewport.messageId?.isEmpty == false) ? "Y" : "N",
       ageSeconds)
     persistedOpeningViewport = viewport
@@ -5746,6 +5765,42 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // opacity" the flicker reports describe (Telegram never cross-fades a chat in).
     removeReopenSnapshotOverlay(reason: "seed-mounted", animated: false)
     removeSeedLoadingIndicator(reason: "seed-mounted")
+    // Late layout passes (exact text sizing, inset settle) can grow content AFTER the
+    // bottom landing, leaving the list a few points short of the true bottom with
+    // nothing re-evaluating ("it's not at the very bottom, needs a slight scroll").
+    // Verify twice after things settle; each check logs the drift it repairs.
+    scheduleBottomIntegrityChecks()
+  }
+
+  private var userHasScrolledSinceOpen = false
+
+  private func scheduleBottomIntegrityChecks() {
+    let openChatId = engineChatId
+    for delay in [1.2, 2.6] {
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        self?.verifyBottomIntegrity(context: "post-seed-\(delay)s", armedChatId: openChatId)
+      }
+    }
+  }
+
+  /// Self-heal for silent bottom drift on a fresh open. Only acts when the user has
+  /// not touched the list since the open, we still believe we're pinned to the bottom,
+  /// and no other offset owner is active — then a short offset means late layout moved
+  /// the content bottom out from under the landing.
+  private func verifyBottomIntegrity(context: String, armedChatId: String) {
+    guard window != nil, engineChatId == armedChatId, !rows.isEmpty,
+      !userHasScrolledSinceOpen, shouldAutoScroll,
+      !collectionView.isTracking, !collectionView.isDragging, !collectionView.isDecelerating,
+      !isBottomGlideInFlight, !isApplyingRowsUpdate, !agentStreaming,
+      persistedOpeningViewport?.atBottom != false
+    else { return }
+    let maxOffset = max(0.0, collectionView.contentSize.height - collectionView.bounds.height)
+    let drift = maxOffset - collectionView.contentOffset.y
+    guard drift > 8.0 else { return }
+    NSLog(
+      "[ChatOpen] bottom DRIFT context=%@ chat=%@ dy=%.0f — re-pin",
+      context, String(engineChatId.prefix(12)), drift)
+    scrollToBottom(animated: false, force: true)
   }
 
   /// Real clears opt in explicitly. Empty payloads emitted by route/input/status setup are
@@ -7529,6 +7584,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     chatOpenStartedAt = ProcessInfo.processInfo.systemUptime
     openingUnreadCount = 0
     shouldApplyOpeningViewport = true
+    userHasScrolledSinceOpen = false
     loadPersistedOpeningViewport(chatId: next)
     preloadReopenSnapshotFromDiskIfNeeded()
     progressiveHeightWarmupWorkItem?.cancel()
@@ -10292,6 +10348,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+    userHasScrolledSinceOpen = true
     if isBottomGlideInFlight {
       // The touch itself already stopped the native scroll animation at the current
       // model offset (it ticks per frame — no presentation-layer readback needed);
