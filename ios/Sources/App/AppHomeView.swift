@@ -1911,6 +1911,10 @@ private final class ChatsViewModel: ObservableObject {
             sourceRows: engineRows,
             peerDisplayName: peerDisplayName
           )
+          // Twin prewarm: decode this chat's reopen raster into the overlay cache now,
+          // so the first open's shell commit already has content on its first frame
+          // instead of racing the disk decode (the cold-open spinner window).
+          ChatListView.prewarmReopenSnapshotRaster(chatId: chatID)
         }
         let tail = Array(engineRows.suffix(tailLimit))
         DispatchQueue.main.async { [weak self] in

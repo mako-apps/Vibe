@@ -1904,8 +1904,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return NSString(string: "\(chatId)|w\(width)|\(theme)")
   }
 
+  // userInitiated, not utility: the per-open disk decode races the shell commit
+  // (~30-50ms) — at utility it lost essentially every first-open race and the chat
+  // showed the spinner despite a valid raster sitting on disk.
   private static let reopenSnapshotIOQueue = DispatchQueue(
-    label: "vibe.reopen-snapshot.io", qos: .utility)
+    label: "vibe.reopen-snapshot.io", qos: .userInitiated)
 
   private static func reopenSnapshotFileURL(for key: NSString) -> URL? {
     guard
@@ -4168,6 +4171,44 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       NSLog(
         "[ChatOpen] prewarm SNAPSHOT chat=%@ rows=%d",
         String(trimmed.prefix(12)), parsed.count)
+    }
+  }
+
+  /// Launch prewarm twin for the reopen raster: decode the disk JPEG into the memory
+  /// cache BEFORE any tap, so the overlay is available at the shell commit itself (first
+  /// visible frame of the push) instead of racing a ~30-120ms disk decode at open. Runs
+  /// for the same few chats the transcript prewarm covers; both theme twins are tried
+  /// since only the file matching the capture-time theme exists. Off-main throughout.
+  static func prewarmReopenSnapshotRaster(chatId: String) {
+    let trimmed = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    let width = Int(UIScreen.main.bounds.width.rounded())
+    let screenScale = UIScreen.main.scale
+    for theme in ["dark", "light"] {
+      let key = NSString(string: "\(trimmed)|w\(width)|\(theme)")
+      guard reopenSnapshotCache.object(forKey: key) == nil,
+        let url = reopenSnapshotFileURL(for: key)
+      else { continue }
+      reopenSnapshotIOQueue.async {
+        guard FileManager.default.fileExists(atPath: url.path),
+          let data = try? Data(contentsOf: url),
+          let raw = UIImage(data: data, scale: screenScale)
+        else { return }
+        let image = raw.preparingForDisplay() ?? raw
+        // Same blank-frame safety as the per-open disk path: a flat raster must never
+        // enter the overlay cache.
+        guard (rasterLumaRange(image) ?? -1) >= 4 else {
+          try? FileManager.default.removeItem(at: url)
+          return
+        }
+        DispatchQueue.main.async {
+          guard reopenSnapshotCache.object(forKey: key) == nil else { return }
+          reopenSnapshotCache.setObject(image, forKey: key)
+          NSLog(
+            "[ChatOpen] reopen-snapshot PREWARM chat=%@ theme=%@",
+            String(trimmed.prefix(12)), theme)
+        }
+      }
     }
   }
 
