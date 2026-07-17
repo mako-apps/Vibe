@@ -4695,6 +4695,31 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return true
   }
 
+  /// Seed-time restore: when the freshly mounted presentation seed already contains the
+  /// saved mid-history anchor and heights are exact, position the FIRST painted frame on
+  /// it instead of mounting at the bottom and letting the post-appear flush jump there
+  /// ~500ms later (the felt bottom→scroll-memory shift on open, which also re-exposed a
+  /// whole new viewport of async-decoding media mid-view — the image pop/flicker).
+  /// Conservative by construction: unread opens, bottom-saved records, progressive
+  /// (estimated) sizing, search, or an anchor outside this seed window all return false
+  /// with the restore flag still armed, so the post-appear flush restores exactly as
+  /// before once the complete transcript is in.
+  private func applySavedViewportAtSeedIfPossible() -> Bool {
+    guard shouldApplyOpeningViewport, searchQuery.isEmpty, openingUnreadCount == 0,
+      !usesProgressiveTranscriptSizing,
+      let viewport = persistedOpeningViewport, viewport.atBottom == false,
+      let messageId = viewport.messageId, !messageId.isEmpty,
+      rows.contains(where: { $0.messageId == messageId })
+    else { return false }
+    let applied = applyOpeningViewportIfNeeded()
+    if applied {
+      NSLog(
+        "[ChatOpen] viewport RESTORE-AT-SEED chat=%@ anchor=%@",
+        String(engineChatId.prefix(12)), String(messageId.prefix(8)))
+    }
+    return applied
+  }
+
   private func hasExactProgressiveHeight(row: ChatListRow, rowWidth: CGFloat) -> Bool {
     let state = agentTurnBubbleState(for: row)
     if bubbleUsesAgentTurnContent(row) {
@@ -5493,10 +5518,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         if lastKnownViewportHeight > 0.5 {
           // Post-commit mount: the first real layout already ran on the empty shell
           // and owned the initial positioning, so this pass must land the freshly
-          // mounted transcript on the latest message itself.
+          // mounted transcript on the latest message itself — or directly on the saved
+          // mid-history anchor when this seed already contains it, so the first painted
+          // frame IS the restored position instead of bottom-then-jump.
           updateBottomAnchorInset()
           collectionView.layoutIfNeeded()
-          scrollToBottom(animated: false, force: true)
+          if !applySavedViewportAtSeedIfPossible() {
+            scrollToBottom(animated: false, force: true)
+          }
           emitViewport(force: true)
         }
         updateFloatingSenderAvatars()
@@ -17458,6 +17487,12 @@ final class SenderRunAvatarView: UIView {
     }
 
     // No cached image yet: show the initials tile now, swap in the photo when it lands.
+    // [AvatarPop] this branch IS the initials→photo flash: memory AND sync disk seed both
+    // missed. Firing repeatedly for the same sender across opens means the disk cache is
+    // not retaining (the reported avatar flicker) — name it.
+    NSLog(
+      "[AvatarPop] cache-miss name=%@ inWindow=%@ url=%@",
+      name, window != nil ? "Y" : "N", String(url.suffix(40)))
     imageView.image = nil
     imageView.isHidden = true
     initialsLabel.isHidden = false
@@ -17465,12 +17500,19 @@ final class SenderRunAvatarView: UIView {
     loadToken = token
     loadedURL = nil
     loadingURL = url
+    let requestedAt = ProcessInfo.processInfo.systemUptime
     Task { [weak self] in
       let image = await ChatAvatarImageStore.load(from: url)
       await MainActor.run {
         guard let self, self.loadToken == token else { return }
         self.loadingURL = nil
         guard let image else { return }
+        if self.window != nil {
+          NSLog(
+            "[AvatarPop] late name=%@ afterMs=%d",
+            self.configuredName ?? "?",
+            Int((ProcessInfo.processInfo.systemUptime - requestedAt) * 1000))
+        }
         self.loadedURL = url
         self.imageView.image = image
         self.imageView.isHidden = false

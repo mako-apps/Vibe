@@ -7003,6 +7003,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         && $0.mediaKey == row.mediaKey
     } ?? false
     let preservedMediaImage = isSameMediaIdentity ? mediaImageView.image : nil
+    // [MediaPop] reference point: image applies within ~1 frame of this stamp are the
+    // synchronous configure pass (invisible); later applies on a window-attached cell
+    // are the visible pop the flicker reports describe.
+    lastConfigureStartedAt = ProcessInfo.processInfo.systemUptime
     self.agentTurnState = agentTurnState
     isConfiguredAgentDivider = false
     let activeVoiceSnapshot = VoiceBubblePlaybackCoordinator.shared.currentSnapshot
@@ -9323,6 +9327,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           DispatchQueue.main.async {
             guard let self, (self.row?.messageId ?? self.row?.key) == rowKey else { return }
             if self.mediaImageView.image == nil {
+              if self.window != nil {
+                NSLog(
+                  "[MediaPop] late-image msgId=%@ type=blob sinceCfgMs=%d hadImage=N",
+                  rowKey,
+                  Int(
+                    (ProcessInfo.processInfo.systemUptime - self.lastConfigureStartedAt)
+                      * 1000))
+              }
               self.mediaImageView.image = image
             }
             self.mediaImageView.isHidden = false
@@ -9661,6 +9673,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       String(describing: mediaContainerView.backgroundColor),
       NSCoder.string(for: mediaContainerView.frame)
     )
+    // [MediaPop] a visible media cell finishing configure WITHOUT pixels will paint a
+    // blank shell this frame and pop when its async decode/download lands — name the
+    // row and which sources it has, so device logs identify the flicker population.
+    if window != nil, !mediaImageView.isHidden, mediaImageView.image == nil,
+      row.visualKind == .media || row.visualKind == .video || row.visualKind == .videoNote
+    {
+      NSLog(
+        "[MediaPop] blank-paint msgId=%@ type=%@ thumbB64=%@ blob=%@ localUrl=%@ url=%@",
+        row.messageId ?? row.key, row.messageType,
+        (row.thumbnailBase64?.isEmpty == false || !row.attachmentThumbnailsB64.isEmpty)
+          ? "Y" : "N",
+        row.agentBridgeAttachmentsEnc.isEmpty ? "N" : "Y",
+        (row.localMediaUrl?.isEmpty == false) ? "Y" : "N",
+        (row.mediaUrl?.isEmpty == false) ? "Y" : "N")
+    }
     updateStickerAnimationPlayback()
   }
 
@@ -9678,11 +9705,24 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     onMediaNaturalSizeResolved?(row.messageId, mediaURL, size)
   }
 
+  /// [MediaPop] configure-pass stamp — see `configure` and applyResolvedMediaPreviewImage.
+  private var lastConfigureStartedAt: TimeInterval = 0
+
   private func applyResolvedMediaPreviewImage(
     _ image: UIImage,
     for row: ChatListRow,
     mediaURL: String
   ) {
+    // Every resolved preview lands here. An apply well after the synchronous configure
+    // pass, on a cell the user can see, IS the visible image pop — name it.
+    let sinceConfigureMs = Int(
+      (ProcessInfo.processInfo.systemUptime - lastConfigureStartedAt) * 1000)
+    if window != nil, sinceConfigureMs > 50 {
+      NSLog(
+        "[MediaPop] late-image msgId=%@ type=%@ sinceCfgMs=%d hadImage=%@",
+        row.messageId ?? row.key, row.messageType, sinceConfigureMs,
+        mediaImageView.image != nil ? "Y" : "N")
+    }
     mediaImageView.image = image
     mediaImageView.isHidden = false
     // Drop the SF Symbol "photo" placeholder the moment real pixels land.
