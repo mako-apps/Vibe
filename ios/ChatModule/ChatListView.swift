@@ -794,11 +794,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// bottom, and a mismatched overlay would visibly jump at swap).
   private static let reopenSnapshotCache: NSCache<NSString, UIImage> = {
     let cache = NSCache<NSString, UIImage>()
-    cache.countLimit = 4
+    // Launch prewarm inserts both theme twins for the top-3 chats (6 images); a limit
+    // of 4 made the prewarm evict its own entries before the user ever opened a chat.
+    cache.countLimit = 8
     return cache
   }()
   private var reopenSnapshotOverlay: UIImageView?
   private var seedLoadingIndicator: UIActivityIndicatorView?
+  private var seedSpinnerGraceWorkItem: DispatchWorkItem?
   /// Marks the one rows application initiated by the cached-history reveal path. That
   /// update is a strict prefix insert and must not run through the generic new-message
   /// finalize/scroll behavior while the user's finger owns the list.
@@ -1116,7 +1119,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var newMessagesWhileAwayCount = 0
   /// The jump-to-latest motion is deterministic and interruptible. Keeping the animator
   /// lets a real pan take ownership without the old spring finishing underneath it.
-  private var jumpToBottomAnimator: UIViewPropertyAnimator?
+  /// True while the jump-to-bottom native animated scroll is traveling. Cleared by its
+  /// didEndScrollingAnimation, by a user grab (willBeginDragging), or by any unanimated
+  /// scrollToBottom that supersedes it.
+  private var isBottomGlideInFlight = false
   private lazy var jumpToBottomButton: ChatJumpToLatestHostView = {
     let view = ChatJumpToLatestHostView { [weak self] in
       self?.jumpToBottomTapped()
@@ -1269,6 +1275,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// Empty areas pass touches through so the list keeps scrolling.
   private let tallToggleOverlay = ChatListPassthroughOverlayView()
   private var tallToggleViewsById: [String: ChatTallBubbleGlassToggleView] = [:]
+  /// True while a tall expand/collapse height morph is animating. Scroll-tick overlay
+  /// updates are suppressed for its duration: mid-morph ticks read MODEL frames (already
+  /// at the final height) while the cells are still visually interpolating, so avatars
+  /// and chips snapped ahead of the content. The morph animates them in-transaction and
+  /// re-places them exactly at completion instead.
+  private var isTallMorphInFlight = false
   /// Invalidates stale expand/collapse completions when the user taps repeatedly.
   private var tallBubbleAnimationGeneration: UInt = 0
   private var senderAvatarViews: [String: SenderRunAvatarView] = [:]
@@ -1682,10 +1694,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     if #available(iOS 26.0, *) {
-      // Soft top + bottom (matches composer). ChatMainView adds a soft theme fade band
-      // under the fixed header so top masking stays legible without a hard cutoff.
-      collectionView.topEdgeEffect.isHidden = false
-      collectionView.topEdgeEffect.style = .soft
+      // Top fade is owned by ChatMainView's custom soft header mask (blur + tint).
+      // Keep system soft edge only at the bottom (composer).
+      collectionView.topEdgeEffect.isHidden = true
       collectionView.bottomEdgeEffect.isHidden = false
       collectionView.bottomEdgeEffect.style = .soft
     }
@@ -2045,6 +2056,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func installReopenSnapshotOverlayIfAvailable() {
+    // The raster's ONLY job is covering an empty shell. The tap-time disk decode can
+    // lose the race to the seed mount — installing then would drop a stale
+    // bottom-anchored screenshot on top of the LIVE transcript until the next rows
+    // flush peeled it off (a full second of wrong-position cover + two extra swaps).
+    guard rows.isEmpty else { return }
     guard reopenSnapshotOverlay == nil,
       let key = reopenSnapshotKey(),
       let image = Self.reopenSnapshotCache.object(forKey: key)
@@ -2098,29 +2114,49 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       completion: { _ in overlay.removeFromSuperview() })
   }
 
-  /// Telegram-style loading affordance for a deferred open with NOTHING to show: a bare
-  /// empty list reads as broken, so an uncovered shell gets one subtle centered spinner
-  /// over the wallpaper instead. It exists only between shell commit and whichever comes
-  /// first — a raster overlay or the seed mount — typically 120-350ms.
+  /// Telegram-style loading affordance for a deferred open with NOTHING to show — but
+  /// only when the wait is genuinely long. The typical seed mounts in 120-350ms and the
+  /// tap-time raster decode lands in ~40-80ms; a spinner that appears and vanishes inside
+  /// that window is itself the flicker (spinner-flash → content = two visible swaps).
+  /// So arm a grace timer instead: bare wallpaper for up to `seedSpinnerGraceSeconds`,
+  /// and only if NOTHING (raster or seed) has arrived by then does the spinner install.
+  private static let seedSpinnerGraceSeconds: TimeInterval = 0.4
+
   private func installSeedLoadingIndicatorIfNeeded() {
-    guard seedLoadingIndicator == nil, reopenSnapshotOverlay == nil, rows.isEmpty else {
-      return
+    guard seedLoadingIndicator == nil, seedSpinnerGraceWorkItem == nil,
+      reopenSnapshotOverlay == nil, rows.isEmpty
+    else { return }
+    let armedChatId = engineChatId
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.seedSpinnerGraceWorkItem = nil
+      // Re-check at fire time: the raster or the seed usually won the race, and then
+      // no spinner ever shows — that's the good path, silent by design.
+      guard self.seedLoadingIndicator == nil, self.reopenSnapshotOverlay == nil,
+        self.rows.isEmpty, self.window != nil, self.engineChatId == armedChatId
+      else { return }
+      let spinner = UIActivityIndicatorView(style: .medium)
+      spinner.color =
+        self.appearance.isDark
+        ? UIColor(white: 1.0, alpha: 0.45) : UIColor(white: 0.0, alpha: 0.35)
+      spinner.center = CGPoint(x: self.bounds.midX, y: self.bounds.midY - 40.0)
+      spinner.autoresizingMask = [
+        .flexibleLeftMargin, .flexibleRightMargin, .flexibleTopMargin, .flexibleBottomMargin,
+      ]
+      self.addSubview(spinner)
+      spinner.startAnimating()
+      self.seedLoadingIndicator = spinner
+      NSLog("[ChatOpen] seed-spinner SHOW chat=%@ — nothing after grace", String(armedChatId.prefix(12)))
     }
-    let spinner = UIActivityIndicatorView(style: .medium)
-    spinner.color =
-      appearance.isDark
-      ? UIColor(white: 1.0, alpha: 0.45) : UIColor(white: 0.0, alpha: 0.35)
-    spinner.center = CGPoint(x: bounds.midX, y: bounds.midY - 40.0)
-    spinner.autoresizingMask = [
-      .flexibleLeftMargin, .flexibleRightMargin, .flexibleTopMargin, .flexibleBottomMargin,
-    ]
-    addSubview(spinner)
-    spinner.startAnimating()
-    seedLoadingIndicator = spinner
-    NSLog("[ChatOpen] seed-spinner SHOW chat=%@", String(engineChatId.prefix(12)))
+    seedSpinnerGraceWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.seedSpinnerGraceSeconds, execute: work)
   }
 
   private func removeSeedLoadingIndicator(reason: String) {
+    // A pending grace timer counts as "the spinner": cancel it so it can never fire
+    // after content has arrived.
+    seedSpinnerGraceWorkItem?.cancel()
+    seedSpinnerGraceWorkItem = nil
     guard let spinner = seedLoadingIndicator else { return }
     seedLoadingIndicator = nil
     spinner.stopAnimating()
@@ -2163,6 +2199,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       hiddenMessageId = nil
       collectionView.reloadData()
     }
+    // Re-attach re-creates cells but nothing re-places the overlay chrome (avatars,
+    // expand chips, jump button) until the first scroll tick — place it now so the
+    // re-opened frame is complete.
+    updateFloatingSenderAvatars()
+    updateTallBubbleGlassToggles(animatedIcons: false)
+    updateJumpToBottomButtonVisibility()
   }
 
   /// When this chat comes on screen, re-present any ask/command that arrived while it was
@@ -7962,19 +8004,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let maxOffsetY = pixelAlignedValue(
       max(0.0, collectionView.contentSize.height - collectionView.bounds.height))
     if animated {
-      jumpToBottomAnimator?.stopAnimation(true)
-      jumpToBottomAnimator = nil
+      if isBottomGlideInFlight {
+        isBottomGlideInFlight = false
+        isInternalScrollAdjustment = false
+      }
       shouldAutoScroll = true
-      isInternalScrollAdjustment = true
-      // Long-distance jumps must not glide: animating contentOffset moves the model
-      // value instantly, so only cells around the TARGET are mounted while the
-      // presentation layer sweeps across thousands of points of never-mounted rows —
-      // the user sees bare wallpaper until the glide lands. Telegram-style teleport:
-      // hop (unanimated) to one viewport above the bottom, then animate the last screen.
+      // Long-distance jumps must not glide the whole way: Telegram-style teleport —
+      // hop (unanimated) to one viewport above the bottom, then travel the last screen.
       let viewportH = max(1.0, collectionView.bounds.height)
       if maxOffsetY - collectionView.contentOffset.y > viewportH * 2.5 {
-        collectionView.setContentOffset(
-          CGPoint(x: 0.0, y: max(0.0, maxOffsetY - viewportH)), animated: false)
+        performInternalScrollAdjustment {
+          collectionView.setContentOffset(
+            CGPoint(x: 0.0, y: max(0.0, maxOffsetY - viewportH)), animated: false)
+        }
         collectionView.layoutIfNeeded()
         // Mounting the destination converts estimated heights to exact ones and can
         // move the real bottom. Re-anchor the hop against the REMEASURED bottom —
@@ -7983,50 +8025,43 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let remeasuredMaxY = pixelAlignedValue(
           max(0.0, collectionView.contentSize.height - collectionView.bounds.height))
         if abs(remeasuredMaxY - maxOffsetY) > 1.0 {
-          collectionView.setContentOffset(
-            CGPoint(x: 0.0, y: max(0.0, remeasuredMaxY - viewportH)), animated: false)
+          performInternalScrollAdjustment {
+            collectionView.setContentOffset(
+              CGPoint(x: 0.0, y: max(0.0, remeasuredMaxY - viewportH)), animated: false)
+          }
           collectionView.layoutIfNeeded()
         }
+        // The glide's starting screen must be REAL — materialized cells, placed
+        // avatars/toggles — or the travel departs from bare wallpaper.
+        materializeCellsAfterProgrammaticJump(context: "bottom-hop")
       }
       let targetMaxOffsetY = pixelAlignedValue(
         max(0.0, collectionView.contentSize.height - collectionView.bounds.height))
-      let distance = abs(targetMaxOffsetY - collectionView.contentOffset.y)
-      let screens = min(3.0, distance / max(1.0, collectionView.bounds.height))
-      let duration = 0.24 + (0.07 * screens)
-      let animator = UIViewPropertyAnimator(duration: duration, curve: .easeOut) { [weak self] in
-        self?.collectionView.contentOffset = CGPoint(x: 0.0, y: targetMaxOffsetY)
+      guard abs(targetMaxOffsetY - collectionView.contentOffset.y) > 1.0 else {
+        // Already there (or the hop landed exactly): a zero-distance animated set
+        // fires no didEndScrollingAnimation, which would strand the in-flight flags.
+        materializeCellsAfterProgrammaticJump(context: "bottom-noop")
+        previousOffsetY = collectionView.contentOffset.y
+        emitViewport(force: true)
+        return
       }
-      animator.addCompletion { [weak self, weak animator] _ in
-        guard let self else { return }
-        if self.jumpToBottomAnimator === animator {
-          self.jumpToBottomAnimator = nil
-        }
-        // Streaming or a late cell measurement can extend OR shrink content during the
-        // glide. Correct the final remainder without starting a second animation, then
-        // verify the destination actually materialized cells — a shrink could land the
-        // offset past the last cell (bare wallpaper until a touch dirtied the layout).
-        self.collectionView.layoutIfNeeded()
-        let finalMaxOffsetY = pixelAlignedValue(
-          max(0.0, self.collectionView.contentSize.height - self.collectionView.bounds.height))
-        if abs(finalMaxOffsetY - self.collectionView.contentOffset.y) > 1.0 {
-          self.collectionView.setContentOffset(
-            CGPoint(x: 0.0, y: finalMaxOffsetY), animated: false)
-        }
-        self.isInternalScrollAdjustment = false
-        self.materializeCellsAfterProgrammaticJump(context: "bottom-glide")
-        self.previousOffsetY = self.collectionView.contentOffset.y
-        self.emitViewport(force: true)
-      }
-      jumpToBottomAnimator = animator
-      animator.startAnimation()
+      // NATIVE animated scroll, not a UIViewPropertyAnimator over contentOffset: the
+      // property animator moves the MODEL offset instantly, so the cells at the start
+      // screen are recycled on the next layout pass and the presentation layer sweeps
+      // across never-mounted rows — the reported "tap the button and the list goes
+      // empty / it skips instead of traveling". The native scroll ticks the model
+      // offset every frame, so cells materialize continuously and every overlay
+      // (avatars, toggles, wallpaper) rides the travel via scrollViewDidScroll.
+      // Completion lands in scrollViewDidEndScrollingAnimation.
+      isInternalScrollAdjustment = true
+      isBottomGlideInFlight = true
+      collectionView.setContentOffset(CGPoint(x: 0.0, y: targetMaxOffsetY), animated: true)
     } else {
-      if jumpToBottomAnimator != nil {
-        jumpToBottomAnimator?.stopAnimation(true)
-        jumpToBottomAnimator = nil
-        // stopAnimation(true) never runs the glide's completion, which is the only
-        // place that cleared its isInternalScrollAdjustment — left true, every pan
-        // stopped updating shouldAutoScroll and the jump chrome until some later
-        // internal adjustment cleared it (the "button appears late" report).
+      if isBottomGlideInFlight {
+        // The non-animated set below cancels the native glide mid-flight, and its
+        // didEndScrollingAnimation never fires — clear the flags here or every pan
+        // stops updating shouldAutoScroll and the jump chrome ("button appears late").
+        isBottomGlideInFlight = false
         isInternalScrollAdjustment = false
       }
       performInternalScrollAdjustment {
@@ -8037,6 +8072,29 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       shouldAutoScroll = true
       emitViewport(force: true)
     }
+  }
+
+  /// Native-glide completion (jump-to-bottom travel). Fires only for animated
+  /// setContentOffset — a user grab mid-glide cancels the animation and routes through
+  /// scrollViewWillBeginDragging instead.
+  public func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+    guard isBottomGlideInFlight else { return }
+    isBottomGlideInFlight = false
+    isInternalScrollAdjustment = false
+    // Streaming or a late cell measurement can extend OR shrink content during the
+    // glide. Correct the final remainder, then verify the destination actually
+    // materialized cells.
+    collectionView.layoutIfNeeded()
+    let finalMaxOffsetY = pixelAlignedValue(
+      max(0.0, collectionView.contentSize.height - collectionView.bounds.height))
+    if abs(finalMaxOffsetY - collectionView.contentOffset.y) > 1.0 {
+      performInternalScrollAdjustment {
+        collectionView.setContentOffset(CGPoint(x: 0.0, y: finalMaxOffsetY), animated: false)
+      }
+    }
+    materializeCellsAfterProgrammaticJump(context: "bottom-glide")
+    previousOffsetY = collectionView.contentOffset.y
+    emitViewport(force: true)
   }
 
   /// Programmatic offset teleports (seed restore, jump-to-bottom hop/land) move the
@@ -8069,6 +8127,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       collectionView.layoutIfNeeded()
     }
     updateFloatingSenderAvatars()
+    // The expand/collapse chips live on the same overlay pattern as the avatars and
+    // were only re-placed by scroll ticks / container layout — after a programmatic
+    // jump neither runs, so the chips trailed the content ("toggle appears late").
+    updateTallBubbleGlassToggles(animatedIcons: false)
     updateJumpToBottomButtonVisibility()
   }
 
@@ -9060,6 +9122,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     if animated {
+      isTallMorphInFlight = true
       // Height-only in Y: ease the cell bounds at a medium pace. The offset correction
       // is part of this same transaction; doing it after completion made collapse snap.
       UIView.animate(
@@ -9094,12 +9157,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             )
           }
           self.updateTallBubbleGlassToggles(animatedIcons: true)
+          // Frames set inside the transaction, so every floating avatar RIDES the same
+          // 0.30 ease to its post-morph spot alongside the cells. Without this the
+          // avatars froze at pre-morph positions and overlapped the neighbor bubbles
+          // until the next scroll tick ("expansion conflicts with another cell").
+          self.updateFloatingSenderAvatars()
         },
         completion: { _ in
+          // Unconditional: any interleaved reload bumps the generation, and the guard
+          // below skipping must never leave the in-flight flag stuck (frozen overlays
+          // on every future scroll).
+          self.isTallMorphInFlight = false
           guard self.tallBubbleAnimationGeneration == animationGeneration else { return }
           self.updateTallBubbleGlassToggles(animatedIcons: false)
+          self.updateFloatingSenderAvatars()
         })
     } else {
+      isTallMorphInFlight = false
       UIView.performWithoutAnimation {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -9107,6 +9181,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         CATransaction.commit()
       }
       updateTallBubbleGlassToggles(animatedIcons: false)
+      updateFloatingSenderAvatars()
     }
     NSLog(
       "[TallToggle] %@ id=%@ index=%d height %.0f→%.0f expanded=%@ animated=%@",
@@ -9851,10 +9926,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // transiently inconsistent there (history prepends fire during a fling), and
     // repositioning against them made avatars jump/flicker for a frame. The batch's own
     // completion re-places the avatars against settled attributes.
-    if !isApplyingRowsUpdate {
+    // ... and while a tall expand/collapse morph is in flight: its offset anchoring
+    // fires didScroll mid-transaction, and placing overlays against the MODEL frames
+    // (already final) while cells visually interpolate snapped them ahead of the
+    // content. The morph animates them in-transaction and re-places at completion.
+    if !isApplyingRowsUpdate, !isTallMorphInFlight {
       updateFloatingSenderAvatars()
     }
-    updateTallBubbleGlassToggles(animatedIcons: false)
+    if !isTallMorphInFlight {
+      updateTallBubbleGlassToggles(animatedIcons: false)
+    }
     // Only user-driven scrolling refreshes/shows the pill. Internal offset adjustments
     // (anchored prepends, keyboard) must not blink it out — the post-scroll linger fade
     // owns hiding now.
@@ -10211,14 +10292,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
-    if let animator = jumpToBottomAnimator {
-      let visibleOffsetY = collectionView.layer.presentation()?.bounds.origin.y
-      animator.stopAnimation(true)
-      jumpToBottomAnimator = nil
-      if let visibleOffsetY, visibleOffsetY.isFinite {
-        collectionView.setContentOffset(
-          CGPoint(x: 0.0, y: pixelAlignedValue(visibleOffsetY)), animated: false)
-      }
+    if isBottomGlideInFlight {
+      // The touch itself already stopped the native scroll animation at the current
+      // model offset (it ticks per frame — no presentation-layer readback needed);
+      // didEndScrollingAnimation will not fire, so clear the flags here.
+      isBottomGlideInFlight = false
       isInternalScrollAdjustment = false
       shouldAutoScroll = false
     }
@@ -10576,7 +10654,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     isInternalScrollAdjustment = true
     block()
     DispatchQueue.main.async { [weak self] in
-      self?.isInternalScrollAdjustment = false
+      guard let self else { return }
+      // A clear pending from a pre-glide adjustment (the jump-to-bottom hop) fires on
+      // the runloop AFTER the native glide starts — it must not strip the glide's
+      // flag mid-travel; didEndScrollingAnimation / willBeginDragging own it then.
+      if !self.isBottomGlideInFlight {
+        self.isInternalScrollAdjustment = false
+      }
     }
   }
 
