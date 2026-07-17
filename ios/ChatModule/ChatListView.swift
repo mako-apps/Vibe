@@ -847,15 +847,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let screenY: Double
     let atBottom: Bool
     let savedAt: Double
-    /// Scroll memory is session-scoped by request: reopening a chat you left mid-history
-    /// returns to that spot only within the same app run. After a full app close the
-    /// record's token no longer matches and the chat opens at the bottom (or the unread
-    /// anchor). Optional so pre-token records simply decode as stale.
+    /// Session identity of the record. A same-run reopen always restores. Across a full
+    /// relaunch only a fresh mid-history anchor restores (see loadPersistedOpeningViewport
+    /// + crossLaunchViewportMaxAge) so returning to a chat lands where you left off, while
+    /// a bottom-saved or stale record still opens at the bottom / unread anchor. Optional
+    /// so pre-token records simply decode as cross-launch candidates.
     var bootToken: String?
   }
 
   /// One value per app process — the viewport records' session identity.
   private static let viewportBootToken = UUID().uuidString
+  /// A mid-history scroll anchor still restores after a full relaunch within this window;
+  /// older records fall through to bottom so a chat untouched for days opens on its newest
+  /// messages rather than a stale position.
+  private static let crossLaunchViewportMaxAge: TimeInterval = 72 * 60 * 60
   private static let persistedViewportKeyPrefix = "vibe.ios.chat.viewport.v1"
   private var persistedOpeningViewport: PersistedViewport?
   private var openingUnreadCount = 0
@@ -4406,6 +4411,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     parsed.reserveCapacity(rawRows.count)
     var reuseMissCount = 0
     var reuseMissDiffs: [String] = []
+    var reuseMissFieldCounts: [String: Int] = [:]
     for raw in rawRows {
       let rawKey = (raw["key"] as? String) ?? ""
       if !rawKey.isEmpty, let cached = reusableParsedRowsByKey[rawKey] {
@@ -4418,15 +4424,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         // cold-open flush into a reload storm. Attribute the differing fields with
         // their old→new values so the volatile side is identifiable from one log.
         reuseMissCount += 1
-        if pendingPresentationSeedReconcile, reuseMissDiffs.count < 4 {
-          let detail = Self.rawRowDiffKeys(cached.raw, raw).prefix(2)
-            .map { key -> String in
-              let path = key.hasSuffix("±") ? String(key.dropLast()) : key
-              return
-                "\(key)[\(Self.rawRowValue(cached.raw, path))→\(Self.rawRowValue(raw as NSDictionary, path))]"
-            }
-            .joined(separator: "+")
-          reuseMissDiffs.append("\(String(rawKey.suffix(8))):\(detail)")
+        if pendingPresentationSeedReconcile {
+          // Bucket EVERY differing field across ALL misses (the 4-example cap below only
+          // showed a sample — one dominant field means a single unresolved transform, a
+          // long flat tail means genuine row churn). This histogram is what tells us
+          // on-device whether the reply-preview seed fix closed the gap or something else
+          // is still volatile.
+          let diffKeys = Self.rawRowDiffKeys(cached.raw, raw)
+          for key in diffKeys {
+            let field = key.hasSuffix("±") ? String(key.dropLast()) : key
+            reuseMissFieldCounts[field, default: 0] += 1
+          }
+          if reuseMissDiffs.count < 4 {
+            let detail = diffKeys.prefix(2)
+              .map { key -> String in
+                let path = key.hasSuffix("±") ? String(key.dropLast()) : key
+                return
+                  "\(key)[\(Self.rawRowValue(cached.raw, path))→\(Self.rawRowValue(raw as NSDictionary, path))]"
+              }
+              .joined(separator: "+")
+            reuseMissDiffs.append("\(String(rawKey.suffix(8))):\(detail)")
+          }
         }
       }
       guard let row = ChatListRow(raw: raw) else { continue }
@@ -4436,9 +4454,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
     }
     if pendingPresentationSeedReconcile, reuseMissCount > 0 {
+      let fieldHistogram = reuseMissFieldCounts
+        .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+        .map { "\($0.key)=\($0.value)" }
+        .joined(separator: ",")
       NSLog(
-        "[ChatOpen] parse reuse-MISS chat=%@ count=%d of=%d diffs=[%@]",
+        "[ChatOpen] parse reuse-MISS chat=%@ count=%d of=%d fields=[%@] diffs=[%@]",
         String(engineChatId.prefix(12)), reuseMissCount, rawRows.count,
+        fieldHistogram,
         reuseMissDiffs.joined(separator: " "))
     }
     if rawRows.count < reusableParsedRowsByKey.count, reusableParsedRowsByKey.count <= 400 {
@@ -4542,14 +4565,37 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func loadPersistedOpeningViewport(chatId: String) {
     guard !chatId.isEmpty,
       let data = UserDefaults.standard.data(forKey: Self.persistedViewportKey(chatId: chatId)),
-      let viewport = try? JSONDecoder().decode(PersistedViewport.self, from: data),
-      viewport.bootToken == Self.viewportBootToken
+      let viewport = try? JSONDecoder().decode(PersistedViewport.self, from: data)
     else {
-      // No record, or one from a previous app run — a fresh launch opens at the
-      // bottom/unread anchor instead of a days-old scroll position.
       persistedOpeningViewport = nil
       return
     }
+    // Same-run reopen always restores. Across a full relaunch, honor ONLY a genuine
+    // mid-history anchor (the user scrolled up and left it there) that is still recent — a
+    // bottom-saved record cold-opens at the bottom exactly as before, and a stale anchor
+    // falls through so we don't drop the user into ancient history. applyOpeningViewport
+    // still prefers unread and resolves the anchor by messageId with a bottom fallback, so
+    // this can only land on a real row the seed loaded; worst case is today's bottom.
+    let sameRun = viewport.bootToken == Self.viewportBootToken
+    let ageSeconds = Date().timeIntervalSince1970 - viewport.savedAt
+    let freshMidHistory =
+      viewport.atBottom == false
+      && (viewport.messageId?.isEmpty == false)
+      && ageSeconds >= 0
+      && ageSeconds <= Self.crossLaunchViewportMaxAge
+    guard sameRun || freshMidHistory else {
+      NSLog(
+        "[ChatOpen] viewport LOAD chat=%@ dropped sameRun=%@ atBottom=%@ hasAnchor=%@ age=%.0fs",
+        String(chatId.prefix(12)), sameRun ? "Y" : "N", viewport.atBottom ? "Y" : "N",
+        (viewport.messageId?.isEmpty == false) ? "Y" : "N", ageSeconds)
+      persistedOpeningViewport = nil
+      return
+    }
+    NSLog(
+      "[ChatOpen] viewport LOAD chat=%@ restore=%@ atBottom=%@ hasAnchor=%@ age=%.0fs",
+      String(chatId.prefix(12)), sameRun ? "same-run" : "cross-launch",
+      viewport.atBottom ? "Y" : "N", (viewport.messageId?.isEmpty == false) ? "Y" : "N",
+      ageSeconds)
     persistedOpeningViewport = viewport
   }
 
@@ -5319,10 +5365,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return Int((now - seedPhaseMarkAt) * 1000)
     }
 
+    // Resolve reply previews on the seed's source with the EXACT transform the post-appear
+    // flush uses (rowsByAttachingReplyPreviews wraps rowsByResolvingReplyPreviews with the
+    // same peer name). The setRows-DEFER seed caller passes raw effectiveRows, so without
+    // this the seed parsed preview-less raw while the flush re-attached previews — every
+    // reply row then missed the parse-reuse cache (the wasted 77-of-128 re-parse + ~53ms
+    // setRows stall that stuttered the reopen-snapshot fade and flickered group avatars).
+    // Fill-nil-only + identical output ⇒ this can only REDUCE the flush diff, never add
+    // one, and is a no-op for the warm-snapshot caller (already resolved). Runs BEFORE day
+    // separators so synthesized rows never feed previewsById.
+    let resolvedSource = rowsByAttachingReplyPreviews(sourceRows)
     // Normalize the COMPLETE source before taking the suffix, exactly as the real rows
     // pipeline does. Taking messages first and synthesizing day rows afterward produces
     // a different boundary and was the source of the visible 5 -> 16 replacement.
-    let normalizedSource = Self.rowsByInsertingDaySeparators(sourceRows)
+    let normalizedSource = Self.rowsByInsertingDaySeparators(resolvedSource)
     guard !normalizedSource.isEmpty else { return }
     // Decoupled push: when the whole transcript's parse and heights are already paid
     // for (warm/prewarm snapshot in the reuse cache + persisted disk heights), mount
