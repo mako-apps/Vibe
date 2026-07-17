@@ -5569,7 +5569,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     _setRowsGeneration &+= 1
     let mySetRowsGeneration = _setRowsGeneration
 
-    let mergedRows = isExplicitEmpty ? [] : mergedRowsPayload(from: effectiveRows)
+    // Resolve reply previews on the live path too — the warm snapshot (reopen seed) and
+    // the reuse cache are both populated from `visibleRows`, and the launch prewarm path
+    // already enriches (see prewarmWarmTranscriptSnapshot). Without this, the seed cached
+    // preview-less raw while the post-appear flush re-attached previews, so every reply
+    // row missed the parse-reuse cache (the felt 77-of-128 re-parse + 54ms stall that
+    // stuttered the reopen-snapshot fade). Idempotent: the resolver only fills nil fields.
+    let mergedRows =
+      isExplicitEmpty ? [] : rowsByAttachingReplyPreviews(mergedRowsPayload(from: effectiveRows))
     let visibleRows = Self.rowsByInsertingDaySeparators(filterRowsForSearch(mergedRows))
     var retainedSourceRows = effectiveRows
     if effectiveRows.isEmpty, !visibleRows.isEmpty {
