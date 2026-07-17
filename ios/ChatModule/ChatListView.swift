@@ -2015,6 +2015,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let raw = UIImage(data: data, scale: screenScale)
       else { return }
       let image = raw.preparingForDisplay() ?? raw
+      // Probe HERE (IO queue, off the open's critical path): a flat disk twin from an
+      // older build must never reach the overlay cache — covering the mount with it is
+      // the "empty chat" flash. Captures are probed before store, so disk is the only
+      // unverified source.
+      guard (Self.rasterLumaRange(image) ?? -1) >= 4 else {
+        try? FileManager.default.removeItem(at: url)
+        NSLog("[ChatOpen] reopen-snapshot DISK-BLANK dropped chat=%@", String(chatId.prefix(12)))
+        return
+      }
       DispatchQueue.main.async {
         guard let self, self.engineChatId == chatId else { return }
         if Self.reopenSnapshotCache.object(forKey: key) == nil {
@@ -2051,20 +2060,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         collectionView.frame.width)
       return
     }
-    // Never overlay a flat frame (blank capture from an older build / teardown race):
-    // covering the live mount with it for the open's first ~200-700ms IS the reported
-    // "empty chat for a second" and the image-opacity flash its fade produced.
-    let lumaRange = Self.rasterLumaRange(image) ?? -1
-    guard lumaRange >= 4 else {
-      Self.reopenSnapshotCache.removeObject(forKey: key)
-      if let url = Self.reopenSnapshotFileURL(for: key) {
-        Self.reopenSnapshotIOQueue.async { try? FileManager.default.removeItem(at: url) }
-      }
-      NSLog(
-        "[ChatOpen] reopen-snapshot SKIP-BLANK chat=%@ luma=%d",
-        String(engineChatId.prefix(12)), lumaRange)
-      return
-    }
+    // Blank-frame safety runs OFF this path: captures are probed before store and disk
+    // twins are probed in the decode callback (both off the open's critical path), so
+    // every image reaching this cache is known-good. Probing here cost 83ms of main
+    // thread at the push's first frame (measured decorateMs=83) — never again.
     let overlay = UIImageView(image: image)
     overlay.frame = collectionView.frame
     // Bottom-anchored: if the reopened viewport height differs slightly (banner,
@@ -2074,9 +2073,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     overlay.isUserInteractionEnabled = false
     insertSubview(overlay, aboveSubview: collectionView)
     reopenSnapshotOverlay = overlay
-    NSLog(
-      "[ChatOpen] reopen-snapshot SHOW chat=%@ luma=%d",
-      String(engineChatId.prefix(12)), lumaRange)
+    NSLog("[ChatOpen] reopen-snapshot SHOW chat=%@", String(engineChatId.prefix(12)))
   }
 
   private func removeReopenSnapshotOverlay(reason: String, animated: Bool) {
