@@ -1927,15 +1927,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard size.width > 1, size.height > 1 else { return }
     let visibleBottom = collectionView.contentOffset.y + collectionView.bounds.height
     let contentBottom = collectionView.contentSize.height + collectionView.adjustedContentInset.bottom
-    guard visibleBottom >= contentBottom - 60 else {
-      // Left mid-history: the next open lands at the bottom, so a snapshot of this
-      // viewport would flash the wrong messages. Drop any stale one too.
-      Self.reopenSnapshotCache.removeObject(forKey: key)
-      if let url = Self.reopenSnapshotFileURL(for: key) {
-        Self.reopenSnapshotIOQueue.async { try? FileManager.default.removeItem(at: url) }
-      }
-      return
-    }
+    // Mid-history closes are captured too: scroll memory now restores the SAME viewport
+    // on the next open (RESTORE-AT-SEED), so this raster is exactly the next first
+    // frame. When the next open cannot honor the record (stale/dropped), viewport LOAD
+    // drops the raster with it.
+    let capturedAtBottom = visibleBottom >= contentBottom - 60
     let renderer = UIGraphicsImageRenderer(bounds: CGRect(origin: .zero, size: size))
     let image = renderer.image { _ in
       collectionView.drawHierarchy(
@@ -1952,6 +1948,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         avatarView.drawHierarchy(in: target, afterScreenUpdates: false)
       }
     }
+    // A capture with no drawable content (drawHierarchy teardown race → flat frame)
+    // must never poison a good raster: overlaying a flat frame for the next open's
+    // first ~200-700ms IS the reported "empty chat" + image-opacity flash.
+    guard let lumaRange = Self.rasterLumaRange(image), lumaRange >= 4 else {
+      NSLog(
+        "[ChatOpen] reopen-snapshot CAPTURE-BLANK chat=%@ luma=%d — kept previous",
+        String(engineChatId.prefix(12)), Self.rasterLumaRange(image) ?? -1)
+      return
+    }
     Self.reopenSnapshotCache.setObject(image, forKey: key)
     if let url = Self.reopenSnapshotFileURL(for: key) {
       Self.reopenSnapshotIOQueue.async {
@@ -1960,9 +1965,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
       }
     }
-    VibeDebugLog.log(
-      "[ChatOpen] reopen-snapshot CAPTURE chat=%@ size=%.0fx%.0f",
-      String(engineChatId.prefix(12)), size.width, size.height)
+    NSLog(
+      "[ChatOpen] reopen-snapshot CAPTURE chat=%@ size=%.0fx%.0f atBottom=%@ luma=%d",
+      String(engineChatId.prefix(12)), size.width, size.height,
+      capturedAtBottom ? "Y" : "N", lumaRange)
+  }
+
+  /// 8×8 luminance spread of a raster — a screenful of transcript always spans more
+  /// than a few luma steps; a flat frame (blank capture) spans ~0. nil = unprobeable.
+  private static func rasterLumaRange(_ image: UIImage) -> Int? {
+    guard let cg = image.cgImage else { return nil }
+    let side = 8
+    var pixels = [UInt8](repeating: 0, count: side * side * 4)
+    guard
+      let ctx = CGContext(
+        data: &pixels, width: side, height: side, bitsPerComponent: 8,
+        bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else { return nil }
+    ctx.interpolationQuality = .low
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: side, height: side))
+    var minLuma = Int.max
+    var maxLuma = Int.min
+    for i in stride(from: 0, to: pixels.count, by: 4) {
+      let luma =
+        (Int(pixels[i]) * 299 + Int(pixels[i + 1]) * 587 + Int(pixels[i + 2]) * 114) / 1000
+      minLuma = min(minLuma, luma)
+      maxLuma = max(maxLuma, luma)
+    }
+    guard minLuma <= maxLuma else { return nil }
+    return maxLuma - minLuma
   }
 
   /// Kicked at engine bind (pre-push): pulls the disk twin into the memory cache so
@@ -2003,6 +2035,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let key = reopenSnapshotKey(),
       let image = Self.reopenSnapshotCache.object(forKey: key)
     else { return }
+    // An unread landing scrolls to the first-unread anchor, not the captured viewport —
+    // the raster would flash the wrong rows. Let the shell show instead.
+    guard openingUnreadCount == 0 else { return }
     // Size sanity: a snapshot whose point width disagrees with the live list would
     // render as a zoomed/offset transcript — never show it, and drop it so the next
     // close re-captures cleanly.
@@ -2016,6 +2051,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         collectionView.frame.width)
       return
     }
+    // Never overlay a flat frame (blank capture from an older build / teardown race):
+    // covering the live mount with it for the open's first ~200-700ms IS the reported
+    // "empty chat for a second" and the image-opacity flash its fade produced.
+    let lumaRange = Self.rasterLumaRange(image) ?? -1
+    guard lumaRange >= 4 else {
+      Self.reopenSnapshotCache.removeObject(forKey: key)
+      if let url = Self.reopenSnapshotFileURL(for: key) {
+        Self.reopenSnapshotIOQueue.async { try? FileManager.default.removeItem(at: url) }
+      }
+      NSLog(
+        "[ChatOpen] reopen-snapshot SKIP-BLANK chat=%@ luma=%d",
+        String(engineChatId.prefix(12)), lumaRange)
+      return
+    }
     let overlay = UIImageView(image: image)
     overlay.frame = collectionView.frame
     // Bottom-anchored: if the reopened viewport height differs slightly (banner,
@@ -2025,7 +2074,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     overlay.isUserInteractionEnabled = false
     insertSubview(overlay, aboveSubview: collectionView)
     reopenSnapshotOverlay = overlay
-    NSLog("[ChatOpen] reopen-snapshot SHOW chat=%@", String(engineChatId.prefix(12)))
+    NSLog(
+      "[ChatOpen] reopen-snapshot SHOW chat=%@ luma=%d",
+      String(engineChatId.prefix(12)), lumaRange)
   }
 
   private func removeReopenSnapshotOverlay(reason: String, animated: Bool) {
@@ -4588,6 +4639,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         "[ChatOpen] viewport LOAD chat=%@ dropped sameRun=%@ atBottom=%@ hasAnchor=%@ age=%.0fs",
         String(chatId.prefix(12)), sameRun ? "Y" : "N", viewport.atBottom ? "Y" : "N",
         (viewport.messageId?.isEmpty == false) ? "Y" : "N", ageSeconds)
+      if viewport.atBottom == false, let key = reopenSnapshotKey() {
+        // The raster captured at that close shows the dropped record's mid-history
+        // viewport; this open lands at the bottom, so the raster would flash the wrong
+        // rows. Runs before preloadReopenSnapshotFromDiskIfNeeded, so the disk twin is
+        // gone before it could decode.
+        Self.reopenSnapshotCache.removeObject(forKey: key)
+        if let url = Self.reopenSnapshotFileURL(for: key) {
+          Self.reopenSnapshotIOQueue.async { try? FileManager.default.removeItem(at: url) }
+        }
+      }
       persistedOpeningViewport = nil
       return
     }
@@ -5552,6 +5613,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       Int((ProcessInfo.processInfo.systemUptime - seedStartedAt) * 1000),
       chatOpenStartedAt > 0
         ? Int((ProcessInfo.processInfo.systemUptime - chatOpenStartedAt) * 1000) : -1)
+    // The seed just mounted the real transcript (positioned at bottom or the restored
+    // anchor). Hand off from the raster NOW — every actual mount path runs through
+    // here, whereas the POST-COMMIT wrapper's removal only covered its own path, so
+    // the overlay used to sit on top of live content until the post-appear flush
+    // (~700ms): a stale/flat raster over a ready list was the felt "empty chat".
+    removeReopenSnapshotOverlay(reason: "seed-mounted", animated: true)
   }
 
   /// Real clears opt in explicitly. Empty payloads emitted by route/input/status setup are
