@@ -798,6 +798,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return cache
   }()
   private var reopenSnapshotOverlay: UIImageView?
+  private var seedLoadingIndicator: UIActivityIndicatorView?
   /// Marks the one rows application initiated by the cached-history reveal path. That
   /// update is a strict prefix insert and must not run through the generic new-message
   /// finalize/scroll behavior while the user's finger owns the list.
@@ -1861,6 +1862,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       replayOutstandingAgentBridgeAskIfNeeded()
     } else {
       removeReopenSnapshotOverlay(reason: "detached", animated: false)
+      removeSeedLoadingIndicator(reason: "detached")
     }
   }
 
@@ -1886,7 +1888,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         Int((ProcessInfo.processInfo.systemUptime - self.deferredPresentationSeedStashedAt) * 1000))
       self.installPresentationSeedIfNeeded(
         sourceRows: sourceRows, preferredParsedRows: preferred)
-      self.removeReopenSnapshotOverlay(reason: "seed-mounted", animated: true)
+      self.removeReopenSnapshotOverlay(reason: "seed-mounted", animated: false)
     }
   }
 
@@ -2073,6 +2075,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     overlay.isUserInteractionEnabled = false
     insertSubview(overlay, aboveSubview: collectionView)
     reopenSnapshotOverlay = overlay
+    removeSeedLoadingIndicator(reason: "raster")
     NSLog("[ChatOpen] reopen-snapshot SHOW chat=%@", String(engineChatId.prefix(12)))
   }
 
@@ -2090,6 +2093,38 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       withDuration: 0.15, delay: 0, options: [.beginFromCurrentState],
       animations: { overlay.alpha = 0 },
       completion: { _ in overlay.removeFromSuperview() })
+  }
+
+  /// Telegram-style loading affordance for a deferred open with NOTHING to show: a bare
+  /// empty list reads as broken, so an uncovered shell gets one subtle centered spinner
+  /// over the wallpaper instead. It exists only between shell commit and whichever comes
+  /// first — a raster overlay or the seed mount — typically 120-350ms.
+  private func installSeedLoadingIndicatorIfNeeded() {
+    guard seedLoadingIndicator == nil, reopenSnapshotOverlay == nil, rows.isEmpty else {
+      return
+    }
+    let spinner = UIActivityIndicatorView(style: .medium)
+    spinner.color =
+      appearance.isDark
+      ? UIColor(white: 1.0, alpha: 0.45) : UIColor(white: 0.0, alpha: 0.35)
+    spinner.center = CGPoint(x: bounds.midX, y: bounds.midY - 40.0)
+    spinner.autoresizingMask = [
+      .flexibleLeftMargin, .flexibleRightMargin, .flexibleTopMargin, .flexibleBottomMargin,
+    ]
+    addSubview(spinner)
+    spinner.startAnimating()
+    seedLoadingIndicator = spinner
+    NSLog("[ChatOpen] seed-spinner SHOW chat=%@", String(engineChatId.prefix(12)))
+  }
+
+  private func removeSeedLoadingIndicator(reason: String) {
+    guard let spinner = seedLoadingIndicator else { return }
+    seedLoadingIndicator = nil
+    spinner.stopAnimating()
+    spinner.removeFromSuperview()
+    NSLog(
+      "[ChatOpen] seed-spinner REMOVE chat=%@ reason=%@",
+      String(engineChatId.prefix(12)), reason)
   }
 
   /// This view is REUSED across chat open/close (ChatHomeListView holds one ChatMainView).
@@ -2233,6 +2268,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           // stashed seed mounts on the next tick (seed-mount POST-COMMIT). If the last
           // close left a snapshot, the shell's first frame already shows the transcript.
           installReopenSnapshotOverlayIfAvailable()
+          // No raster to cover the shell → deliberate loading affordance, never a bare
+          // empty transcript. Replaced by the raster (late disk decode) or the seed.
+          installSeedLoadingIndicatorIfNeeded()
           NSLog(
             "[ChatOpen] firstRealBounds seed-deferred chat=%@ — shell committed",
             String(engineChatId.prefix(12)))
@@ -5615,7 +5653,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // here, whereas the POST-COMMIT wrapper's removal only covered its own path, so
     // the overlay used to sit on top of live content until the post-appear flush
     // (~700ms): a stale/flat raster over a ready list was the felt "empty chat".
-    removeReopenSnapshotOverlay(reason: "seed-mounted", animated: true)
+    // Instant, never a crossfade: identical content swaps invisibly and newer content
+    // cuts cleanly in one frame — the 0.15s alpha dissolve is exactly the "shifting
+    // opacity" the flicker reports describe (Telegram never cross-fades a chat in).
+    removeReopenSnapshotOverlay(reason: "seed-mounted", animated: false)
+    removeSeedLoadingIndicator(reason: "seed-mounted")
   }
 
   /// Real clears opt in explicitly. Empty payloads emitted by route/input/status setup are
@@ -5713,7 +5755,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // racing a pop that detached the view before its post-commit mount tick ran).
     deferredPresentationSeedSourceRows = nil
     deferredPresentationSeedPreferredRows = nil
-    removeReopenSnapshotOverlay(reason: "rows-applied", animated: true)
+    removeReopenSnapshotOverlay(reason: "rows-applied", animated: false)
+    removeSeedLoadingIndicator(reason: "rows-applied")
     isApplyingRowsUpdate = true
     _setRowsGeneration &+= 1
     let mySetRowsGeneration = _setRowsGeneration
@@ -7410,6 +7453,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     deferredPresentationSeedSourceRows = nil
     deferredPresentationSeedPreferredRows = nil
     removeReopenSnapshotOverlay(reason: "chat-switch", animated: false)
+    removeSeedLoadingIndicator(reason: "chat-switch")
     deltaStreamCoalesceWorkItem?.cancel()
     deltaStreamCoalesceWorkItem = nil
     engineDeltaRefreshPending = false
