@@ -366,6 +366,9 @@ defmodule Vibe.Agents do
       target_url == "" ->
         {:error, :missing_callback}
 
+      match?({:error, _}, Vibe.Net.SafeURL.validate(target_url)) ->
+        {:error, :invalid_callback_url}
+
       true ->
         %AgentDeliveryEvent{}
         |> AgentDeliveryEvent.changeset(%{

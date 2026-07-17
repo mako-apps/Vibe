@@ -14,7 +14,7 @@ defmodule VibeWeb.AIController do
   """
   def edit_image(conn, %{"image_url" => image_url, "prompt" => prompt})
       when is_binary(image_url) and is_binary(prompt) and byte_size(prompt) > 0 do
-    Logger.info("[AIController] edit_image called with prompt: #{String.slice(prompt, 0, 50)}...")
+    Logger.info("[AIController] edit_image called with prompt=<redacted #{byte_size(prompt)} bytes>")
 
     case ImageEditor.edit_image(image_url, prompt) do
       {:ok, edited_url} ->
@@ -29,7 +29,7 @@ defmodule VibeWeb.AIController do
   end
 
   def edit_image(conn, params) do
-    Logger.warning("[AIController] edit_image called with invalid params: #{inspect(params)}")
+    Logger.warning("[AIController] edit_image called with invalid params keys=#{inspect(Map.keys(params))}")
 
     missing =
       []

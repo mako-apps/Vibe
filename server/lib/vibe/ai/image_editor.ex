@@ -5,6 +5,7 @@ defmodule Vibe.AI.ImageEditor do
 
   require Logger
   alias Vibe.AI.Tools.Vision
+  alias Vibe.Net.SafeURL
 
   # Using Gemini 3.0 Pro Image Preview (Nano Banana Pro)
   @gemini_api "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image-preview:generateContent"
@@ -20,7 +21,7 @@ defmodule Vibe.AI.ImageEditor do
     else
       image_url
     end
-    Logger.info("[ImageEditor] Editing image: #{log_url} with prompt: '#{prompt}'")
+    Logger.info("[ImageEditor] Editing image: #{log_url} with prompt=<redacted #{byte_size(prompt)} bytes>")
 
     api_key = System.get_env("GEMINI_API_KEY")
 
@@ -44,7 +45,9 @@ defmodule Vibe.AI.ImageEditor do
       String.starts_with?(url, "data:image/") ->
         {:ok, url}
       String.starts_with?(url, "http") ->
-        Vision.fetch_and_encode(url)
+        with {:ok, _uri} <- SafeURL.validate(url) do
+          Vision.fetch_and_encode(url)
+        end
       true ->
         {:error, "Invalid image URL format"}
     end
@@ -82,7 +85,7 @@ defmodule Vibe.AI.ImageEditor do
     case Finch.request(request, Vibe.Finch, receive_timeout: 60_000) do
       {:ok, %{status: 200, body: resp_body}} ->
         Logger.info("[ImageEditor] Gemini Raw Response Length: #{byte_size(resp_body)}")
-        Logger.info("[ImageEditor] Response Head: #{String.slice(resp_body, 0, 1000)}")
+        Logger.info("[ImageEditor] Response Body: <redacted #{byte_size(resp_body)} bytes>")
 
         case Jason.decode(resp_body) do
           {:ok, %{"candidates" => [%{"content" => %{"parts" => parts}} | _]}} ->

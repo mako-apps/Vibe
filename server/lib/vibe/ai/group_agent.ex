@@ -1175,14 +1175,18 @@ defmodule Vibe.AI.GroupAgent do
 
       # Log raw tool input for debugging
       if name == "create_document" do
-        raw_cols = tool_input_value(input, "columns")
+        raw_cols_count =
+          case tool_input_value(input, "columns") do
+            columns when is_list(columns) -> length(columns)
+            _ -> 0
+          end
         raw_rows = case input do
           %{"rows" => r} when is_list(r) -> length(r)
           _ -> "none"
         end
         raw_op = tool_input_value(input, "operation")
-        raw_body = tool_input_value(input, "body") |> String.slice(0..200)
-        Logger.info("[GroupAgent] create_document RAW INPUT: op=#{raw_op} cols=#{inspect(raw_cols)} rows_count=#{raw_rows} body=#{raw_body}")
+        raw_body_bytes = tool_input_value(input, "body") |> byte_size()
+        Logger.info("[GroupAgent] create_document RAW INPUT: op=#{raw_op} cols_count=#{raw_cols_count} rows_count=#{raw_rows} body=<redacted #{raw_body_bytes} bytes>")
       end
 
       result = execute_tool_with_recovery(name, input, user_id, chat_id, 1)

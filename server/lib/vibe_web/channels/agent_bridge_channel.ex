@@ -410,7 +410,7 @@ defmodule VibeWeb.AgentBridgeChannel do
     if is_binary(chat_id) and chat_id != "" do
       Logger.info(
         "[AgentBridge][ask] cancel user=#{socket.assigns.user_id} chat=#{chat_id} " <>
-          "requestId=#{inspect(request_id)} reason=#{inspect(payload["reason"])} " <>
+          "requestId=#{inspect(request_id)} reason=<redacted #{byte_size(inspect(payload["reason"] || ""))} bytes> " <>
           "→ broadcast chat:#{chat_id}/agent-bridge-ask-cancel"
       )
 
@@ -430,8 +430,11 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   # daemon → server: acknowledgement for a phone-issued task control action.
   def handle_in("control_result", payload, socket) do
+    control_type = payload["type"] || payload["action"] || payload["event"]
+    control_id = payload["id"] || payload["requestId"] || payload["request_id"]
+
     Logger.info(
-      "[AgentBridge] control_result user=#{socket.assigns.user_id} payload=#{inspect(payload)}"
+      "[AgentBridge] control_result user=#{socket.assigns.user_id} type=#{inspect(control_type)} id=#{inspect(control_id)} payload=<redacted>"
     )
 
     {:reply, :ok, socket}
@@ -461,7 +464,7 @@ defmodule VibeWeb.AgentBridgeChannel do
   # daemon → server: surface an error notice without a full result
   def handle_in("error", %{"provider" => provider, "chatId" => chat_id} = payload, socket) do
     Logger.info(
-      "[AgentBridge] error received user=#{socket.assigns.user_id} provider=#{inspect(provider)} chat=#{inspect(chat_id)} message=#{inspect(payload["message"])}"
+      "[AgentBridge] error received user=#{socket.assigns.user_id} provider=#{inspect(provider)} chat=#{inspect(chat_id)} message=<redacted #{byte_size(inspect(payload["message"] || ""))} bytes>"
     )
 
     message = payload["message"] || "The task could not be completed on your computer."
