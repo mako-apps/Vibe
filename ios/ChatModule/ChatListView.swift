@@ -4853,6 +4853,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       NSLog(
         "[ChatOpen] viewport RESTORE-AT-SEED chat=%@ anchor=%@",
         String(engineChatId.prefix(12)), String(messageId.prefix(8)))
+      // The restore teleported the offset AFTER the mount's layout pass, so the
+      // anchor region's cells were never created (measured visible=3 of a full
+      // viewport) — bubbles/images/expand toggles stayed invisible until a touch
+      // dirtied the layout. Materialize the restored viewport in the same mount.
+      materializeCellsAfterProgrammaticJump(context: "seed-restore")
     }
     return applied
   }
@@ -7996,8 +8001,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         if self.jumpToBottomAnimator === animator {
           self.jumpToBottomAnimator = nil
         }
-        // Streaming or a late cell measurement can extend content during the glide.
-        // Correct the final sub-frame remainder without starting a second animation.
+        // Streaming or a late cell measurement can extend OR shrink content during the
+        // glide. Correct the final remainder without starting a second animation, then
+        // verify the destination actually materialized cells — a shrink could land the
+        // offset past the last cell (bare wallpaper until a touch dirtied the layout).
         self.collectionView.layoutIfNeeded()
         let finalMaxOffsetY = pixelAlignedValue(
           max(0.0, self.collectionView.contentSize.height - self.collectionView.bounds.height))
@@ -8006,21 +8013,63 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             CGPoint(x: 0.0, y: finalMaxOffsetY), animated: false)
         }
         self.isInternalScrollAdjustment = false
+        self.materializeCellsAfterProgrammaticJump(context: "bottom-glide")
         self.previousOffsetY = self.collectionView.contentOffset.y
         self.emitViewport(force: true)
       }
       jumpToBottomAnimator = animator
       animator.startAnimation()
     } else {
-      jumpToBottomAnimator?.stopAnimation(true)
-      jumpToBottomAnimator = nil
+      if jumpToBottomAnimator != nil {
+        jumpToBottomAnimator?.stopAnimation(true)
+        jumpToBottomAnimator = nil
+        // stopAnimation(true) never runs the glide's completion, which is the only
+        // place that cleared its isInternalScrollAdjustment — left true, every pan
+        // stopped updating shouldAutoScroll and the jump chrome until some later
+        // internal adjustment cleared it (the "button appears late" report).
+        isInternalScrollAdjustment = false
+      }
       performInternalScrollAdjustment {
         collectionView.setContentOffset(CGPoint(x: 0.0, y: maxOffsetY), animated: false)
       }
+      materializeCellsAfterProgrammaticJump(context: "bottom-teleport")
       previousOffsetY = collectionView.contentOffset.y
       shouldAutoScroll = true
       emitViewport(force: true)
     }
+  }
+
+  /// Programmatic offset teleports (seed restore, jump-to-bottom hop/land) move the
+  /// model offset without a user scroll, and the destination's cells only materialize
+  /// on a later layout pass. If content shrank during the move (estimated→exact
+  /// heights), the offset can even land in blank space BELOW the last cell: zero
+  /// visible cells while the floating-avatar overlay deliberately preserves its last
+  /// frame — the reported "tap the toggle and the list goes empty except one avatar,
+  /// content reappears after a pinch". Run the pass NOW, clamp any overshoot, and
+  /// reload if cells still failed to materialize (same self-heal as attach).
+  private func materializeCellsAfterProgrammaticJump(context: String) {
+    guard !rows.isEmpty, collectionView.bounds.height > 1.0 else { return }
+    collectionView.layoutIfNeeded()
+    let maxOffset = max(0.0, collectionView.contentSize.height - collectionView.bounds.height)
+    if collectionView.contentOffset.y > maxOffset + 1.0 {
+      performInternalScrollAdjustment {
+        collectionView.setContentOffset(
+          CGPoint(x: 0.0, y: pixelAlignedValue(maxOffset)), animated: false)
+      }
+      collectionView.layoutIfNeeded()
+      NSLog(
+        "[ChatOpen] jump CLAMP context=%@ chat=%@ — offset overshot content",
+        context, String(engineChatId.prefix(12)))
+    }
+    if collectionView.indexPathsForVisibleItems.isEmpty, collectionView.contentSize.height > 0 {
+      NSLog(
+        "[ChatOpen] jump REVALIDATE context=%@ chat=%@ — 0 cells at offset=%.0f",
+        context, String(engineChatId.prefix(12)), collectionView.contentOffset.y)
+      collectionView.reloadData()
+      collectionView.layoutIfNeeded()
+    }
+    updateFloatingSenderAvatars()
+    updateJumpToBottomButtonVisibility()
   }
 
   private func updateJumpToBottomButtonVisibility() {
