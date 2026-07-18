@@ -74,6 +74,9 @@ it. The essentials:
   - agy: `~/.local/bin/agy -p "Read and execute the brief at <path>" --mode accept-edits --dangerously-skip-permissions --print-timeout 30m` (UI/low-risk only — never auth/security/payments/migrations)
 - Review DIFFS vs baseline, never handoff prose. One verify pass (compile/tests/build)
   at the end — workers never commit, build, or launch.
+- **Shared agent memory**: `.vibe/memory.md` is the append-only journal all agents
+  share — read it before diagnosing (what previous runs shipped/learned), append one
+  short entry (Shipped / Learned / Open) after finishing real work.
 - **Clean up when the run settles**: fold durable learnings into docs/memory, then
   delete that run's `.vibe/team/<run>*` board and brief files.
 

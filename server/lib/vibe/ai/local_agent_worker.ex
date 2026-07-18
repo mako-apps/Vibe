@@ -1505,22 +1505,21 @@ defmodule Vibe.AI.LocalAgentWorker do
         remaining = Enum.reject(handles, &(&1 == lead_handle))
         now_ms = System.system_time(:millisecond)
 
-        worker_states =
-          handles
-          |> Enum.map(fn handle ->
-            status = if handle == lead_handle, do: "running", else: "pending"
-
-            {handle,
-             %{
-               "status" => status,
-               "started_at" => if(status == "running", do: now_ms),
-               "finished_at" => nil,
-               "summary" => nil,
-               "task_id" => nil,
-               "last_label" => if(status == "running", do: "starting", else: "queued")
-             }}
-          end)
-          |> Map.new()
+        # Only the lead is real at registration time. Siblings enter worker_states
+        # when something actually spawns them (team_spawn / a bridge status update —
+        # update_team_worker_state adds unknown handles). Pre-seeding every group
+        # agent as "pending" painted a permanent 4-worker board on runs where the
+        # agent-native lead sizes the team itself and may never spawn most of them.
+        worker_states = %{
+          lead_handle => %{
+            "status" => "running",
+            "started_at" => now_ms,
+            "finished_at" => nil,
+            "summary" => nil,
+            "task_id" => nil,
+            "last_label" => "starting"
+          }
+        }
 
         ensure_team_run_table()
 

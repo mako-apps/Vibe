@@ -204,6 +204,9 @@ diff-review rules): `agent-bridge/instructions/team-lead.md`.
   - agy: `~/.local/bin/agy -p "Read and execute the brief at <path>" --mode accept-edits --dangerously-skip-permissions --print-timeout 30m` — UI/low-risk only; never auth/security/payments/migrations; always diff+build verify its work.
 - Review worker DIFFS against the pre-dispatch baseline — never trust handoff text.
   Workers never commit, push, build, or launch; the dispatcher does ONE verify pass.
+- Shared agent memory: `.vibe/memory.md` is the append-only journal all agents share —
+  read it before diagnosing (what previous runs shipped/learned), append one short
+  entry (Shipped / Learned / Open) after finishing real work.
 - Cleanup when settled: move durable learnings into real docs, then delete the run's
   `.vibe/team/<run>*` files.
 

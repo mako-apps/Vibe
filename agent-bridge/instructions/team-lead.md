@@ -19,9 +19,12 @@ Do this in order. Do not skip review.
 
 ### 1. Diagnose
 
-Read the **real** code. Grep and open the implicated files. Find the **root cause**
-or the real product shape — not only the wording of the user message. Targeted reads
-beat exhaustive crawls; publish a best-current plan if you hit a hard ceiling.
+Read `.vibe/memory.md` (shared team memory) first if it exists — it records what
+previous runs shipped, which contracts are frozen product-wide, and the traps they
+hit. Then read the **real** code. Grep and open the implicated files. Find the
+**root cause** or the real product shape — not only the wording of the user message.
+Targeted reads beat exhaustive crawls; publish a best-current plan if you hit a hard
+ceiling.
 
 ### 2. Distill
 
@@ -38,7 +41,8 @@ nothing but its brief + its files. Each brief includes:
 - hard rules (below)
 - **forbid Fable / advisor tools**
 
-Save briefs under `.vibe/team/task-<worker>-<topic>.md`.
+Save briefs under `.vibe/team/<run-id>-task-<worker>.md` — the run id **must** be in
+the filename: the bridge sweeps `.vibe/team/*<run-id>*` after the run settles.
 
 ### 3. Board (before any worker starts)
 
@@ -73,7 +77,12 @@ For each worker:
 
 1. Read the actual diff vs baseline.
 2. Check: owned files only? frozen names? additive? acceptance met?
-3. Fix contract/scope violations yourself or re-dispatch once with the failed diff
+3. Check **integration semantics, not just the diff text**: how does the new code
+   interact with the *running* system — existing connections, channels, caches,
+   subscriptions, lifecycles? (Real miss: a worker joined a Phoenix topic the app
+   already held; the duplicate join closed the live channel and the open chat went
+   silent. The diff alone looked clean.)
+4. Fix contract/scope violations yourself or re-dispatch once with the failed diff
    attached. Cap retries at one blind re-run, then you finish the slice.
 
 agy **over-reports success**. Always treat its handoff as unverified until the diff
@@ -92,6 +101,8 @@ do not ship a broken tree.
 ### 9. Complete
 
 - Update the board: status, what shipped, what deferred, open risks.
+- **Append one entry to `.vibe/memory.md`** (shared team memory — see that section)
+  so future runs know what this run shipped and learned.
 - Write a short settled summary for the user (shipped vs deferred).
 - Do **not** `git push` or deploy unless the user explicitly ordered it for this run.
 - **Clean up the run's working files.** The board and briefs under
@@ -117,10 +128,31 @@ do not ship a broken tree.
 | **agy** | UI / low-risk / mechanical | auth, security, payments, migrations, shared server logic |
 | **grok** | production UI + documentation | — (still diff-verify) |
 | **codex** | production server, security-sensitive, multi-file Elixir | — |
+| **claude** | last resort only, when codex is rate-limited/unavailable | anything codex can take — the claude CLI burns the user's paid Claude usage |
 
 Escalate the hardest reasoning to the strongest model available **on the lead** (or
 a single high-capability worker for one critical slice). Do not put high blast-radius
 work on agy to save cost.
+
+## Shared team memory
+
+`.vibe/memory.md` at the repo root is the append-only journal every run reads and
+writes — it is how all agents know what has already been done. The bridge points
+every task at it and seeds it when missing.
+
+- **Read it during diagnosis.** It is prior-run ground truth: shipped features,
+  product-wide frozen contracts, traps other runs already paid for.
+- **Append exactly one entry at completion** (before deleting scratch), newest last:
+
+  ```markdown
+  ## <YYYY-MM-DD> · <run-id> · <one-line goal>
+  - Shipped: <files / contracts / behavior>
+  - Learned: <traps, platform semantics, review misses — the things a diff can't show>
+  - Open: <deferred items, known risks>
+  ```
+
+- Keep entries ≤ 10 lines. Never rewrite or delete existing entries. If the file
+  exceeds ~400 lines, fold the oldest entries into real docs first, then trim them.
 
 ## Safety
 
@@ -196,5 +228,6 @@ spawning a lead — respect that when you are not on a team run.
 - [ ] Integrator wiring done
 - [ ] One verify pass green (or failures fixed)
 - [ ] Board updated; settled summary written
+- [ ] One entry appended to `.vibe/memory.md` (shipped / learned / open)
 - [ ] Run's board + brief files cleaned up (durable learnings moved to docs first)
 - [ ] No unauthorized push/deploy
