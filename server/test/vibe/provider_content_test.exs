@@ -1,9 +1,18 @@
 defmodule Vibe.ProviderContentTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
+  alias Vibe.Accounts.User
+  alias Vibe.Agent
+  alias Vibe.AgentDeliveryEvent
   alias Vibe.ProviderContent
+  alias Vibe.Repo
+  alias VibeWeb.ChatChannel
 
   @contract "vibe.content.v1"
+
+  setup do
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+  end
 
   defp envelope(parts, fallback \\ "fallback body") do
     %{
@@ -282,5 +291,66 @@ defmodule Vibe.ProviderContentTest do
              "available" => false,
              "mode" => "callback"
            }
+  end
+
+  describe "provider interaction delivery" do
+    setup do
+      owner = insert_user("owner")
+      agent_user = insert_user("provider_agent")
+
+      agent =
+        Repo.insert!(%Agent{
+          owner_user_id: owner.id,
+          agent_user_id: agent_user.id,
+          status: "published",
+          display_name: "Provider Agent",
+          callback_url: "https://8.8.8.8/provider-events",
+          webhook_secret_hash: "hash",
+          secret_hint: "hint"
+        })
+
+      %{agent: agent}
+    end
+
+    test "queues an action tap with the documented structured payload", %{agent: agent} do
+      payload = %{"type" => "action", "actionId" => "approve", "messageId" => "message-1"}
+
+      assert {:ok, delivery} = ChatChannel.deliver_provider_event(agent, "action", payload)
+      delivery = AgentDeliveryEvent |> Repo.get!(delivery.id) |> Repo.preload(:invocation)
+
+      assert delivery.event_type == "action"
+      assert delivery.request_body == payload
+      assert delivery.status == "pending"
+      assert delivery.invocation.request_payload == payload
+    end
+
+    test "queues call.requested with trusted chat and agent identifiers", %{agent: agent} do
+      payload = %{
+        "type" => "call.requested",
+        "chatId" => "chat-1",
+        "agentId" => agent.id
+      }
+
+      assert {:ok, delivery} =
+               ChatChannel.deliver_provider_event(agent, "call.requested", payload)
+
+      delivery = AgentDeliveryEvent |> Repo.get!(delivery.id) |> Repo.preload(:invocation)
+      assert delivery.event_type == "call.requested"
+      assert delivery.request_body == payload
+      assert delivery.status == "pending"
+      assert delivery.invocation.vibe_chat_id == "chat-1"
+    end
+  end
+
+  defp insert_user(prefix) do
+    suffix = System.unique_integer([:positive])
+
+    Repo.insert!(%User{
+      id: Ecto.UUID.generate(),
+      username: "#{prefix}_#{suffix}",
+      password_hash: "hash",
+      public_key: "key",
+      device_id: "device-#{suffix}"
+    })
   end
 end

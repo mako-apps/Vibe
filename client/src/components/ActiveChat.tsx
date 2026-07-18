@@ -13,22 +13,46 @@ import VoiceBubble from './VoiceBubble';
 import GifPicker from './GifPicker';
 import MessageBubbleTail from './MessageBubbleTail';
 import ContentParts, { getVibeContentEnvelope } from './ContentParts';
+import ConnectionManager from '../ConnectionManager';
 import { Chat, Message } from '../types';
 import { formatTime, formatDuration } from '../utils';
 import PatternWallpaper from './PatternWallpaper';
 import { VIBE_APPEARANCE } from '../theme/appearance';
 
-/** Stub until host wires actions → events POST (see provider-content-contract §3.4). */
-function handleContentPartAction(actionId: string): void {
-    // TODO(provider-actions): POST { type: "action", actionId, messageId } on the
-    // existing agent events path when the host action callback contract lands.
-    console.log('[ContentParts] onAction stub', actionId);
+function emitProviderEvent(chatId: string, payload: Record<string, string>): void {
+    const socket = ConnectionManager.getInstance().getSocket();
+    if (!socket?.isConnected()) return;
+
+    // Reuse the channel Chat.tsx already holds for the open chat — a second join
+    // on the same topic makes Phoenix close the live one (duplicate-join rule).
+    const topic = `chat:${chatId}`;
+    type JoinedChannel = { topic: string; state: string; push: (event: string, payload: object) => unknown };
+    const joined = (socket as unknown as { channels?: JoinedChannel[] }).channels?.find(
+        (ch) => ch.topic === topic && ch.state === 'joined'
+    );
+    if (joined) {
+        joined.push('provider-event', payload);
+        return;
+    }
+
+    const channel = socket.channel(topic, {});
+    channel.join()
+        .receive('ok', () => {
+            channel.push('provider-event', payload)
+                .receive('ok', () => channel.leave())
+                .receive('error', () => channel.leave())
+                .receive('timeout', () => channel.leave());
+        })
+        .receive('error', () => channel.leave())
+        .receive('timeout', () => channel.leave());
 }
 
-/** Stub until host wires vibe.call → call.requested. */
-function handleContentPartCall(): void {
-    // TODO(provider-call): emit call.requested on events / open native call UX.
-    console.log('[ContentParts] onCall stub');
+function handleContentPartAction(chatId: string, messageId: string, actionId: string): void {
+    emitProviderEvent(chatId, { type: 'action', actionId, messageId });
+}
+
+function handleContentPartCall(chatId: string): void {
+    emitProviderEvent(chatId, { type: 'call.requested' });
 }
 
 interface ChatInterfaceProps {
@@ -278,8 +302,8 @@ const MessageRow = React.memo(({
                             <ContentParts
                                 content={envelope}
                                 accent={VIBE_APPEARANCE.accent}
-                                onAction={handleContentPartAction}
-                                onCall={handleContentPartCall}
+                                onAction={(actionId) => handleContentPartAction(activeChat.chatId, m.id, actionId)}
+                                onCall={() => handleContentPartCall(activeChat.chatId)}
                             />
                         );
                     })()}
@@ -983,8 +1007,8 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                                                 <ContentParts
                                                     content={envelope}
                                                     accent={VIBE_APPEARANCE.accent}
-                                                    onAction={handleContentPartAction}
-                                                    onCall={handleContentPartCall}
+                                                    onAction={(actionId) => handleContentPartAction(activeChat.chatId, contextMenu.message.id, actionId)}
+                                                    onCall={() => handleContentPartCall(activeChat.chatId)}
                                                 />
                                             );
                                         })()}

@@ -234,6 +234,22 @@ defmodule VibeWeb.ChatChannel do
   end
 
   @impl true
+  def handle_in("provider-event", payload, socket) when is_map(payload) do
+    "chat:" <> chat_id = socket.topic
+
+    with %{} = agent <- socket.assigns[:standalone_agent],
+         true <- socket.assigns[:standalone_agent_chat_enabled],
+         {:ok, event_type, event_payload} <- provider_event_payload(payload, chat_id, agent.id),
+         {:ok, _delivery} <- deliver_provider_event(agent, event_type, event_payload) do
+      {:reply, :ok, socket}
+    else
+      nil -> {:reply, {:error, %{reason: "agent_not_available"}}, socket}
+      false -> {:reply, {:error, %{reason: "agent_chat_disabled"}}, socket}
+      {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
+    end
+  end
+
+  @impl true
   def handle_in("agent-bridge-control", payload, socket) when is_map(payload) do
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
@@ -576,6 +592,37 @@ defmodule VibeWeb.ChatChannel do
   end
 
   # ── Agent Dispatch ──
+
+  @doc false
+  def deliver_provider_event(agent, event_type, event_payload) do
+    with {:ok, invocation} <-
+           Agents.record_invocation(agent, %{
+             source: "chat.interaction",
+             vibe_chat_id: event_payload["chatId"],
+             request_payload: event_payload,
+             response_payload: %{},
+             status: "completed"
+           }) do
+      Agents.create_delivery_event(agent, invocation, event_type, event_payload)
+    end
+  end
+
+  defp provider_event_payload(
+         %{"type" => "action", "actionId" => action_id, "messageId" => message_id},
+         _chat_id,
+         _agent_id
+       )
+       when is_binary(action_id) and byte_size(action_id) > 0 and is_binary(message_id) and
+              byte_size(message_id) > 0 do
+    {:ok, "action", %{"type" => "action", "actionId" => action_id, "messageId" => message_id}}
+  end
+
+  defp provider_event_payload(%{"type" => "call.requested"}, chat_id, agent_id) do
+    {:ok, "call.requested",
+     %{"type" => "call.requested", "chatId" => chat_id, "agentId" => agent_id}}
+  end
+
+  defp provider_event_payload(_payload, _chat_id, _agent_id), do: {:error, :invalid_event}
 
   defp maybe_dispatch_agent(chat_id, data, user_id) do
     Logger.info(

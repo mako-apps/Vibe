@@ -168,3 +168,6 @@ docs/MESH_NETWORKING.md
 !server/Dockerfile
 !server/start.sh
 !server/.dockerignore
+
+# Team-run scratch (boards + briefs) — temporary by contract, cleaned after each run
+.vibe/team/
