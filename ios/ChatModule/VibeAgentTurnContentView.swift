@@ -222,8 +222,11 @@ func vibeAgentTeamDisplayFeed(
   var items: [VibeAgentKitProgressItem] = []
 
   // Intro: mid-run only — once settled the full final answer renders as the body and
-  // would duplicate the opening line.
-  if message.isStreaming {
+  // would duplicate the opening line. When the run is suppress-all-text (supervisor
+  // team), the lead posts NO narration paragraph at all: the cell is a pure progress
+  // runner (worker rows with live "reading/editing" status), and the only prose is the
+  // lead's final summary at settle.
+  if message.isStreaming, !runtime.suppressAllText {
     let firstNarration = message.progressItems.first {
       $0.itemType == "text" && !$0.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -242,7 +245,7 @@ func vibeAgentTeamDisplayFeed(
 
   // Worker rows: real statuses when the bridge has reported them, else a synthesized
   // "starting" row per known handle so the team roster shows from the first frame.
-  let statuses: [ChatListRow.TeamWorkerStatus] =
+  let roster: [ChatListRow.TeamWorkerStatus] =
     runtime.teamWorkersStatus.isEmpty
     ? runtime.teamWorkers.map {
       ChatListRow.TeamWorkerStatus(
@@ -253,10 +256,39 @@ func vibeAgentTeamDisplayFeed(
     }
     : runtime.teamWorkersStatus
 
+  // Real-time nodes. Each worker appears as a node only once the monitor has actually
+  // ENGAGED it — a still-pending/queued member stays hidden until it starts (and a run
+  // that finishes without ever engaging it never shows it). The lead is the monitor
+  // voice (intro + final answer), not a worker node under itself, so it's filtered out
+  // — EXCEPT on a solo run, where the single member IS the lead and must remain visible.
+  let leadHandle = (runtime.leadWorker ?? "").lowercased()
+  let hasNonLeadWorker = roster.contains { $0.worker.lowercased() != leadHandle }
+  let statuses = roster.filter { status in
+    let handle = status.worker.lowercased()
+    if hasNonLeadWorker, !leadHandle.isEmpty, handle == leadHandle { return false }
+    let s = status.status.lowercased()
+    if s == "pending" || s == "queued" { return false }
+    return true
+  }
+
+  // A settled turn has no live workers: once the message stops streaming, any worker
+  // still reading running/starting/waiting is stale (the run ended without a terminal
+  // frame — CLI crash, or orphaned by a server redeploy). Present it as "stopped" so the
+  // row never keeps a lingering shimmer after the run is over. This is the client's half
+  // of the fix — the worker statuses live inside the E2E-encrypted runtime, so only here
+  // (post-decryption) can they be terminalized; ChatEngine only flips the isStreaming flag.
+  let runNotStreaming = !message.isStreaming
+  let staleWorkerStates: Set<String> = [
+    "running", "starting", "pending", "queued", "active", "streaming",
+    "waiting", "in-progress", "in_progress", "working",
+  ]
   for status in statuses {
     let name = status.label.isEmpty ? status.worker.capitalized : status.label
+    let effectiveStatus =
+      (runNotStreaming && staleWorkerStates.contains(status.status.lowercased()))
+      ? "stopped" : status.status
     let statusText: String = {
-      let s = status.status.lowercased()
+      let s = effectiveStatus.lowercased()
       if s == "done" || s == "completed" {
         if let ms = status.durationMs, ms > 0 {
           return "done · \(ChatListRow.TeamWorkerStatus.formatDuration(ms))"
@@ -265,7 +297,21 @@ func vibeAgentTeamDisplayFeed(
       }
       if s == "failed" || s == "error" { return "failed" }
       if s == "skipped" { return "skipped" }
+      // Settled without a terminal frame (crashed run / orphaned by a server redeploy)
+      // — a real stopped state, never a lingering "working…".
+      if s == "stopped" || s == "cancelled" || s == "reassigned" { return "stopped" }
       if s == "starting" || s == "pending" { return "starting…" }
+      // Payload-contract barrier: a consumer held until its owner freezes the shape.
+      // The server puts "waiting for <contract> from <owner>" in lastLabel; show it so
+      // the user sees the barrier working (never a spinner, never hidden).
+      if s == "waiting" {
+        if let last = status.lastLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !last.isEmpty
+        {
+          return last.count > 40 ? String(last.prefix(40)) + "…" : last
+        }
+        return "waiting for payload…"
+      }
       if let last = status.lastLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
         !last.isEmpty
       {
@@ -277,7 +323,7 @@ func vibeAgentTeamDisplayFeed(
       VibeAgentKitProgressItem(
         label: name, badges: [], eventType: "progress", recipient: nil, platform: nil,
         format: nil, messageContent: nil, messagePreview: statusText, voiceUrl: nil,
-        voiceDuration: nil, status: status.status, isRecording: false,
+        voiceDuration: nil, status: effectiveStatus, isRecording: false,
         recordingStartTime: nil, tool: nil, image: nil, itemType: "teamworker",
         sourceUrl: nil, nodeId: "teamworker:\(status.worker)",
         subagentType: status.worker))

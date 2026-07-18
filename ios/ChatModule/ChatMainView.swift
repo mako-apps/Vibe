@@ -125,6 +125,8 @@ public final class ChatMainView: UIView,
   private let headerContainer = UIView()
   private let headerMaskView = UIView()
   private let headerMaskBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
+  /// Second blur pass — single material maxes out soft; stack for stronger frost.
+  private let headerMaskBlurBoostView = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
   private let headerMaskOverlayView = UIView()
   private let headerMaskGradientLayer = CAGradientLayer()
   private let headerContentView = UIView()
@@ -315,6 +317,7 @@ public final class ChatMainView: UIView,
   private var profileHierarchyAttached = false
   private var externalNavigationHeaderEnabled = false
   private var previewHeaderCenterOnly = false
+  private var previewHeaderCompactLeading = false
   private let engineStateRefreshQueue = DispatchQueue(
     label: "vibe.chat.main.engine-state",
     qos: .utility
@@ -754,6 +757,13 @@ public final class ChatMainView: UIView,
   func setPreviewHeaderCenterOnly(_ enabled: Bool) {
     guard previewHeaderCenterOnly != enabled else { return }
     previewHeaderCenterOnly = enabled
+    updateChatModeHeaderControls()
+    setNeedsLayout()
+  }
+
+  func setPreviewHeaderCompactLeading(_ enabled: Bool) {
+    guard previewHeaderCompactLeading != enabled else { return }
+    previewHeaderCompactLeading = enabled
     updateChatModeHeaderControls()
     setNeedsLayout()
   }
@@ -1200,18 +1210,25 @@ public final class ChatMainView: UIView,
     headerContainer.clipsToBounds = false
     headerMaskView.isUserInteractionEnabled = false
     headerContainer.addSubview(headerMaskView)
+    // Blur stack underneath, pure tint sibling on top (not inside contentView —
+    // materials inside contentView still read gray/brown over wallpaper).
     headerMaskView.addSubview(headerMaskBlurView)
-    headerMaskBlurView.contentView.addSubview(headerMaskOverlayView)
-    // Soft alpha fade (not a hard cutoff). Keeps status-bar chrome legible while the
-    // native soft scroll-edge shapes glass around the chips. Light/dark fill only —
-    // never wallpaper / bubble colors (see applyTheme / refreshHeaderGlass).
+    headerMaskView.addSubview(headerMaskBlurBoostView)
+    headerMaskView.addSubview(headerMaskOverlayView)
+    // Custom soft mask (replaces system topEdgeEffect): multi-stop alpha so the
+    // blur+tint plate feathers into the transcript — no hard rectangular cutoff.
+    // Keep the top band denser so dark black actually reads, then soft fade.
     headerMaskGradientLayer.colors = [
       UIColor.black.withAlphaComponent(1.0).cgColor,
-      UIColor.black.withAlphaComponent(0.88).cgColor,
-      UIColor.black.withAlphaComponent(0.35).cgColor,
+      UIColor.black.withAlphaComponent(0.96).cgColor,
+      UIColor.black.withAlphaComponent(0.72).cgColor,
+      UIColor.black.withAlphaComponent(0.32).cgColor,
+      UIColor.black.withAlphaComponent(0.08).cgColor,
       UIColor.clear.cgColor,
     ]
-    headerMaskGradientLayer.locations = [0.0, 0.42, 0.72, 1.0]
+    headerMaskGradientLayer.locations = [0.0, 0.22, 0.45, 0.68, 0.86, 1.0]
+    headerMaskGradientLayer.startPoint = CGPoint(x: 0.5, y: 0.0)
+    headerMaskGradientLayer.endPoint = CGPoint(x: 0.5, y: 1.0)
     headerMaskView.layer.mask = headerMaskGradientLayer
     headerContainer.addSubview(headerContentView)
     headerContainer.layer.zPosition = 50.0
@@ -1428,7 +1445,7 @@ public final class ChatMainView: UIView,
     chatSubtitleRow.addArrangedSubview(chatConnectingSpinner)
     chatSubtitleRow.addArrangedSubview(chatSubtitleLabel)
     chatConnectingSpinner.alpha = 0
-    chatConnectingSpinner.isHidden = false
+    chatConnectingSpinner.isHidden = true
 
     chatHeaderStack.addArrangedSubview(chatTitleLabel)
     chatHeaderStack.addArrangedSubview(chatSubtitleRow)
@@ -1532,20 +1549,8 @@ public final class ChatMainView: UIView,
     syncProfileHierarchyForMode()
     updateChatModeHeaderControls()
 
-    if #available(iOS 26.0, *) {
-      // Let UIKit shape the Liquid Glass edge where the fixed header overlays the message
-      // scroller. This interaction is attached once with the header hierarchy; list data
-      // updates no longer rebuild or relayout the header container.
-      let chatInteraction = UIScrollEdgeElementContainerInteraction()
-      chatInteraction.scrollView = chatListView.collectionView
-      chatInteraction.edge = .top
-      headerContainer.addInteraction(chatInteraction)
-
-      let profileInteraction = UIScrollEdgeElementContainerInteraction()
-      profileInteraction.scrollView = profileScrollView
-      profileInteraction.edge = .top
-      profileHeaderContainer.addInteraction(profileInteraction)
-    }
+    // Top scroll-edge API is disabled — header uses custom soft blur/tint masking
+    // (see applyHeaderChromeSystemStyle / layoutChrome). Bottom edge stays system soft.
   }
 
   private func ensureProfileHierarchyAttached() {
@@ -1664,6 +1669,21 @@ public final class ChatMainView: UIView,
     headerContainer.isHidden = false
     let usesSavedMessagesHeader = headerMode == .savedMessages
     let searchActive = savedSearchExpanded && currentPage == .chat
+    if previewHeaderCompactLeading && !searchActive {
+      headerContainer.isUserInteractionEnabled = false
+      backGlassView.isHidden = true
+      avatarButton.isHidden = false
+      avatarGlassView.isHidden = false
+      menuGlassView.isHidden = true
+      savedSearchCancelGlassView.isHidden = true
+      rightActionsGlassView.isHidden = true
+      titleGlassView.isHidden = false
+      titleButton.isUserInteractionEnabled = false
+      titleButton.showsMenuAsPrimaryAction = false
+      titleButton.menu = nil
+      applyHeaderSearchPresentation()
+      return
+    }
     if previewHeaderCenterOnly && !searchActive {
       headerContainer.isUserInteractionEnabled = false
       backGlassView.isHidden = true
@@ -3051,8 +3071,7 @@ public final class ChatMainView: UIView,
     presenter.present(navigationController, animated: true)
   }
 
-  /// System light/dark only — never wallpaper luminance (`appearance.isDark`) or bubble colors.
-  /// Reads the window / view trait collection (system default), not chat list theme.
+  /// System light/dark for glass chrome chips only (not mask plate).
   private var headerChromeIsDark: Bool {
     let style =
       window?.traitCollection.userInterfaceStyle
@@ -3063,61 +3082,81 @@ public final class ChatMainView: UIView,
     return style == .dark
   }
 
-  /// Apple UIGlassEffect.tintColor — “a tint color applied to the glass” (stained wash).
-  /// Use pure system surface colors so Liquid Glass does not pick up list/bubble hues.
-  private func headerGlassSystemTint(isDark: Bool) -> UIColor {
-    let traits = UITraitCollection(userInterfaceStyle: isDark ? .dark : .light)
-    // systemBackground = black (dark) / white (light). Opaque enough that scrolling
-    // content cannot recolor the chip; still translucent for glass refraction.
-    return UIColor.systemBackground
-      .resolvedColor(with: traits)
-      .withAlphaComponent(isDark ? 0.55 : 0.50)
+  /// Mask plate darkness follows **chat theme** (wallpaper), not system UI style.
+  /// Using system alone made dark chats still get light/gray materials → brown/gray wash.
+  private var headerMaskIsDark: Bool {
+    appearance.isDark
   }
 
-  /// Soft mask band under the header — systemBackground only (light/dark).
-  private func headerMaskSystemColor(isDark: Bool) -> UIColor {
-    let traits = UITraitCollection(userInterfaceStyle: isDark ? .dark : .light)
-    return UIColor.systemBackground.resolvedColor(with: traits)
+  /// Soft header-mask wash: dark = pure black; light = desaturated theme tint (never pure white).
+  private func headerMaskWashColor(isDark: Bool) -> UIColor {
+    if isDark {
+      return UIColor.black
+    }
+    // Theme wallpaper tint — keep some chroma, no hardcoded white.
+    let themeBase =
+      appearance.wallpaperGradient.first
+      ?? UIColor.secondarySystemBackground.resolvedColor(
+        with: UITraitCollection(userInterfaceStyle: .light))
+    var r: CGFloat = 0
+    var g: CGFloat = 0
+    var b: CGFloat = 0
+    var a: CGFloat = 0
+    guard themeBase.getRed(&r, green: &g, blue: &b, alpha: &a) else {
+      return themeBase
+    }
+    // Mild desaturate toward cool-neutral — less aggressive so tint still reads.
+    let target: CGFloat = 0.88
+    let mix: CGFloat = 0.35
+    let inv = 1.0 - mix
+    return UIColor(
+      red: (r * inv) + (target * mix),
+      green: (g * inv) + (target * mix),
+      blue: (b * inv) + (target * mix),
+      alpha: 1.0
+    )
   }
 
   private func applyHeaderChromeSystemStyle() {
-    let isDark = headerChromeIsDark
-    let chromeStyle: UIUserInterfaceStyle = isDark ? .dark : .light
-    // Lock chrome traits to system light/dark so materials never adapt to transcript content.
-    headerContainer.overrideUserInterfaceStyle = chromeStyle
-    profileHeaderContainer.overrideUserInterfaceStyle = chromeStyle
-    headerMaskView.overrideUserInterfaceStyle = chromeStyle
-    headerMaskBlurView.overrideUserInterfaceStyle = chromeStyle
+    // Header chrome + mask both follow **chat theme** dark/light (not system UI style).
+    let themeDark = headerMaskIsDark
+    let themeStyle: UIUserInterfaceStyle = themeDark ? .dark : .light
+    headerContainer.overrideUserInterfaceStyle = themeStyle
+    profileHeaderContainer.overrideUserInterfaceStyle = themeStyle
+    headerMaskView.overrideUserInterfaceStyle = themeStyle
+    headerMaskBlurView.overrideUserInterfaceStyle = themeStyle
+    headerMaskBlurBoostView.overrideUserInterfaceStyle = themeStyle
     [
       backGlassView, titleGlassView, avatarGlassView, menuGlassView,
       savedSearchCancelGlassView, rightActionsGlassView,
       profileBackGlassView, profileMenuGlassView,
-    ].forEach { $0.overrideUserInterfaceStyle = chromeStyle }
+    ].forEach { $0.overrideUserInterfaceStyle = themeStyle }
 
-    // Mask: forced system material + systemBackground plate (not wallpaper/bubbles).
+    // Double-pass blur: thick base + chrome boost (one style alone is too soft).
     headerMaskBlurView.effect =
-      UIBlurEffect(style: isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight)
+      UIBlurEffect(style: themeDark ? .systemThickMaterialDark : .systemThickMaterialLight)
+    headerMaskBlurBoostView.effect =
+      UIBlurEffect(style: themeDark ? .systemChromeMaterialDark : .systemChromeMaterialLight)
     headerMaskOverlayView.backgroundColor =
-      headerMaskSystemColor(isDark: isDark).withAlphaComponent(isDark ? 0.78 : 0.72)
+      themeDark
+      ? UIColor.black.withAlphaComponent(0.88)
+      : headerMaskWashColor(isDark: false).withAlphaComponent(0.56)
   }
 
   private func refreshHeaderGlass() {
     applyHeaderChromeSystemStyle()
-    let isDark = headerChromeIsDark
+    let isDark = headerMaskIsDark
+
+    // Always show custom soft header mask (replaces system top edge API).
+    headerMaskView.isHidden = false
+    profileHeaderMaskView.isHidden = true
 
     if #available(iOS 26.0, *) {
-      // Soft native scroll-edge + soft system-tint fade band. Band tints from system
-      // light/dark only so list element colors cannot shift the mask.
-      headerMaskView.isHidden = false
-      profileHeaderMaskView.isHidden = true
-
-      let glassTint = headerGlassSystemTint(isDark: isDark)
-
       func makeGlassEffect() -> UIGlassEffect {
         let effect = UIGlassEffect(style: .regular)
         effect.isInteractive = true
-        // Required: without tintColor, glass samples whatever is behind (bubbles/images).
-        effect.tintColor = glassTint
+        // No black/white plate tint — clear glass so chips don’t read as hard black.
+        effect.tintColor = .clear
         return effect
       }
 
@@ -3131,17 +3170,16 @@ public final class ChatMainView: UIView,
       profileMenuGlassView.effect = makeGlassEffect()
 
       let collection = chatListView.collectionView
-      collection.topEdgeEffect.isHidden = false
-      collection.topEdgeEffect.style = .soft
+      // Custom header mask owns the top fade — hide system edge API there.
+      collection.topEdgeEffect.isHidden = true
       collection.bottomEdgeEffect.isHidden = false
       collection.bottomEdgeEffect.style = .soft
 
-      profileScrollView.topEdgeEffect.isHidden = false
-      profileScrollView.topEdgeEffect.style = .soft
+      profileScrollView.topEdgeEffect.isHidden = true
       profileScrollView.bottomEdgeEffect.isHidden = false
       profileScrollView.bottomEdgeEffect.style = .soft
     } else {
-      // Forced Dark/Light materials = system chrome only, not adaptive content blur tint.
+      // Theme dark/light materials (chat appearance, not system-only).
       let material: UIBlurEffect.Style =
         isDark ? .systemMaterialDark : .systemMaterialLight
       backGlassView.effect = UIBlurEffect(style: material)
@@ -3178,7 +3216,11 @@ public final class ChatMainView: UIView,
   }
 
   private func layoutChrome() {
-    let safeTop = window?.safeAreaInsets.top ?? safeAreaInsets.top
+    // A Home mini-preview is already positioned inside the screen safe area.
+    // Reusing the window inset here pushes its centered header down a second time.
+    let safeTop: CGFloat = (previewHeaderCenterOnly || previewHeaderCompactLeading)
+      ? 0.0
+      : (window?.safeAreaInsets.top ?? safeAreaInsets.top)
     let headerHeight = safeTop + 60.0
     let contentY = safeTop + 8.0
     let headerContentWidth = max(0.0, bounds.width - 24.0)
@@ -3190,6 +3232,7 @@ public final class ChatMainView: UIView,
       headerContainer.frame = .zero
       headerMaskView.frame = .zero
       headerMaskBlurView.frame = .zero
+      headerMaskBlurBoostView.frame = .zero
       headerMaskOverlayView.frame = .zero
       headerMaskGradientLayer.frame = .zero
       headerContentView.frame = .zero
@@ -3209,17 +3252,23 @@ public final class ChatMainView: UIView,
       applyHeaderSearchPresentation()
     } else {
       headerContainer.frame = CGRect(x: 0, y: 0, width: bounds.width, height: headerHeight)
-      headerMaskView.frame = headerContainer.bounds
+      // Soft fade band extends below the chip row so blur eases out (not a hard edge).
+      let maskFadeExtra: CGFloat = 44.0
+      let maskHeight = headerHeight + maskFadeExtra
+      headerMaskView.frame = CGRect(x: 0, y: 0, width: bounds.width, height: maskHeight)
       headerMaskBlurView.frame = headerMaskView.bounds
-      headerMaskOverlayView.frame = headerMaskBlurView.bounds
+      headerMaskBlurBoostView.frame = headerMaskView.bounds
+      // Sibling on top of blur stack (not inside contentView) so black tint is pure.
+      headerMaskOverlayView.frame = headerMaskView.bounds
       headerMaskGradientLayer.frame = headerMaskView.bounds
+      headerMaskView.bringSubviewToFront(headerMaskOverlayView)
       headerContainer.bringSubviewToFront(headerContentView)
 
       headerContentView.frame = CGRect(
         x: 12.0, y: contentY, width: max(0.0, bounds.width - 24.0), height: 44.0)
 
       let backWidth: CGFloat
-      if previewHeaderCenterOnly && !savedSearchExpanded {
+      if (previewHeaderCenterOnly || previewHeaderCompactLeading) && !savedSearchExpanded {
         backWidth = 0.0
       } else if selectionModeActive {
         let size = backButton.sizeThatFits(CGSize(width: .greatestFiniteMagnitude, height: 44.0))
@@ -3238,7 +3287,19 @@ public final class ChatMainView: UIView,
         chatSubtitleLabel.intrinsicContentSize.width + subtitleDotWidth
       )
         
-      if previewHeaderCenterOnly && !savedSearchExpanded {
+      if previewHeaderCompactLeading && !savedSearchExpanded {
+        menuGlassView.frame = .zero
+        savedSearchCancelGlassView.frame = .zero
+        rightActionsGlassView.frame = .zero
+        avatarGlassView.frame = CGRect(x: 0, y: 0, width: 44, height: 44)
+        let titleX = avatarGlassView.frame.maxX + 10
+        titleGlassView.frame = CGRect(
+          x: titleX,
+          y: 0,
+          width: max(0, headerContentView.bounds.width - titleX),
+          height: 44
+        )
+      } else if previewHeaderCenterOnly && !savedSearchExpanded {
         avatarGlassView.frame = .zero
         menuGlassView.frame = .zero
         savedSearchCancelGlassView.frame = .zero
@@ -3437,6 +3498,21 @@ public final class ChatMainView: UIView,
     let searchActive = savedSearchExpanded && currentPage == .chat
     let controlsAlpha: CGFloat = searchActive ? 0.0 : 1.0
 
+    if previewHeaderCompactLeading && !searchActive {
+      backGlassView.alpha = 0.0
+      menuGlassView.alpha = 0.0
+      avatarGlassView.alpha = 1.0
+      savedSearchCancelGlassView.alpha = 0.0
+      savedSearchField.alpha = 0.0
+      savedSearchField.isUserInteractionEnabled = false
+      savedSearchCancelButton.isUserInteractionEnabled = false
+      savedSearchCancelGlassView.isUserInteractionEnabled = false
+      titleGlassView.alpha = 1.0
+      chatHeaderStack.alpha = 1.0
+      chatHeaderStack.transform = .identity
+      return
+    }
+
     if previewHeaderCenterOnly && !searchActive {
       backGlassView.alpha = 0.0
       menuGlassView.alpha = 0.0
@@ -3525,7 +3601,9 @@ public final class ChatMainView: UIView,
   }
 
   private func layoutPages() {
-    let safeTop = window?.safeAreaInsets.top ?? safeAreaInsets.top
+    let safeTop: CGFloat = (previewHeaderCenterOnly || previewHeaderCompactLeading)
+      ? 0.0
+      : (window?.safeAreaInsets.top ?? safeAreaInsets.top)
     let headerHeight =
       externalNavigationHeaderEnabled && !savedSearchExpanded
       ? 0.0
@@ -3802,7 +3880,7 @@ public final class ChatMainView: UIView,
     menuGlassView.contentView.backgroundColor = .clear
     savedSearchCancelGlassView.contentView.backgroundColor = .clear
     rightActionsGlassView.contentView.backgroundColor = .clear
-    // Header glass + mask follow system light/dark (not appearance.isDark / wallpaper).
+    // Glass chips: system style. Mask: chat-theme darkness + thick blur + pure black/tint.
     refreshHeaderGlass()
 
     profileHeaderContainer.backgroundColor = .clear
@@ -4052,8 +4130,10 @@ public final class ChatMainView: UIView,
       setSubtitleDotPulsing(false)
     } else {
       chatConnectingSpinner.stopAnimating()
-      // Keep the slot: do not collapse with isHidden (that shifts text left).
-      chatConnectingSpinner.isHidden = false
+      // Collapse the slot: an invisible spinner kept every subtitle indented
+      // 15pt off the title's leading edge. The small text shift when
+      // Connecting chrome appears is the lesser evil.
+      chatConnectingSpinner.isHidden = true
       chatConnectingSpinner.alpha = 0
       chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
     }
@@ -4670,6 +4750,23 @@ public final class ChatMainView: UIView,
       pGradient?.startPoint = CGPoint(x: 0.5, y: 0)
       pGradient?.endPoint = CGPoint(x: 0.5, y: 1)
       profileAvatarView.backgroundColor = .clear
+
+      // Header avatar needs the same teal bookmark tile. The normal saved
+      // header hides the leading avatar so this was never inserted — but the
+      // compact-leading preview header DOES show it, and rendered an empty
+      // glass circle without it.
+      var hGradient =
+        avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "savedMessagesGradient" })
+        as? CAGradientLayer
+      if hGradient == nil {
+        hGradient = CAGradientLayer()
+        hGradient?.name = "savedMessagesGradient"
+        avatarGlassView.contentView.layer.insertSublayer(hGradient!, at: 0)
+      }
+      hGradient?.colors = [gradientStart.cgColor, gradientEnd.cgColor]
+      hGradient?.startPoint = CGPoint(x: 0.5, y: 0)
+      hGradient?.endPoint = CGPoint(x: 0.5, y: 1)
+      hGradient?.frame = avatarGlassView.contentView.bounds
       return
     }
 

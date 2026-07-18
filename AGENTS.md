@@ -81,6 +81,9 @@ npm publish, ...) are blocked in every remote mode, even `full`.
 or start a large implementation. Fable is a second-opinion advisor only — it does
 not edit code; you still implement and verify.
 
+**If you ARE Fable** (model id `claude-fable-5` / Claude Fable 5): skip this
+section entirely — do not call `advisor`/`ask_fable`; you'd be asking yourself.
+
 ### When to ask
 
 Treat a task as complex when any of these apply:
@@ -185,6 +188,24 @@ Fable billing scales with **prompt size + reply size**. Default package budget i
 
 Claude in this repo may see the same tool as `mcp__vibeask__ask_fable` (or the
 built-in `advisor` tool). Same contract: concrete `question` + lean `context`.
+
+## Complex task? Diagnose yourself, then dispatch worker CLIs
+
+For multi-slice work: first diagnose and decide exactly what changes where, then
+dispatch other agent CLIs as background subprocesses to execute in parallel instead
+of patching every file yourself. Full operating guide (loop, board protocol, routing,
+diff-review rules): `agent-bridge/instructions/team-lead.md`.
+
+- Board first: `.vibe/team/<run>-board.md` with frozen contract names + one owner per
+  file (disjoint slices); then a self-contained brief per worker.
+- Worker invocations (verified 2026-07-18):
+  - codex: `codex exec --json -c sandbox_mode="workspace-write" -c approval_policy="never" -c model_reasoning_effort="<low|medium|high>" --cd <repo> --skip-git-repo-check "<prompt>"`
+  - grok: `~/.grok/bin/grok --prompt-file <brief> --always-approve --max-turns 80 --output-format plain --cwd <repo>` (headless drops writes under acceptEdits; always pass --max-turns)
+  - agy: `~/.local/bin/agy -p "Read and execute the brief at <path>" --mode accept-edits --dangerously-skip-permissions --print-timeout 30m` — UI/low-risk only; never auth/security/payments/migrations; always diff+build verify its work.
+- Review worker DIFFS against the pre-dispatch baseline — never trust handoff text.
+  Workers never commit, push, build, or launch; the dispatcher does ONE verify pass.
+- Cleanup when settled: move durable learnings into real docs, then delete the run's
+  `.vibe/team/<run>*` files.
 
 ## Prefer commands that run without approval
 

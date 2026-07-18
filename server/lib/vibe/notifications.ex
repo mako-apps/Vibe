@@ -4,6 +4,8 @@ defmodule Vibe.Notifications do
   require Logger
 
   alias Vibe.Accounts
+  alias Vibe.Repo
+  alias Vibe.Schemas.NotificationPreference
 
   @expo_push_url "https://exp.host/--/api/v2/push/send"
   @expo_receipts_url "https://exp.host/--/api/v2/push/getReceipts"
@@ -13,13 +15,49 @@ defmodule Vibe.Notifications do
   @fcm_legacy_url "https://fcm.googleapis.com/fcm/send"
   @apns_voip_jwt_cache_ttl_secs 50 * 60
 
-  def send_incoming_call_push(to_user_id, payload) when is_binary(to_user_id) and is_map(payload) do
+  def get_notification_preferences(user_id) do
+    case Repo.get_by(NotificationPreference, user_id: user_id) do
+      nil -> NotificationPreference.default_preferences()
+      preference -> NotificationPreference.normalize(preference.preferences)
+    end
+  end
+
+  def update_notification_preferences(user_id, updates) do
+    with {:ok, updates} <- NotificationPreference.validate_update(updates) do
+      preferences = deep_merge(get_notification_preferences(user_id), updates)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      %NotificationPreference{}
+      |> NotificationPreference.changeset(%{user_id: user_id, preferences: preferences})
+      |> Repo.insert(
+        on_conflict: [set: [preferences: preferences, updated_at: now]],
+        conflict_target: [:user_id],
+        returning: true
+      )
+      |> case do
+        {:ok, preference} -> {:ok, NotificationPreference.normalize(preference.preferences)}
+        {:error, changeset} -> {:error, changeset}
+      end
+    end
+  end
+
+  def notification_enabled?(user_id, category) do
+    get_notification_preferences(user_id)
+    |> Map.fetch!(category)
+    |> Map.fetch!("enabled")
+  end
+
+  def send_incoming_call_push(to_user_id, payload)
+      when is_binary(to_user_id) and is_map(payload) do
     with to_user when not is_nil(to_user) <- Accounts.get_user(to_user_id),
          push_targets when is_map(push_targets) <- normalized_push_targets(to_user.push_token) do
       call_type = normalize_call_type(payload["callType"] || payload["call_type"])
       call_id = payload["callId"] || payload["call_id"]
       from_user_id = payload["fromUserId"] || payload["from_user_id"]
-      caller_name = payload["fromUserName"] || payload["from_user_name"] || from_user_id || "Unknown"
+
+      caller_name =
+        payload["fromUserName"] || payload["from_user_name"] || from_user_id || "Unknown"
+
       caller_image =
         normalize_push_image(
           payload["fromUserImage"] || payload["from_user_image"],
@@ -87,20 +125,35 @@ defmodule Vibe.Notifications do
         )
 
       case {expo_result, voip_result, fcm_result} do
-        {{:ok, :expo}, _, _} -> :ok
-        {_, {:ok, :apns_voip}, _} -> :ok
-        {_, _, {:ok, :fcm}} -> :ok
+        {{:ok, :expo}, _, _} ->
+          :ok
+
+        {_, {:ok, :apns_voip}, _} ->
+          :ok
+
+        {_, _, {:ok, :fcm}} ->
+          :ok
+
         {:noop, :noop, :noop} ->
-          Logger.info("[Notifications] Incoming call push skipped: no usable Expo/VoIP/FCM token to_user=#{to_user_id}")
+          Logger.info(
+            "[Notifications] Incoming call push skipped: no usable Expo/VoIP/FCM token to_user=#{to_user_id}"
+          )
+
           :noop
 
         {expo, voip, fcm} ->
-          Logger.warning("[Notifications] Incoming call push delivery failed to_user=#{to_user_id} expo=#{inspect(expo)} voip=#{inspect(voip)} fcm=#{inspect(fcm)}")
+          Logger.warning(
+            "[Notifications] Incoming call push delivery failed to_user=#{to_user_id} expo=#{inspect(expo)} voip=#{inspect(voip)} fcm=#{inspect(fcm)}"
+          )
+
           :error
       end
     else
       _ ->
-        Logger.info("[Notifications] Incoming call push skipped: missing target user/push token to_user=#{to_user_id}")
+        Logger.info(
+          "[Notifications] Incoming call push skipped: missing target user/push token to_user=#{to_user_id}"
+        )
+
         :noop
     end
   end
@@ -108,7 +161,8 @@ defmodule Vibe.Notifications do
   def send_incoming_call_push(_to_user_id, _payload), do: :noop
 
   def send_message_push(to_user_id, payload) when is_binary(to_user_id) and is_map(payload) do
-    with to_user when not is_nil(to_user) <- Accounts.get_user(to_user_id),
+    with true <- notification_enabled?(to_user_id, notification_category(payload)),
+         to_user when not is_nil(to_user) <- Accounts.get_user(to_user_id),
          push_targets when is_map(push_targets) <- normalized_push_targets(to_user.push_token),
          push_token when is_binary(push_token) <- push_targets.expo,
          true <- push_token != "" do
@@ -120,15 +174,17 @@ defmodule Vibe.Notifications do
       message_type_normalized = message_type |> to_string() |> String.downcase()
       message_body = resolve_message_body(payload, message_type)
       sender_image = normalize_push_image(sender && sender.profile_image, from_user_id)
+
       media_preview_image =
         if message_type_normalized in ["image", "video", "gif"] do
           resolve_push_media_image(payload)
         else
           nil
         end
+
       mutable_content_enabled =
-        (is_binary(sender_image) and sender_image != "")
-        or (is_binary(media_preview_image) and media_preview_image != "")
+        (is_binary(sender_image) and sender_image != "") or
+          (is_binary(media_preview_image) and media_preview_image != "")
 
       base_data = %{
         type: "new_message",
@@ -205,29 +261,73 @@ defmodule Vibe.Notifications do
           :error
 
         {:error, reason} ->
-          Logger.warning("[Notifications] Message push request failed to_user=#{to_user_id} reason=#{inspect(reason)}")
+          Logger.warning(
+            "[Notifications] Message push request failed to_user=#{to_user_id} reason=#{inspect(reason)}"
+          )
+
           :error
       end
     else
       _ ->
-        Logger.info("[Notifications] Message push skipped: missing target user/push token to_user=#{to_user_id}")
+        Logger.info(
+          "[Notifications] Message push skipped: missing target user/push token to_user=#{to_user_id}"
+        )
+
         :noop
     end
   end
 
   def send_message_push(_to_user_id, _payload), do: :noop
 
-  defp send_expo_incoming_call_push(push_token, _to_user_id, _caller_name, _call_type, _caller_image, _data)
+  defp notification_category(payload) do
+    case payload["notificationCategory"] || payload["notification_category"] ||
+           payload["chatType"] || payload["chat_type"] do
+      category when category in ["group", "group_chat", "group_chats"] -> "groupChats"
+      category when category in ["channel", "channels"] -> "channels"
+      category when category in ["story", "stories"] -> "stories"
+      category when category in ["reaction", "reactions"] -> "reactions"
+      _ -> "privateChats"
+    end
+  end
+
+  defp deep_merge(left, right) do
+    Map.merge(left, right, fn _key, current, update ->
+      if is_map(current) and is_map(update), do: deep_merge(current, update), else: update
+    end)
+  end
+
+  defp send_expo_incoming_call_push(
+         push_token,
+         _to_user_id,
+         _caller_name,
+         _call_type,
+         _caller_image,
+         _data
+       )
        when not is_binary(push_token) do
     :noop
   end
 
-  defp send_expo_incoming_call_push(push_token, _to_user_id, _caller_name, _call_type, _caller_image, _data)
+  defp send_expo_incoming_call_push(
+         push_token,
+         _to_user_id,
+         _caller_name,
+         _call_type,
+         _caller_image,
+         _data
+       )
        when is_binary(push_token) and push_token == "" do
     :noop
   end
 
-  defp send_expo_incoming_call_push(push_token, to_user_id, caller_name, call_type, _caller_image, data) do
+  defp send_expo_incoming_call_push(
+         push_token,
+         to_user_id,
+         caller_name,
+         call_type,
+         _caller_image,
+         data
+       ) do
     message = %{
       to: push_token,
       sound: "default",
@@ -258,7 +358,10 @@ defmodule Vibe.Notifications do
         :error
 
       {:error, reason} ->
-        Logger.warning("[Notifications] Expo push request failed to_user=#{to_user_id} reason=#{inspect(reason)}")
+        Logger.warning(
+          "[Notifications] Expo push request failed to_user=#{to_user_id} reason=#{inspect(reason)}"
+        )
+
         :error
     end
   end
@@ -276,7 +379,10 @@ defmodule Vibe.Notifications do
   defp send_fcm_incoming_call_push(fcm_token, to_user_id, caller_name, call_type, data) do
     case fcm_server_key() do
       nil ->
-        Logger.info("[Notifications] FCM call push skipped: missing FCM server key to_user=#{to_user_id}")
+        Logger.info(
+          "[Notifications] FCM call push skipped: missing FCM server key to_user=#{to_user_id}"
+        )
+
         :noop
 
       server_key ->
@@ -306,17 +412,24 @@ defmodule Vibe.Notifications do
 
         case Finch.request(request, Vibe.Finch, receive_timeout: 7_000) do
           {:ok, %Finch.Response{status: status, body: body}} when status in 200..299 ->
-            Logger.info("[Notifications] FCM call push accepted to_user=#{to_user_id} body=#{String.slice(body || "", 0, 240)}")
+            Logger.info(
+              "[Notifications] FCM call push accepted to_user=#{to_user_id} body=#{String.slice(body || "", 0, 240)}"
+            )
+
             {:ok, :fcm}
 
           {:ok, %Finch.Response{status: status, body: body}} ->
             Logger.warning(
               "[Notifications] FCM call push failed status=#{status} to_user=#{to_user_id} body=#{String.slice(body || "", 0, 240)}"
             )
+
             :error
 
           {:error, reason} ->
-            Logger.warning("[Notifications] FCM call push request failed to_user=#{to_user_id} reason=#{inspect(reason)}")
+            Logger.warning(
+              "[Notifications] FCM call push request failed to_user=#{to_user_id} reason=#{inspect(reason)}"
+            )
+
             :error
         end
     end
@@ -345,16 +458,17 @@ defmodule Vibe.Notifications do
          {:ok, body} <- apns_voip_payload(data, caller_name, call_type) do
       url = "#{config.base_url}/3/device/#{URI.encode(voip_token)}"
 
-      headers = [
-        {"content-type", "application/json"},
-        {"authorization", "bearer " <> jwt},
-        {"apns-push-type", "voip"},
-        {"apns-priority", "10"},
-        {"apns-topic", config.topic},
-        {"apns-expiration", "0"},
-        {"apns-collapse-id", Map.get(data, :callId, "") |> to_string()}
-      ]
-      |> Enum.reject(fn {_k, v} -> v in [nil, ""] end)
+      headers =
+        [
+          {"content-type", "application/json"},
+          {"authorization", "bearer " <> jwt},
+          {"apns-push-type", "voip"},
+          {"apns-priority", "10"},
+          {"apns-topic", config.topic},
+          {"apns-expiration", "0"},
+          {"apns-collapse-id", Map.get(data, :callId, "") |> to_string()}
+        ]
+        |> Enum.reject(fn {_k, v} -> v in [nil, ""] end)
 
       request = Finch.build(:post, url, headers, body)
 
@@ -363,18 +477,21 @@ defmodule Vibe.Notifications do
           Logger.info(
             "[Notifications] APNs VoIP push accepted to_user=#{to_user_id} call_type=#{call_type} topic=#{config.topic} base_url=#{config.base_url}"
           )
+
           {:ok, :apns_voip}
 
         {:ok, %Finch.Response{status: status, body: response_body}} ->
           Logger.warning(
             "[Notifications] APNs VoIP push failed status=#{status} to_user=#{to_user_id} topic=#{config.topic} base_url=#{config.base_url} body=#{String.slice(response_body || "", 0, 240)}"
           )
+
           :error
 
         {:error, reason} ->
           Logger.warning(
             "[Notifications] APNs VoIP request failed to_user=#{to_user_id} topic=#{config.topic} base_url=#{config.base_url} reason=#{inspect(reason)}"
           )
+
           :error
       end
     else
@@ -382,10 +499,14 @@ defmodule Vibe.Notifications do
         Logger.info(
           "[Notifications] APNs VoIP push skipped: missing APNs VoIP config #{inspect(apns_voip_config_presence())}"
         )
+
         :noop
 
       {:error, reason} ->
-        Logger.warning("[Notifications] APNs VoIP push setup failed to_user=#{to_user_id} reason=#{inspect(reason)}")
+        Logger.warning(
+          "[Notifications] APNs VoIP push setup failed to_user=#{to_user_id} reason=#{inspect(reason)}"
+        )
+
         :error
     end
   end
@@ -407,7 +528,10 @@ defmodule Vibe.Notifications do
               expo: normalize_token_value(value["expo"] || value["expoPushToken"]),
               fcm: normalize_token_value(value["fcm"] || value["fcmPushToken"]),
               apns: normalize_token_value(value["apns"] || value["apnsToken"]),
-              apns_voip: normalize_token_value(value["apns_voip"] || value["voip"] || value["voipPushToken"])
+              apns_voip:
+                normalize_token_value(
+                  value["apns_voip"] || value["voip"] || value["voipPushToken"]
+                )
             }
 
           _ ->
@@ -425,6 +549,7 @@ defmodule Vibe.Notifications do
       nil ->
         System.get_env("FIREBASE_SERVER_KEY")
         |> normalize_token_value()
+
       value ->
         value
     end
@@ -432,6 +557,7 @@ defmodule Vibe.Notifications do
       nil ->
         System.get_env("FIREBASE_CLOUD_MESSAGING_SERVER_KEY")
         |> normalize_token_value()
+
       value ->
         value
     end
@@ -501,10 +627,11 @@ defmodule Vibe.Notifications do
     %{
       team_id: is_binary(normalize_token_value(System.get_env("APPLE_VOIP_TEAM_ID"))),
       key_id: is_binary(normalize_token_value(System.get_env("APPLE_VOIP_KEY_ID"))),
-      private_key: is_binary(normalize_apns_private_key(System.get_env("APPLE_VOIP_PRIVATE_KEY"))),
+      private_key:
+        is_binary(normalize_apns_private_key(System.get_env("APPLE_VOIP_PRIVATE_KEY"))),
       topic:
         is_binary(
-          (System.get_env("APPLE_VOIP_TOPIC") |> normalize_token_value()) ||
+          System.get_env("APPLE_VOIP_TOPIC") |> normalize_token_value() ||
             case System.get_env("APPLE_BUNDLE_ID") |> normalize_token_value() do
               nil -> nil
               bundle_id -> bundle_id <> ".voip"
@@ -517,12 +644,13 @@ defmodule Vibe.Notifications do
   defp apns_voip_config do
     team_id = System.get_env("APPLE_VOIP_TEAM_ID") |> normalize_token_value()
     key_id = System.get_env("APPLE_VOIP_KEY_ID") |> normalize_token_value()
+
     private_key =
       System.get_env("APPLE_VOIP_PRIVATE_KEY")
       |> normalize_apns_private_key()
 
     topic =
-      (System.get_env("APPLE_VOIP_TOPIC") |> normalize_token_value()) ||
+      System.get_env("APPLE_VOIP_TOPIC") |> normalize_token_value() ||
         case System.get_env("APPLE_BUNDLE_ID") |> normalize_token_value() do
           nil -> nil
           bundle_id -> bundle_id <> ".voip"
@@ -537,7 +665,14 @@ defmodule Vibe.Notifications do
       end
 
     if is_binary(team_id) and is_binary(key_id) and is_binary(private_key) and is_binary(topic) do
-      {:ok, %{team_id: team_id, key_id: key_id, private_key: private_key, topic: topic, base_url: base_url}}
+      {:ok,
+       %{
+         team_id: team_id,
+         key_id: key_id,
+         private_key: private_key,
+         topic: topic,
+         base_url: base_url
+       }}
     else
       {:error, :missing_config}
     end
@@ -562,7 +697,8 @@ defmodule Vibe.Notifications do
     cache_key = apns_voip_jwt_cache_key(config)
 
     case :persistent_term.get(cache_key, nil) do
-      %{jwt: jwt, iat: iat} when is_binary(jwt) and is_integer(iat) and now - iat < @apns_voip_jwt_cache_ttl_secs ->
+      %{jwt: jwt, iat: iat}
+      when is_binary(jwt) and is_integer(iat) and now - iat < @apns_voip_jwt_cache_ttl_secs ->
         {:ok, jwt}
 
       _ ->
@@ -583,7 +719,8 @@ defmodule Vibe.Notifications do
   end
 
   defp apns_voip_jwt_cache_key(config) do
-    {:vibe_notifications_apns_voip_jwt, config.team_id, config.key_id, :erlang.phash2(config.private_key)}
+    {:vibe_notifications_apns_voip_jwt, config.team_id, config.key_id,
+     :erlang.phash2(config.private_key)}
   end
 
   defp decode_apns_private_key(pem) when is_binary(pem) do
@@ -603,6 +740,7 @@ defmodule Vibe.Notifications do
   defp sign_es256_jwt(signing_input, private_key) do
     try do
       der_sig = :public_key.sign(signing_input, :sha256, private_key)
+
       case :public_key.der_decode(:"ECDSA-Sig-Value", der_sig) do
         {:"ECDSA-Sig-Value", r, s} when is_integer(r) and is_integer(s) ->
           {:ok, <<int_to_fixed_32(r)::binary, int_to_fixed_32(s)::binary>>}
@@ -620,6 +758,7 @@ defmodule Vibe.Notifications do
 
   defp int_to_fixed_32(int) when is_integer(int) and int >= 0 do
     bin = :binary.encode_unsigned(int)
+
     case byte_size(bin) do
       32 -> bin
       size when size < 32 -> :binary.copy(<<0>>, 32 - size) <> bin
@@ -629,6 +768,7 @@ defmodule Vibe.Notifications do
 
   defp apns_voip_payload(data, caller_name, call_type) when is_map(data) do
     aps = %{"content-available" => 1}
+
     payload =
       data
       |> Map.put_new(:event, "call-start")
@@ -680,11 +820,11 @@ defmodule Vibe.Notifications do
   defp resolve_push_media_image(payload) when is_map(payload) do
     candidate =
       payload["media_image"] ||
-      payload["mediaImage"] ||
-      payload["media_url"] ||
-      payload["mediaUrl"] ||
-      map_value(payload["richContent"], "image") ||
-      map_value(payload["_richContent"], "image")
+        payload["mediaImage"] ||
+        payload["media_url"] ||
+        payload["mediaUrl"] ||
+        map_value(payload["richContent"], "image") ||
+        map_value(payload["_richContent"], "image")
 
     case candidate do
       value when is_binary(value) ->
@@ -743,7 +883,10 @@ defmodule Vibe.Notifications do
           Logger.info("[Notifications] push image using remote URL from_user=#{from_user_id}")
           trimmed
         else
-          Logger.warning("[Notifications] push image URL too long from_user=#{from_user_id} length=#{String.length(trimmed)}")
+          Logger.warning(
+            "[Notifications] push image URL too long from_user=#{from_user_id} length=#{String.length(trimmed)}"
+          )
+
           nil
         end
 
@@ -754,7 +897,10 @@ defmodule Vibe.Notifications do
   end
 
   defp normalize_push_image(_value, from_user_id) do
-    Logger.info("[Notifications] push image non-binary value, using proxy URL from_user=#{from_user_id}")
+    Logger.info(
+      "[Notifications] push image non-binary value, using proxy URL from_user=#{from_user_id}"
+    )
+
     avatar_proxy_url(from_user_id)
   end
 

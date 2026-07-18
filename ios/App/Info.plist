@@ -20,12 +20,21 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<!-- Giphy GIF panel (overridable via process env GIPHY_API_KEY) -->
+	<key>GIPHY_API_KEY</key>
+	<string>sXpGFDGZs0Dv1mmNFvYaGUvYwKX0PWIh</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_vibegram-bridge._tcp</string>
+	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Use the camera for video calls and to capture story photos and videos.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Use Face ID to unlock privacy controls and reveal protected account data.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Vibe connects directly to the Vibe bridge on your Mac over your local network for faster, private agent updates when your phone and Mac share Wi‑Fi.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Use the microphone for calls, story videos, and voice messages.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

@@ -1,14 +1,15 @@
 import UIKit
 
 let listBottomThreshold: CGFloat = 88.0
-let messageHorizontalInset: CGFloat = 10.0
+let messageHorizontalInset: CGFloat = 8.0
 let messageSelectionLeadingInset: CGFloat = 38.0
 let sectionTopInset: CGFloat = 10.0
 let sectionBottomInset: CGFloat = 14.0
-let bubbleSideMargin: CGFloat = 4.0
+let bubbleSideMargin: CGFloat = 2.0
 let bubbleHorizontalPadding: CGFloat = 12.0
 let bubbleTopPadding: CGFloat = 7.0
-let bubbleBottomPadding: CGFloat = 7.0
+// Slightly more bottom pad so meta/time clear the lower Telegram-aligned tail join.
+let bubbleBottomPadding: CGFloat = 8.0
 let bubbleMetaTopSpacing: CGFloat = 2.0
 let bubbleMetaHeight: CGFloat = 14.0
 let bubbleMinWidth: CGFloat = 26.0
@@ -25,13 +26,26 @@ let agentTurnVerticalPadding: CGFloat = bubbleTopPadding
 // message. Rich content (diff cards / step lists) scrolls/wraps inside this width rather
 // than widening the whole bubble past its neighbours.
 let agentTurnMaxWidthFactor: CGFloat = bubbleMaxWidthFactor
-let dayPillHorizontalPadding: CGFloat = 11.0
-let dayPillVerticalPadding: CGFloat = 4.0
+// Telegram-style date chip: a clean solid capsule — slightly wider and shorter than the
+// old bordered pill. Shared by the in-list day separators AND the sticky header pill so
+// the stick/hand-off between them reads as one element.
+let dayPillHorizontalPadding: CGFloat = 14.0
+let dayPillVerticalPadding: CGFloat = 3.5
 // One shared tall-content rule for BOTH user and agent bubbles: content taller than
-// the trigger collapses to the capped height and gains a tappable "Show more" /
-// "Show less" bar under the text. The trigger sits well above the cap so borderline
-// content never gets a bar that saves almost nothing (no collapse-for-20pt churn).
+// the trigger collapses to the capped height and gains a glass expand/collapse chip
+// OUTSIDE the plate (list overlay): them = top-trailing outside, me = top-leading
+// outside. Collapsed content keeps full text and soft-fades at the bottom (no hard
+// clip). Expand/collapse is height-only in Y — no content fade. The trigger sits well
+// above the cap so borderline content never gets a control that saves almost nothing.
 let tallBubbleCollapseTriggerHeight: CGFloat = 560.0
 let tallBubbleCollapsedContentHeight: CGFloat = 420.0
-let tallBubbleToggleHeight: CGFloat = 28.0
-let tallBubbleToggleSpacing: CGFloat = 4.0
+/// Gap between the bubble's outer side edge and the glass toggle chip.
+let tallBubbleToggleSpacing: CGFloat = 6.0
+/// Soft fade band at the bottom of collapsed tall content ("there's more").
+let tallBubbleCollapseFadeHeight: CGFloat = 56.0
+/// Visible glass circle diameter (icon sits inside).
+let tallBubbleGlassToggleSize: CGFloat = 34.0
+/// Hit target for the outer glass expand/collapse control.
+let tallBubbleChevronHitSize: CGFloat = 40.0
+/// Cell height reserved for the outer glass chip (overlay sits outside the plate).
+let tallBubbleGlassOuterReserve: CGFloat = 0.0

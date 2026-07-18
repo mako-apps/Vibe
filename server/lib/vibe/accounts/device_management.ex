@@ -51,6 +51,14 @@ defmodule Vibe.Accounts.DeviceManagement do
     |> Repo.all()
   end
 
+  def list_sessions(user_id) do
+    DeviceSession
+    |> where([s], s.user_id == ^user_id and is_nil(s.revoked_at))
+    |> order_by([s], desc: s.last_used_at, desc: s.inserted_at)
+    |> preload(:account_device)
+    |> Repo.all()
+  end
+
   @doc "Revokes a device and cascades revocation to its active sessions."
   def revoke_device(user_id, device_id) do
     with %AccountDevice{} = device <- Repo.get_by(AccountDevice, id: device_id, user_id: user_id) do
@@ -71,6 +79,14 @@ defmodule Vibe.Accounts.DeviceManagement do
       end)
     else
       nil -> {:error, :not_found}
+    end
+  end
+
+  def revoke_device(user_id, device_id, current_device_identifier) do
+    case Repo.get_by(AccountDevice, id: device_id, user_id: user_id) do
+      nil -> {:error, :not_found}
+      %{device_identifier: ^current_device_identifier} -> {:error, :current_session}
+      _device -> revoke_device(user_id, device_id)
     end
   end
 
@@ -140,6 +156,14 @@ defmodule Vibe.Accounts.DeviceManagement do
         session
         |> DeviceSession.changeset(%{revoked_at: DateTime.utc_now() |> DateTime.truncate(:second)})
         |> Repo.update()
+    end
+  end
+
+  def revoke_session(user_id, session_id, current_device_identifier) do
+    case Repo.get_by(DeviceSession, id: session_id, user_id: user_id) |> Repo.preload(:account_device) do
+      nil -> {:error, :not_found}
+      %{account_device: %{device_identifier: ^current_device_identifier}} -> {:error, :current_session}
+      session -> revoke_session(user_id, session.id)
     end
   end
 

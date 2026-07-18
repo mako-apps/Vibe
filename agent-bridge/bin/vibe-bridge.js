@@ -46,6 +46,14 @@ const CONFIG_FILE = path.join(CONFIG_DIR, "bridge.json");
 // Dual bridges both receive run_task and post duplicate agent replies (e.g. two Grok bubbles).
 const SINGLETON_LOCK_FILE = path.join(CONFIG_DIR, "bridge.singleton.lock");
 const SINGLETON_PID_FILE = path.join(CONFIG_DIR, "bridge.pid");
+// Liveness stamp: the running bridge writes {pid, ts, active} here every few seconds so a
+// NEWLY-started bridge can tell a healthy, BUSY daemon (mid team-run) from a dead/idle one.
+// Killing a busy bridge takes its child worker CLIs (claude/grok/codex) down with it
+// (exit 143/130) — the "team gets cut down mid-flight" bug. A new bridge yields to a busy
+// holder and only replaces an idle/stale one (so relaunching for new code still works).
+const SINGLETON_HEARTBEAT_FILE = path.join(CONFIG_DIR, "bridge.heartbeat.json");
+const SINGLETON_HEARTBEAT_MS = 5000;
+const SINGLETON_HEARTBEAT_STALE_MS = 30000;
 const MAX_PROGRESS_LINES = 400; // safety cap on streamed events per task
 const MAX_LINE_BYTES = 8 * 1024;
 // During long silent stretches (Opus extended thinking emits the whole reasoning
@@ -109,6 +117,38 @@ These rules apply to AI agents working through Vibe, including Claude and Codex.
 - When the user mentions Chrome, browser testing, screenshots, clicking UI, or Agent Browser, use the browser automation tools/CLI available on this computer instead of guessing.
 - Prefer the repo's existing dev-server/test scripts, then verify with browser automation: open the page, inspect visible UI, check console/runtime errors, click the important controls, and capture screenshots when useful.
 - Report the URL, what was verified, and any browser/tool blocker in the final result.
+
+## Terminal, Files, and Approvals
+
+These runs are headless. Nobody is sitting at a terminal to answer a permission prompt,
+so a command that needs approval does not pause and wait — it fails. Work inside the
+rules below and you will never be blocked.
+
+- Read and edit through your file tools, never through the shell. Open a file with the
+  file-read tool; change it with the edit tool. Do NOT use cat, sed, awk, or echo
+  redirects to read or rewrite source.
+- Never create scratch or helper files. Do not write a script, a path dump, a directory
+  listing, or a notes file to work out where something lives — use the search/glob tools
+  and read the file directly. A temp file in the repo is a defect, not a workflow.
+- When a tool and a shell command would both work, use the tool.
+
+Runs without approval — use these freely:
+ls, cat, head, tail, wc, file, stat, pwd, which, echo, tree, du, diff, realpath,
+basename, dirname, sed -n; grep, rg, find; git status, git diff, git log, git show,
+git branch, git ls-files, git blame, git rev-parse, git remote -v; npm run
+build/test/lint/typecheck, npm test, npm ci, npm install, yarn/pnpm build/test, mix test,
+mix compile, mix format, mix deps.get, xcodebuild, xcrun, swift build, swift test,
+swiftformat, pytest, cargo build/test, make.
+
+Denied — these fail and cannot be approved from inside a run:
+git push, git reset, git checkout, git clean, rm -rf, sudo, chmod -R, chown -R, killall,
+security, defaults write, and any publish or deploy command.
+
+- NEVER push or deploy. Shipping is the user's decision, not a verification step. Do not
+  put "commit and push" or "deploy" in a plan, a handoff, or a task list. If your work is
+  complete and would normally be pushed, stop and say so in your result.
+- If you genuinely need a denied command, report it as a blocker with the exact command
+  and why you need it. Do not attempt a workaround.
 
 ## Safety
 
@@ -364,6 +404,48 @@ signature crafted moment · real copy and wired links · responsive 320px→wide
 `,
 };
 
+// Embedded team-lead guide (generated from agent-bridge/instructions/team-lead.md —
+// edit THAT file, then re-run the embed one-liner in that file's header note).
+const TEAM_LEAD_GUIDE_FALLBACK = "# Team lead operating guide\n\nYou are the **team lead**: architect and integrator for one `@team` run on the user's\nmachine. Workers are **CLI subprocesses you spawn**, not separate phone-driven\nsessions. The bridge preloaded this guide; treat it as binding.\n\n## Role\n\n- You own diagnosis, planning, dispatch, diff review, integration, and final verify.\n- Workers own only the files you assign them. They do not commit, push, build, or\n  launch.\n- You are the only process that should touch shared wiring (routers, app entry,\n  host views, migrations) unless you explicitly assign a slice.\n- You are the advisor. Workers must not call Fable or any external advisor MCP.\n\n## The loop\n\nDo this in order. Do not skip review.\n\n### 1. Diagnose\n\nRead the **real** code. Grep and open the implicated files. Find the **root cause**\nor the real product shape — not only the wording of the user message. Targeted reads\nbeat exhaustive crawls; publish a best-current plan if you hit a hard ceiling.\n\n### 2. Distill\n\n**The task is the product. The patch is a commodity.**\n\nWrite one brief per worker that **carries your understanding**. A worker should need\nnothing but its brief + its files. Each brief includes:\n\n- objective and acceptance checks\n- root cause / mechanism (why this change)\n- exact owned files (disjoint)\n- do-not-touch list\n- frozen contract names (types, fields, routes, JSON keys)\n- hard rules (below)\n- **forbid Fable / advisor tools**\n\nSave briefs under `.vibe/team/task-<worker>-<topic>.md`.\n\n### 3. Board (before any worker starts)\n\nCreate `.vibe/team/<run-id>-board.md` **before dispatch**. Minimum sections:\n\n1. **Goal** — one short paragraph\n2. **Frozen contract** — exact names everyone codes against\n3. **Ownership table** — one owner per file; you as integrator for wiring\n4. **Hard rules** — the worker rules below\n5. **Dispatch status** — brief path + status\n6. **Handoff** — empty section workers append to\n\nEvidence of boards that worked:\n`.vibe/team/appearance-0716-board.md`, `.vibe/team/settings-0716-1424-board.md`.\n\n### 4. Snapshot baselines\n\nBefore launch, note the pre-change state of every target file (git status / content\nsnapshot). You will review **diffs against this baseline**, not handoff prose.\n\n### 5. Dispatch\n\nLaunch workers as **background subprocesses** with disjoint ownership and auto-edit\npermissions. Wait on process exit (shell-level — cheap). Re-engage only when a\nworker finishes or fails to start.\n\n### 6. Diff-review (mandatory)\n\n**Never trust a worker's handoff text.**\n\nFor each worker:\n\n1. Read the actual diff vs baseline.\n2. Check: owned files only? frozen names? additive? acceptance met?\n3. Fix contract/scope violations yourself or re-dispatch once with the failed diff\n   attached. Cap retries at one blind re-run, then you finish the slice.\n\nagy **over-reports success**. Always treat its handoff as unverified until the diff\nand a build prove otherwise.\n\n### 7. Integrate\n\nWire shared surfaces workers were forbidden to touch. Keep public APIs stable.\n\n### 8. Verify once\n\nOne compile/build/test pass at the end (platform-appropriate: `mix compile`, web\nbuild, `xcodebuild`, etc.). Workers do not build or launch the app. Fix failures;\ndo not ship a broken tree.\n\n### 9. Complete\n\n- Update the board: status, what shipped, what deferred, open risks.\n- Write a short settled summary for the user (shipped vs deferred).\n- Do **not** `git push` or deploy unless the user explicitly ordered it for this run.\n- **Clean up the run's working files.** The board and briefs under\n  `.vibe/team/<run>*` are scratch, not documentation: after the settled summary,\n  move anything durably valuable into real docs (or the final summary), then delete\n  this run's board and brief files. Do not leave dead run files accumulating.\n\n## Worker rules (put these in every brief)\n\n- Edit **only** owned files. Do not touch another worker's files, or integrator-owned\n  wiring, unless the brief says so.\n- Do **not** `git commit`, `push`, `checkout`, `reset`, or `stash`.\n- Do **not** run full product builds or launch apps (integrator verifies once).\n- **Additive only** — do not rename or remove existing public names.\n- Code against the **frozen contract names** exactly.\n- Do **not** call Fable / advisor tools; the lead is the reviewer.\n- No secrets or real keys in code or examples (placeholders only).\n\n## Routing\n\n| Worker | Assign | Never assign |\n|---|---|---|\n| **agy** | UI / low-risk / mechanical | auth, security, payments, migrations, shared server logic |\n| **grok** | production UI + documentation | — (still diff-verify) |\n| **codex** | production server, security-sensitive, multi-file Elixir | — |\n\nEscalate the hardest reasoning to the strongest model available **on the lead** (or\na single high-capability worker for one critical slice). Do not put high blast-radius\nwork on agy to save cost.\n\n## Safety\n\n- Destructive commands are blocked by the **bridge permission layer**, not by prompt\n  discipline alone. Still: never instruct workers to force-push, reset hard, or\n  deploy.\n- Never `git push` / production deploy as lead unless the user explicitly asked in\n  this run.\n- Never bake project-external product vocabulary into Vibe core types or public APIs.\n- Prefer existing architecture, names, and UI patterns.\n\n## Worker CLI forms\n\nUse these exact forms (fill repo path, effort, brief content):\n\n### codex\n\n```bash\ncodex exec --json \\\n  -c sandbox_mode=\"workspace-write\" \\\n  -c approval_policy=\"never\" \\\n  -c model_reasoning_effort=\"<e>\" \\\n  --cd <repo> \\\n  --skip-git-repo-check \\\n  \"<prompt>\"\n```\n\nPrefer putting the full brief in the prompt (or a file the prompt tells codex to\nread). Effort: `low` / `medium` / `high` by risk.\n\n### grok\n\n```bash\n~/.grok/bin/grok \\\n  --prompt-file <brief> \\\n  --always-approve \\\n  --max-turns 80 \\\n  --output-format plain \\\n  --cwd <repo>\n```\n\nTwo verified headless failure modes — both exit 0 with **no files written**:\n`--permission-mode acceptEdits` is silently ignored headless (grok narrates the write\nbut drops the tool call), so `--always-approve` is required; and the default\n`--max-turns` is low enough that workers get cut off after recon, so always pass it\nexplicitly. If a grok run exits without a diff, probe first: ask it to write one\ntrivial file and check the file exists — trust the filesystem, not the narration or\nexit code.\n\n### agy\n\n```bash\n~/.local/bin/agy -p \"Read and execute the brief at <brief path>. Work from <repo>.\" \\\n  --mode accept-edits \\\n  --dangerously-skip-permissions \\\n  --print-timeout 30m\n```\n\nUI / low-risk briefs only (see Routing). Same ownership and no-commit/no-build rules\nas other workers. Run it with the repo as working directory.\n\n## Simple work\n\nIf the request does not need multi-agent coordination, do not force a team. A single\nworker (or you alone) is correct. The bridge may also dispatch simple work without\nspawning a lead — respect that when you are not on a team run.\n\n## Completion checklist\n\n- [ ] Board exists with frozen contract + ownership before dispatch\n- [ ] Every worker brief has disjoint files + hard rules + no-Fable\n- [ ] Every worker diff reviewed against baseline\n- [ ] Integrator wiring done\n- [ ] One verify pass green (or failures fixed)\n- [ ] Board updated; settled summary written\n- [ ] Run's board + brief files cleaned up (durable learnings moved to docs first)\n- [ ] No unauthorized push/deploy\n";
+
+// Agent-native team orchestration: the team-lead operating guide is EMBEDDED below
+// (TEAM_LEAD_GUIDE_FALLBACK) so every bridge install ships the team feature — no
+// machine-local files required. The repo copy (agent-bridge/instructions/team-lead.md)
+// is the editable source of truth and overrides the embedded copy when present;
+// regenerate the embed after editing it (see scripts note beside the constant).
+try {
+  const teamLeadGuidePath = path.join(__dirname, "..", "instructions", "team-lead.md");
+  BRIDGE_INSTRUCTION_FILES["team-lead.md"] = fs.existsSync(teamLeadGuidePath)
+    ? fs.readFileSync(teamLeadGuidePath, "utf8")
+    : TEAM_LEAD_GUIDE_FALLBACK;
+} catch (_) {
+  BRIDGE_INSTRUCTION_FILES["team-lead.md"] = TEAM_LEAD_GUIDE_FALLBACK;
+}
+
+// ~/.vibe/agent-config.toml → team_orchestration = "agent_native" switches @team runs
+// to the agent-native lead (the lead CLI spawns worker CLIs itself, per
+// docs/team-architecture.md); anything else keeps the legacy server-side fan-out.
+// Read per call so config edits apply without a bridge restart.
+function agentNativeTeamOrchestration() {
+  try {
+    const cfg = fs.readFileSync(path.join(os.homedir(), ".vibe", "agent-config.toml"), "utf8");
+    const m = cfg.match(/^\s*team_orchestration\s*=\s*"([^"]+)"/m);
+    return !!m && m[1].trim().toLowerCase() === "agent_native";
+  } catch (_) {
+    return false;
+  }
+}
+
+function isTeamLeadTask(task) {
+  if (!task) return false;
+  if (!(task.teamRunId || task.team_run_id)) return false;
+  const role = String(task.teamRole || task.team_role || "").toLowerCase();
+  if (role && role !== "lead") return false;
+  const mode = task.teamMode || task.team_mode;
+  if (mode && mode !== "supervisor" && mode !== "group_supervisor") return false;
+  return true;
+}
+
 function parseArgs(argv) {
   const out = { repos: [], repoRoots: [] };
   for (let i = 2; i < argv.length; i++) {
@@ -595,8 +677,12 @@ function addRepository(map, dir, source) {
   });
 }
 
-function bridgeInstructionRelativeFiles(provider) {
+function bridgeInstructionRelativeFiles(provider, task) {
   const files = [path.join(BRIDGE_INSTRUCTION_DIR, "AGENTS.md")];
+  // Agent-native team runs: the lead also loads the team-lead operating guide.
+  if (task && isTeamLeadTask(task) && agentNativeTeamOrchestration()) {
+    files.push(path.join(BRIDGE_INSTRUCTION_DIR, "team-lead.md"));
+  }
   if (provider === "claude") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CLAUDE.md"));
   else if (provider === "codex") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CODEX.md"));
   else if (provider === "grok") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "AGENTS.md"));
@@ -687,11 +773,11 @@ function taskWantsBridgeInstructions(task, prompt) {
   return /(^|\s)@(codex|claude|grok|agy|antigravity|team|vibe)\b/i.test(String(prompt || ""));
 }
 
-function taskPromptWithBridgeInstructions(provider, prompt, repo) {
+function taskPromptWithBridgeInstructions(provider, prompt, repo, task) {
   const cleaned = stripReservedMention(prompt, provider);
   const ready = ensureBridgeInstructionFiles(repo);
   const readyNames = new Set(ready.map((file) => file.path));
-  const fileLines = bridgeInstructionRelativeFiles(provider)
+  const fileLines = bridgeInstructionRelativeFiles(provider, task)
     .map((file) => `- ${file}${readyNames.has(file) ? "" : " (write failed; follow inline rules instead)"}`)
     .join("\n");
 
@@ -1334,6 +1420,55 @@ function claudeDisallowedTools(task) {
   return base;
 }
 
+// Commands a worker may run without an approval round-trip. A bridge run is
+// headless: there is no TTY to answer a permission prompt, so anything NOT
+// pre-approved here is effectively dead in `acceptEdits`/`auto` mode — which is
+// why Claude workers kept stalling on tests and greps while Grok (auto) and
+// Codex (sandbox, approval_policy=never) ran clean.
+//
+// The list is deliberately inspection + verification only. Nothing that mutates
+// git history, escalates privilege, publishes, or deploys belongs here; those
+// stay denied by DEFAULT_CLAUDE_MOBILE_DISALLOWED_TOOLS (deny wins over allow).
+const SAFE_BASH_ALLOWLIST = [
+  // Inspect
+  "Bash(ls *)", "Bash(cat *)", "Bash(head *)", "Bash(tail *)", "Bash(wc *)",
+  "Bash(file *)", "Bash(stat *)", "Bash(pwd)", "Bash(which *)", "Bash(echo *)",
+  "Bash(tree *)", "Bash(du *)", "Bash(diff *)", "Bash(realpath *)",
+  "Bash(basename *)", "Bash(dirname *)", "Bash(sed -n *)",
+  // Search
+  "Bash(grep *)", "Bash(rg *)", "Bash(find *)",
+  // Git — read-only subcommands only (push/reset/checkout/clean stay denied)
+  "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)",
+  "Bash(git branch*)", "Bash(git ls-files*)", "Bash(git blame*)",
+  "Bash(git rev-parse*)", "Bash(git remote -v)",
+  // Verify: build / test / lint / format
+  "Bash(npm run build*)", "Bash(npm run test*)", "Bash(npm run lint*)",
+  "Bash(npm run typecheck*)", "Bash(npm test*)", "Bash(npm ci)", "Bash(npm install*)",
+  "Bash(yarn build*)", "Bash(yarn test*)", "Bash(pnpm build*)", "Bash(pnpm test*)",
+  "Bash(mix test*)", "Bash(mix compile*)", "Bash(mix format*)", "Bash(mix deps.get)",
+  "Bash(xcodebuild *)", "Bash(xcrun *)", "Bash(swift build*)", "Bash(swift test*)",
+  "Bash(swiftformat *)", "Bash(pytest*)", "Bash(cargo build*)", "Bash(cargo test*)",
+  "Bash(make *)", "Bash(node --check *)",
+];
+
+// Core file tools. Reading and editing must go through these, never through the
+// terminal — see the "Terminal, Files, and Approvals" rules in AGENTS.md.
+const SAFE_FILE_TOOLS = ["Read", "Edit", "MultiEdit", "Write", "Glob", "Grep", "LS", "TodoWrite"];
+
+function claudeAllowedTools(task) {
+  const mode = workModeFor(task);
+  // read_only/plan deny Bash+writes outright; pre-approving them here would be
+  // at best redundant and at worst a hole in the chat-turn write-strip.
+  if (mode === "read_only" || mode === "plan") return [];
+  const allowed = [...SAFE_BASH_ALLOWLIST, ...SAFE_FILE_TOOLS];
+  if (mode === "ask") {
+    // Live-approval mode still routes the interesting stuff to the phone; the
+    // allow-list only spares the user an Approve sheet for `ls`.
+    return allowed.filter((t) => !SAFE_FILE_TOOLS.includes(t));
+  }
+  return allowed;
+}
+
 function appendToolListArg(args, flag, values) {
   const list = compactStringList(values || [], 80);
   if (!list.length) return;
@@ -1749,12 +1884,11 @@ function advisorFor(provider, chatId, task) {
   return null;
 }
 
+// The GPT (Sol) fallback advisor now defaults to codex/GPT-5.6-Sol, so it is
+// available out of the box (no VIBE_SOL_COMMAND needed) whenever the codex CLI is
+// present. An explicit VIBE_SOL_COMMAND still overrides.
 function solAdvisorAvailable() {
-  return !!(
-    process.env.VIBE_SOL_COMMAND ||
-    process.env.VIBE_SOL_ADVISOR_COMMAND ||
-    process.env.VIBE_GPT_ADVISOR_COMMAND
-  );
+  return true;
 }
 
 function solAdvisorCommand() {
@@ -1764,6 +1898,37 @@ function solAdvisorCommand() {
     process.env.VIBE_GPT_ADVISOR_COMMAND ||
     null
   );
+}
+
+// Run GPT-5.6-Sol (via codex exec) as an advise-only pass and return its text.
+// Parses codex --json (item.completed / agent_message). Returns "" on failure.
+function runSolCodexAdvice(prompt, cwd) {
+  try {
+    const cmd = process.env.VIBE_CODEX_COMMAND || "codex";
+    const model = process.env.VIBE_ADVISOR_CODEX_MODEL || "gpt-5.6-sol";
+    const effort = process.env.VIBE_ADVISOR_CODEX_EFFORT || "xhigh";
+    const result = spawnSync(
+      cmd,
+      ["exec", "--json", "--sandbox", "read-only", "--skip-git-repo-check",
+       "-m", model, "-c", `model_reasoning_effort="${effort}"`, prompt],
+      { cwd, encoding: "utf8", timeout: 180000, env: process.env }
+    );
+    let answer = "";
+    for (const ln of String(result.stdout || "").split("\n")) {
+      const t = ln.trim();
+      if (!t) continue;
+      let obj = null;
+      try { obj = JSON.parse(t); } catch (_) { continue; }
+      const item = obj && obj.item ? obj.item : null;
+      if (item && (item.type === "agent_message" || item.type === "assistant_message") &&
+          typeof item.text === "string" && item.text.trim()) {
+        answer = item.text.trim();
+      }
+    }
+    return answer;
+  } catch (_) {
+    return "";
+  }
 }
 
 /** Frontend/JSX/UI paths that should trigger Gemini (Agy) UI-only advice. */
@@ -1832,13 +1997,6 @@ async function maybeRunGeminiUiAdvisor(task, agentRuntime, outputText) {
 /** Fable unavailable → optional Sol (GPT) advise-only pass into handoff. */
 async function maybeRunSolAdvisorFallback(task, reason, contextText) {
   const cmd = solAdvisorCommand();
-  if (!cmd) {
-    console.log(
-      `[vibe-bridge] Fable unavailable (${reason || "unknown"}); Sol advisor not configured ` +
-        `(set VIBE_SOL_COMMAND). Continuing without advisor.`
-    );
-    return null;
-  }
   try {
     const teamRunId = task.teamRunId || task.team_run_id;
     const cwd = (task.cwd || task.project || process.cwd()).toString();
@@ -1846,17 +2004,29 @@ async function maybeRunSolAdvisorFallback(task, reason, contextText) {
       ? path.join(cwd, ".vibe", "team", `${String(teamRunId).replace(/[^A-Za-z0-9_.-]+/g, "-")}.md`)
       : null;
     const prompt =
-      "You are Sol (GPT), fallback advisor after Fable failed. Brief advice only; no file edits.\n" +
+      "You are Sol (GPT-5.6-Sol), fallback advisor after Fable failed. Brief advice only; no file edits.\n" +
       `Reason Fable unavailable: ${reason || "unknown"}\n\n` +
       String(contextText || "").slice(0, 5000);
-    const parts = cmd.split(/\s+/).filter(Boolean);
-    const result = spawnSync(parts[0], [...parts.slice(1), prompt], {
-      cwd,
-      encoding: "utf8",
-      timeout: 120000,
-      env: process.env,
-    });
-    const advice = String(result.stdout || result.stderr || "").trim().slice(0, 4000);
+    let advice = "";
+    if (cmd) {
+      // Explicit override command (plain stdout).
+      const parts = cmd.split(/\s+/).filter(Boolean);
+      const result = spawnSync(parts[0], [...parts.slice(1), prompt], {
+        cwd,
+        encoding: "utf8",
+        timeout: 180000,
+        env: process.env,
+      });
+      advice = String(result.stdout || result.stderr || "").trim().slice(0, 4000);
+    } else {
+      // Default: GPT-5.6-Sol via codex.
+      advice = runSolCodexAdvice(prompt, cwd).slice(0, 4000);
+    }
+    if (advice) {
+      console.log(`[vibe-bridge] Sol (GPT-5.6-Sol) advisor pass complete (${reason || "fable-unavailable"}).`);
+    } else {
+      console.log(`[vibe-bridge] Sol advisor returned nothing (${reason || "fable-unavailable"}); continuing.`);
+    }
     if (handoff && advice) {
       try {
         const fs = require("fs");
@@ -1881,6 +2051,10 @@ function maybeDetectTeamSpawn(channel, task, line) {
   const role = task.teamRole || task.team_role;
   const teamMode = task.teamMode || task.team_mode;
   if (!teamRunId) return;
+  // Agent-native orchestration: the lead spawns worker CLIs itself (see
+  // .vibe/instructions/team-lead.md). Suppress the legacy server-side fan-out so
+  // workers are never spawned twice for one run.
+  if (agentNativeTeamOrchestration()) return;
   if (teamMode && teamMode !== "supervisor" && teamMode !== "group_supervisor") return;
   if (role && role !== "lead") return;
   const text = String(line || "");
@@ -1990,24 +2164,24 @@ function buildCommand(provider, prompt, chatId, task) {
     // into a throttled `vibe_thinking` progress line (see thinkingState below).
     const args = ["-p", "--output-format", "stream-json", "--include-partial-messages", "--permission-mode", mode, "--effort", effort];
     appendToolListArg(args, "--disallowedTools", claudeDisallowedTools(task));
+    // Pre-approve the safe inspection/verification commands. Without this a headless
+    // run in acceptEdits mode has no way to answer a Bash permission prompt, so every
+    // test/build/grep the task needs to verify itself silently dies.
+    const allowedTools = claudeAllowedTools(task);
     if (ASK_MCP_ENABLED && askMcpConfigPath) {
       // Expose the ask_user + approve_command MCP tools and pre-allow them so the
       // mid-run question and command-approval round-trips never themselves trip a
       // (headless-unanswerable) permission prompt.
-      const allowedMcpTools = [ASK_TOOL_NAME, APPROVE_TOOL_NAME];
-      if (FABLE_MCP_ENABLED) allowedMcpTools.push(FABLE_TOOL_NAME);
-      args.push(
-        "--mcp-config",
-        askMcpConfigPath,
-        "--allowedTools",
-        allowedMcpTools.join(",")
-      );
+      allowedTools.push(ASK_TOOL_NAME, APPROVE_TOOL_NAME);
+      if (FABLE_MCP_ENABLED) allowedTools.push(FABLE_TOOL_NAME);
+      args.push("--mcp-config", askMcpConfigPath);
       // Live "ask" mode: route every other tool's permission request to the phone
       // via the approve_command permission-prompt tool (Approve/Skip/Deny sheet).
       if (workModeFor(task) === "ask") {
         args.push("--permission-prompt-tool", APPROVE_TOOL_NAME);
       }
     }
+    appendToolListArg(args, "--allowedTools", allowedTools);
     const resumeId = resumeIdFor(task);
     if (resumeId) args.push("--resume", resumeId);
     args.push("--verbose");
@@ -2191,11 +2365,12 @@ function pushProgressFrame(channel, key, payload) {
 }
 
 /** Fire-and-forget fanout to every authenticated LAN phone socket. */
-function fanoutLanEvent(type, payload) {
+function fanoutLanEvent(type, payload, excludedSocket) {
   if (!lanClients || lanClients.size === 0) return;
   const raw = JSON.stringify({ type, payload: payload == null ? {} : payload });
   for (const sock of lanClients) {
     try {
+      if (excludedSocket && sock === excludedSocket) continue;
       if (sock.readyState === WebSocket.OPEN) sock.send(raw);
     } catch (_) {}
   }
@@ -2338,13 +2513,21 @@ function captureRateLimitsFromLine(provider, line) {
     } else if (typeof win.resets_in_seconds === "number") {
       resetsAt = new Date(Date.now() + win.resets_in_seconds * 1000).toISOString();
     }
+    // Label from the CLI's ACTUAL window, never a hardcoded assumption. Codex can
+    // change or drop a window (e.g. it removed the 5-hour session) — if it stops
+    // reporting `primary`, addWindow returns early above and no bucket is emitted, so
+    // the phone never shows a window the CLI no longer enforces. The passed `label` is
+    // only a last resort when the CLI omits window_minutes entirely.
     const minutes = Number(win.window_minutes ?? win.windowMinutes);
-    let resolvedLabel = label;
-    if (!resolvedLabel) {
-      if (minutes === 300) resolvedLabel = "5-hour session";
-      else if (minutes === 10080) resolvedLabel = "7-day (weekly)";
-      else if (Number.isFinite(minutes) && minutes > 0) resolvedLabel = `${minutes}m window`;
-      else resolvedLabel = "Usage";
+    let resolvedLabel;
+    if (Number.isFinite(minutes) && minutes > 0) {
+      if (minutes === 300) resolvedLabel = "5-hour limit";
+      else if (minutes === 10080) resolvedLabel = "Weekly limit";
+      else if (minutes % 1440 === 0) resolvedLabel = `${minutes / 1440}-day limit`;
+      else if (minutes % 60 === 0) resolvedLabel = `${minutes / 60}-hour limit`;
+      else resolvedLabel = `${minutes}-min limit`;
+    } else {
+      resolvedLabel = label || "Usage";
     }
     buckets.push({
       label: resolvedLabel,
@@ -2353,8 +2536,11 @@ function captureRateLimitsFromLine(provider, line) {
     });
   };
 
-  addWindow("5-hour session", rl.primary);
-  addWindow("7-day (weekly)", rl.secondary);
+  // Pass null so the label is derived from each window's REAL window_minutes — see
+  // addWindow. Do not assume primary=5h / secondary=weekly; the CLI is the source of
+  // truth for which windows exist and how long they are.
+  addWindow(null, rl.primary);
+  addWindow(null, rl.secondary);
   // Some shapes nest under limit windows array
   if (Array.isArray(rl.windows)) {
     for (const w of rl.windows) addWindow(null, w);
@@ -2390,7 +2576,10 @@ function rememberUsageLimitHit(provider, message) {
           utilization: Math.max(100, Number(b.utilization) || 0),
           resetsAt: b.resetsAt || resetsAt,
         }))
-      : [{ label: "5-hour session", utilization: 100, resetsAt }];
+      // No real window was ever reported — emit a GENERIC limit marker, not a fake
+      // "5-hour" window the CLI never sent. resetsAt stays whatever the limit text
+      // actually parsed (may be null); we never invent a reset time.
+      : [{ label: "Usage limit", utilization: 100, resetsAt }];
   lastRateLimitsByProvider.set(provider, { at: Date.now(), buckets, hit: true, message: String(message || "").slice(0, 400) });
   return true;
 }
@@ -3274,6 +3463,10 @@ function agySummaryToBuckets(data) {
 // Returns { buckets: [...] } or null. Never throws.
 function fetchCodexUtilizationFromDisk() {
   try {
+    // Session files outlive the CLI process and even the subscription shape that wrote
+    // them. They are useful as a short handoff cache, not as current account authority.
+    const maxSnapshotAgeMs = 30 * 60 * 1000;
+    const now = Date.now();
     const home = process.env.HOME || process.env.USERPROFILE || "";
     const roots = [
       path.join(home, ".codex", "sessions"),
@@ -3303,7 +3496,9 @@ function fetchCodexUtilizationFromDisk() {
     for (const root of roots) walk(root, 0);
     // Sort by mtime first — directory walk order is not chronological.
     files.sort((a, b) => b.mtime - a.mtime);
-    const newest = files.slice(0, 20);
+    const newest = files
+      .filter((file) => now - file.mtime <= maxSnapshotAgeMs)
+      .slice(0, 20);
     // Walk newest → oldest; first rate_limits wins.
     for (const { full } of newest) {
       let text;
@@ -3327,6 +3522,12 @@ function fetchCodexUtilizationFromDisk() {
         try {
           obj = JSON.parse(line);
         } catch {
+          continue;
+        }
+        const eventTimestamp = Date.parse(
+          String((obj && (obj.timestamp || obj.created_at || obj.createdAt)) || "")
+        );
+        if (Number.isFinite(eventTimestamp) && now - eventTimestamp > maxSnapshotAgeMs) {
           continue;
         }
         const rl =
@@ -3353,17 +3554,19 @@ function fetchCodexUtilizationFromDisk() {
             windowMinutes: Number(win.window_minutes ?? win.windowMinutes) || null,
           });
         };
-        // 300 min = 5h, 10080 min = 7d — always label that way for the phone sheet.
-        const primaryLabel =
-          Number(rl.primary && (rl.primary.window_minutes || rl.primary.windowMinutes)) === 10080
-            ? "7-day (weekly)"
-            : "5-hour session";
-        const secondaryLabel =
-          Number(rl.secondary && (rl.secondary.window_minutes || rl.secondary.windowMinutes)) === 300
-            ? "5-hour session"
-            : "7-day (weekly)";
-        add(primaryLabel, rl.primary);
-        add(secondaryLabel, rl.secondary);
+        const windowLabel = (win) => {
+          const minutes = Number(win && (win.window_minutes ?? win.windowMinutes));
+          if (!Number.isFinite(minutes) || minutes <= 0) return "Usage";
+          if (minutes === 300) return "5-hour limit";
+          if (minutes === 10080) return "Weekly limit";
+          if (minutes % 1440 === 0) return `${minutes / 1440}-day limit`;
+          if (minutes % 60 === 0) return `${minutes / 60}-hour limit`;
+          return `${minutes}-min limit`;
+        };
+        // A missing primary/secondary window emits nothing. Never infer a 5-hour
+        // window merely because one side of the historical pair is absent.
+        add(windowLabel(rl.primary), rl.primary);
+        add(windowLabel(rl.secondary), rl.secondary);
         if (buckets.length) {
           lastRateLimitsByProvider.set("codex", { at: Date.now(), buckets });
           return { buckets, planType: rl.plan_type || rl.planType || null };
@@ -4042,11 +4245,14 @@ async function refreshExternalProviderActivity() {
     // The status push that initiated this async scan necessarily used the old
     // cache. Publish the completed snapshot immediately so the server/phone do
     // not wait for the next 30-second heartbeat.
-    if (
-      previous !== JSON.stringify(externalProviderActivity) &&
-      activeChannel && activeChannel.state === "joined"
-    ) {
-      activeChannel.push("status", bridgeStatusPayload());
+    if (previous !== JSON.stringify(externalProviderActivity)) {
+      const payload = bridgeStatusPayload();
+      if (activeChannel && activeChannel.state === "joined") {
+        activeChannel.push("status", payload);
+      }
+      // A chat page stops Home's REST poll. Keep every authenticated phone current
+      // directly as provider desktop/CLI activity starts or ends.
+      fanoutLanEvent("bridge_status", payload);
     }
   })().catch((err) => {
     console.warn(`[vibe-bridge][home-live] provider scan failed: ${err && err.message ? err.message : err}`);
@@ -4105,7 +4311,14 @@ function pushBridgeStatus(channel, forceModels) {
     })
     .catch(() => {})
     .finally(() => {
-      if (channel.state === "joined") channel.push("status", bridgeStatusPayload());
+      if (channel.state !== "joined") return;
+      const payload = bridgeStatusPayload();
+      channel.push("status", payload);
+      // Status is task authority, not a Home-only decoration. Mirror every start,
+      // session-id discovery, and finish to LAN immediately. When `channel` itself is
+      // the requesting LAN transport, exclude that one socket because channel.push
+      // already delivered it there; other phones still receive the same snapshot.
+      fanoutLanEvent("bridge_status", payload, channel._lanSocket || null);
     });
 }
 
@@ -4540,7 +4753,7 @@ async function runTask(channel, task) {
       `Use your file Read tool to view ${attachments.length === 1 ? "it" : "them"}:\n${lines}\n\n${prompt}`;
   }
   const promptForCli = taskWantsBridgeInstructions(task, prompt)
-    ? taskPromptWithBridgeInstructions(provider, effectivePrompt, repo)
+    ? taskPromptWithBridgeInstructions(provider, effectivePrompt, repo, task)
     : effectivePrompt;
   const built = buildCommand(provider, promptForCli, chatId, task);
   if (!built) {
@@ -4624,6 +4837,7 @@ async function runTask(channel, task) {
     frameLog: [],
     lastProgress: null,
   });
+  writeBridgeHeartbeat();
   pushBridgeStatus(channel);
   pushProgressFrame(channel, key, {
     provider,
@@ -4970,6 +5184,7 @@ async function runTask(channel, task) {
       }
     }
     runningTasks.delete(key);
+    writeBridgeHeartbeat();
     pushBridgeStatus(channel);
     // A slot just freed — admit the next queued task (if any) right away.
     drainPendingTasks();
@@ -5244,6 +5459,42 @@ function extractVibeUserPrompt(text) {
   return body.trim();
 }
 
+// Users often paste Xcode / device logs after a short request. Cut at the first
+// tool/build/log boundary so History bubbles and titles keep the human prose.
+function stripCodexPastePollution(text) {
+  if (typeof text !== "string" || !text) return text;
+  const markers = [
+    /\s+ExecuteExternalTool\b/,
+    /\n\s*Command line invocation:/i,
+    /\n\s*SwiftDriver\b/,
+    /\n\s*CompileSwift\b/,
+    /\n\s*Ld\s+\//,
+    /\n\s*note:\s+/i,
+    // Mid-line path dumps after a short human sentence (no newline before the path).
+    /\s+-\s*sdk\s+\/Applications\/Xcode\.app\//i,
+    /\s+\/Applications\/Xcode\.app\//,
+    /\s+\/tmp\/vibe-device-build\//,
+    /\n\s*\/Applications\/Xcode\.app\//,
+    /\n\s*\/tmp\/vibe-device-build\//,
+    /\n\s*\[(?:ChatEngine|AgentBridgeHistory|AvatarPin|MediaDrop|MainThreadStall|VibeAgentKitStreamingText)\]/,
+    /\n\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\w+\[\d+/,
+    // Pasted `xcodebuild` argv clusters: " -project ios/… -scheme …"
+    /\s+-project\s+\S+\.xcodeproj\b/i,
+    /\s+-destination\s+['"]?platform=iOS/i,
+    /\s+-derivedDataPath\s+\/tmp\//i,
+    /\n```/,
+  ];
+  let cut = text.length;
+  for (const re of markers) {
+    const match = re.exec(text);
+    // Keep a minimum human lead-in so a real request that mentions "error:" mid-sentence
+    // is not wiped when a later log dump lands.
+    if (match && match.index >= 12 && match.index < cut) cut = match.index;
+  }
+  const trimmed = text.slice(0, cut).trim();
+  return trimmed.length >= 8 ? trimmed : text.trim();
+}
+
 // Codex IDE integrations wrap a genuine prompt in a context preamble:
 //   # Context from my IDE setup:
 //   …
@@ -5257,12 +5508,51 @@ function codexUserMessageText(text) {
   const marker = /^##\s*My request for Codex:\s*$/im.exec(raw);
   if (marker) raw = raw.slice(marker.index + marker[0].length);
   else if (isContextMessage(raw)) return "";
-  return cleanMessageText(raw);
+  return stripCodexPastePollution(cleanMessageText(raw));
+}
+
+function normalizeCodexTitleKey(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .replace(/[.…]+$/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+// Ungenerated Codex titles are the first prompt (or a truncated/prefix copy of it).
+// Real Codex-generated names are short, title-like, and diverge from the prompt body.
+function isRawCodexTitleCandidate(title, firstMessage) {
+  const raw = String(title || "").trim();
+  if (!raw) return true;
+  if (/^vibe bridge startup\b/i.test(raw)) return true;
+  if (/^you are codex\b/i.test(raw)) return true;
+  if (/^#\s*agents\.md\b/i.test(raw)) return true;
+  if (/\n/.test(raw) && raw.length > 48) return true;
+  if (raw.length > 90) return true;
+  if (/ExecuteExternalTool|xcodebuild|SwiftDriver|\/tmp\/vibe-device-build/i.test(raw)) return true;
+
+  const titleKey = normalizeCodexTitleKey(raw);
+  const firstKey = normalizeCodexTitleKey(firstMessage);
+  if (!titleKey) return true;
+  if (firstKey) {
+    if (titleKey === firstKey) return true;
+    // Prefix match with a length/ellipsis guard so a real short name like
+    // "Fix login" is kept even when the prompt starts with those words.
+    const looksTruncated = /[….]{1,3}$/.test(String(title || "").trim()) || /[a-z0-9]$/i.test(raw) && raw.length >= 40;
+    if (
+      firstKey.startsWith(titleKey) &&
+      titleKey.length >= 24 &&
+      (looksTruncated || titleKey.length >= 36 || firstKey.length > titleKey.length + 12)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Codex CLI/exec sessions often have no generated thread_name. Keep canonical
-// names when present, but make a stable chat-sized fallback from the recovered
-// human task rather than leaking an 80-character prompt or saying "Codex session".
+// names when present, but distill a short chat-sized label from the recovered
+// human task rather than leaking the raw first prompt (or "Codex session").
 function codexFallbackTitle(text, role = "user") {
   let value = role === "user" ? codexUserMessageText(text) : cleanMessageText(text);
   if (!value || isContextMessage(value)) return null;
@@ -5274,7 +5564,6 @@ function codexFallbackTitle(text, role = "user") {
   value = value
     .replace(/^(?:\s*\[Image #\d+\]\s*)+/i, "")
     .replace(/^\s*@codex\b[\s,:-]*/i, "")
-    .replace(/^\s*(?:hey|hi|hello)\b[\s,!.-]*/i, "")
     .trim();
   if (role === "assistant") {
     value = value
@@ -5297,54 +5586,102 @@ function codexFallbackTitle(text, role = "user") {
     return greeting ? greeting.charAt(0).toUpperCase() + greeting.slice(1) : null;
   }
 
+  // Cut at the earliest blank line / fence / log line so paste dumps never become the name.
+  const blank = value.search(/\n\s*\n/);
+  if (blank > 12) value = value.slice(0, blank);
+  const fence = value.indexOf("```");
+  if (fence > 12) value = value.slice(0, fence);
+  const logLine = value.search(
+    /\n\s*(?:xcodebuild\b|ExecuteExternalTool\b|error:|warning:|\bat\s+\S)/i
+  );
+  if (logLine > 12) value = value.slice(0, logLine);
+  if (value.trim().length < 8) value = greetingFallback || value;
+
   // Prefer the first actual prose line over markdown headings/file pointers.
   const lines = value.split("\n").map((line) => line.trim()).filter(Boolean);
   value = lines.find((line) =>
     !line.startsWith("<") &&
     !/^#{1,6}\s/.test(line) &&
-    !/^(?:[-*]\s*)?\/[^\s]+$/.test(line)
+    !/^(?:[-*]\s*)?\/[^\s]+$/.test(line) &&
+    !/^(?:xcodebuild|ExecuteExternalTool|error:|warning:)\b/i.test(line)
   ) || lines[0] || "";
   value = value.replace(/^[-*]\s+/, "").replace(/^["'`]+|["'`]+$/g, "").trim();
 
-  // Small intent normalization turns common conversational starts into labels.
-  value = value
-    .replace(/^(?:please\s+)?(?:can|could|would)\s+you\s+/i, "")
-    .replace(/^i\s+(?:want|need|would like)\s+(?:you\s+)?to\s+/i, "")
-    .replace(/^there\s+(?:is|are)(?:\s+an?)?(?:\s+another)?\s+(?:issue|problem|bug)s?(?:\s+(?:with|in|for))?\s+/i, "Fix ")
-    .replace(/^(?:(?:the|another|other)\s+)?(?:issue|problem|bug)\s+(?:is|with)\s+/i, "Fix ")
-    .replace(/^look\s+at\s+/i, "Review ")
-    .replace(/^i(?:'|’)m\s+/i, "")
-    .replace(/^i(?:'|’)ll\s+/i, "")
-    .trim();
+  // Strip conversational filler repeatedly, then normalize common intents into labels.
+  for (let i = 0; i < 3; i++) {
+    const next = value
+      .replace(/^\s*(?:hey|hi|hello)\b[\s,!.-]*/i, "")
+      .replace(/^(?:please\s+)?(?:can|could|would)\s+you\s+/i, "")
+      .replace(/^i\s+(?:want|need|would like)\s+(?:you\s+)?to\s+/i, "")
+      .replace(/^take\s+a\s+look\s+at\s+/i, "")
+      .replace(/^(?:please\s+)?(?:check|check out|look at|review)\s+/i, "")
+      .replace(/^there\s+(?:is|are)(?:\s+an?)?(?:\s+another)?\s+(?:issue|problem|bug)s?(?:\s+(?:with|in|for|that))?\s+/i, "Fix ")
+      .replace(/^(?:(?:the|another|other)\s+)?(?:issue|problem|bug)\s+(?:is|with|that)\s+/i, "Fix ")
+      .replace(/^look\s+at\s+/i, "")
+      .replace(/^i(?:'|’)m\s+/i, "")
+      .replace(/^i(?:'|’)ll\s+/i, "")
+      .trim();
+    if (next === value) break;
+    value = next;
+  }
 
   // A frequent bridge debugging prompt has enough misspelling/noise that merely
   // clipping it is still not a useful name; retain its semantic core.
-  if (/codex/i.test(value) && /pa+y?laod|payload/i.test(value) && /exec|command|raw/i.test(value)) {
+  if (/codex/i.test(value) && /pa+y?laod|payload/i.test(value) && /exec|command|raw|parse|node/i.test(value)) {
     return "Fix Codex payload and command rendering";
   }
-  if (/codex/i.test(value) && /(?:history|chat).{0,24}title|title.{0,24}(?:history|chat)/i.test(value)) {
+  if (/codex/i.test(value) && /(?:history|chat).{0,24}title|title.{0,24}(?:history|chat|name|row)|shows\s+raw/i.test(value)) {
     return "Fix Codex history titles";
   }
+  if (/\bios\b/i.test(value) && /list/i.test(value) && /(?:latency|delay|empty|push|open)/i.test(value)) {
+    return "Fix chat list open latency";
+  }
 
-  // Stop at a natural sentence boundary, then enforce a compact word/character cap.
-  const sentence = value.match(/^(.{8,}?)(?:[.!?](?:\s|$)|$)/);
+  // First sentence, then a tight word/character cap at a word boundary (no ellipsis).
+  const sentence = value.match(/^(.{4,}?)(?:[.!?](?:\s|$)|$)/);
   if (sentence && sentence[1]) value = sentence[1];
   value = value.replace(/\s+/g, " ").replace(/[,:;\s-]+$/g, "").trim();
   if (!value) return null;
-  const words = value.split(" ");
-  if (words.length > 10) value = `${words.slice(0, 10).join(" ")}…`;
-  value = clip(value, 68);
+  const words = value.split(" ").filter(Boolean);
+  if (words.length > 7) value = words.slice(0, 7).join(" ");
+  if (value.length > 42) {
+    const clipped = value.slice(0, 42);
+    const boundary = clipped.lastIndexOf(" ");
+    value = (boundary >= 16 ? clipped.slice(0, boundary) : clipped).trim();
+  }
+  value = value.replace(/[,:;\s-]+$/g, "").trim();
   return value ? value.charAt(0).toUpperCase() + value.slice(1) : null;
 }
 
 function isWeakCodexTitle(value) {
-  const title = String(value || "").replace(/[.!?…]+$/g, "").trim().toLowerCase();
+  const title = String(value || "")
+    .replace(/^[\s.…—\-–]+/, "")
+    .replace(/[.!?…—\-–]+$/g, "")
+    .trim()
+    .toLowerCase();
   return (
     !title ||
+    title === "codex session" ||
+    title === "untitled" ||
+    // Assistant self-intro is not a conversation name.
+    /^(?:i(?:'|’)?m\s+)?codex(?:\s+here)?$/.test(title) ||
+    /^(?:hi[, ]+)?i(?:'|’)?m\s+codex\b/.test(title) ||
     /^(?:see|view|check|review|look at)\s+(?:this|these)(?:\s+(?:image|images|photo|photos|screenshot|screenshots))?$/.test(title) ||
     /^(?:here (?:is|are)|this is)\s+(?:the\s+)?(?:image|images|photo|photos|screenshot|screenshots)$/.test(title) ||
-    /^(?:image|images|photo|photos|screenshot|screenshots)$/.test(title)
+    /^(?:image|images|photo|photos|screenshot|screenshots)$/.test(title) ||
+    // Still a raw prompt fragment rather than a conversation name.
+    title.length > 48 ||
+    /^(?:take a look|call (?:the |all )?agents|guys |again|yep|continue)\b/.test(title)
   );
+}
+
+function resolveCodexTopic(stored, userTopic, assistantTopic) {
+  if (stored && !isWeakCodexTitle(stored) && !isRawCodexTitleCandidate(stored)) return stored;
+  const storedDistilled = stored ? codexFallbackTitle(stored) : null;
+  const user = userTopic && !isWeakCodexTitle(userTopic) ? userTopic : null;
+  const fromStored = storedDistilled && !isWeakCodexTitle(storedDistilled) ? storedDistilled : null;
+  const assistant = assistantTopic && !isWeakCodexTitle(assistantTopic) ? assistantTopic : null;
+  return user || fromStored || assistant || userTopic || storedDistilled || assistantTopic || "Codex session";
 }
 
 // Skip ephemeral scratch/test working dirs so the list shows real work.
@@ -5885,19 +6222,28 @@ function parseMcpToolRef(nameOrId) {
   return null;
 }
 
+// User-facing MCP tool labels. Wire ids stay ask_fable / ask_user / …;
+// the phone should never show the internal Fable product name.
+function prettyMcpToolLabel(tool) {
+  const raw = String(tool || "").replace(/_/g, " ").trim();
+  if (!raw) return "";
+  if (/^ask\s+fable$/i.test(raw) || /^fable$/i.test(raw)) return "ask advisor";
+  return raw;
+}
+
 function mcpActionDetail(name, input) {
   const inp = input && typeof input === "object" ? input : {};
   const fromName = parseMcpToolRef(name);
   const fromInput = parseMcpToolRef(inp.tool_name || inp.toolName || inp.name);
   const p = fromName || fromInput;
   if (!p) return null;
-  const prettyTool = String(p.tool || "").replace(/_/g, " ");
+  const prettyTool = prettyMcpToolLabel(p.tool);
   return {
     kind: "mcp",
     name: p.raw,
     server: p.server,
     tool: p.tool,
-    // Compact target for the phone: "vibeask · ask fable"
+    // Compact target for the phone: "vibeask · ask advisor"
     target: p.server + " · " + prettyTool,
     // Question / query rides encrypted output path when result arrives; keep a
     // short prompt preview on the action for the sheet header.
@@ -6147,16 +6493,23 @@ function codexActionDetailSingle(p) {
     const target = String(input.target || input.task_name || "subagent").replace(/^\/root\//, "");
     return { kind: "task", description: `Message ${target}`, subagent: target };
   }
-  // Codex mcp_tool_call / MCP-ish function names.
+  // Named MCP tools first (Claude-style `mcp__vibeask__ask_fable`, nested
+  // `tools.mcp__vibeask__ask_fable(...)`, or Grok `vibeask__ask_fable`). Do NOT
+  // re-wrap an already-qualified name with a default server ("mcp") — that used
+  // to produce `mcp__mcp__ask_fable` and drop the real server.
+  const namedMcp = mcpActionDetail(name, p.arguments || p.input || {});
+  if (namedMcp) return namedMcp;
+  // Codex stream item_type `mcp_tool_call` carries discrete server + tool fields.
   const itemType = String(p.item_type || p.type || p.kind || "").toLowerCase();
-  if (itemType === "mcp_tool_call" || /mcp/i.test(name)) {
+  if (itemType === "mcp_tool_call") {
     const server = String(p.server || p.mcp_server || "").trim() || "mcp";
     const tool = String(p.tool || p.name || "tool").replace(/^mcp__/i, "");
-    const mcp = mcpActionDetail("mcp__" + server + "__" + tool.replace(/^.*__/, ""), p.arguments || p.input || {});
+    const mcp = mcpActionDetail(
+      "mcp__" + server + "__" + tool.replace(/^.*__/, ""),
+      p.arguments || p.input || {}
+    );
     if (mcp) return mcp;
   }
-  const mcp = mcpActionDetail(name, p.arguments || p.input || {});
-  if (mcp) return mcp;
   return { kind: "tool", name: name || "tool" };
 }
 
@@ -6389,6 +6742,14 @@ function codexNestedToolInput(name, source, payload) {
   if (name === "view_image") return { path: codexJsPropertyString(source, "path") };
   if (name === "web__run") return { query: codexJsPropertyString(source, "q") };
   if (name === "update_plan") return codexPlanInputFromSource(source);
+  // Nested MCP: tools.mcp__vibeask__ask_fable({ question: "…" }) or tools.vibeask__ask_fable(…)
+  if (/^mcp__/i.test(name) || /^[a-z][a-z0-9_-]*__[a-z0-9_-]+$/i.test(name)) {
+    const question =
+      codexJsPropertyString(source, "question") ||
+      codexJsPropertyString(source, "query") ||
+      codexJsPropertyString(source, "prompt");
+    return question ? { question } : {};
+  }
   return {};
 }
 
@@ -6449,28 +6810,42 @@ function codexCommandFromPayload(p) {
   return String(cmd || "").replace(/\s+/g, " ").trim();
 }
 
-// Codex emits the command result as a separate `function_call_output` whose
-// `output` is sometimes a JSON-wrapped string. Pull out the readable text.
+// Codex emits the command/MCP result as a separate `function_call_output` /
+// `custom_tool_call_output`. Current app persistence stores `output` as an
+// ARRAY of `{type:"input_text", text:"…"}` blocks (not a plain string). Older
+// shapes used a JSON-wrapped string or stdout/stderr fields. Pull readable text
+// from every known shape so Ask Fable / Read / shell results are not empty on iOS.
 function codexOutputText(output) {
   if (output == null) return "";
+  // Array of content blocks — the common Codex app shape for tool results.
+  if (Array.isArray(output)) return toolResultText(output);
   if (typeof output === "string") {
     try {
       const o = JSON.parse(output);
+      if (Array.isArray(o)) return toolResultText(o);
       if (o && typeof o.output === "string") return o.output;
+      if (o && Array.isArray(o.output)) return toolResultText(o.output);
       if (o && typeof o.aggregated_output === "string") return o.aggregated_output;
       if (o && (typeof o.stdout === "string" || typeof o.stderr === "string")) {
         return [o.stdout, o.stderr].filter(Boolean).join("\n");
       }
       if (o && typeof o.content === "string") return o.content;
+      if (o && Array.isArray(o.content)) return toolResultText(o.content);
+      if (o && typeof o.text === "string") return o.text;
+      if (o && typeof o.result === "string") return o.result;
     } catch (_) {}
     return output;
   }
   if (typeof output === "object") {
     if (typeof output.output === "string") return output.output;
+    if (Array.isArray(output.output)) return toolResultText(output.output);
     if (typeof output.aggregated_output === "string") return output.aggregated_output;
     if (typeof output.stdout === "string" || typeof output.stderr === "string") {
       return [output.stdout, output.stderr].filter(Boolean).join("\n");
     }
+    if (typeof output.text === "string") return output.text;
+    if (typeof output.result === "string") return output.result;
+    if (Array.isArray(output.content)) return toolResultText(output.content);
     return toolResultText(output.content);
   }
   return "";
@@ -6966,6 +7341,23 @@ function liveCodexActions(output) {
       return;
     }
 
+    // Stream `mcp_tool_call` items (server+tool fields) — not only nested exec wrappers.
+    if (type === "mcp_tool_call") {
+      const detail = codexActionDetailSingle(item);
+      if (detail) {
+        detailByUid.set(uid, detail);
+        order.push(uid);
+        const outputText = codexOutputText(item.result || item.output || item.content);
+        if (outputText) {
+          resultByUid.set(uid, {
+            output: clipText(outputText, MAX_ACTION_OUTPUT),
+            isError: !!item.is_error || String(item.status || "").toLowerCase().includes("error"),
+          });
+        }
+      }
+      return;
+    }
+
     if (type === "function_call" || type === "custom_tool_call") {
       const details = codexActionDetails(item);
       const actionUids = [];
@@ -7052,10 +7444,14 @@ function cleanNodeLabel(kind, target, d) {
     case "todo": return "Planning";
     case "thinking": return "Thinking";
     case "mcp": {
-      // "MCP · ask fable" — stable base (duration is appended client-side at settle).
-      const tool = d.tool ? String(d.tool).replace(/_/g, " ") : "";
+      // "MCP · ask advisor" — stable base (duration is appended client-side at settle).
+      const tool = d.tool ? prettyMcpToolLabel(d.tool) : "";
       if (tool) return "MCP · " + tool;
-      return target ? "MCP · " + target : "MCP tool";
+      if (target) {
+        // Rewrite any residual "ask fable" in a prebuilt target string.
+        return "MCP · " + String(target).replace(/\bask\s+fable\b/gi, "ask advisor");
+      }
+      return "MCP tool";
     }
     default: return d.name || "Tool";
   }
@@ -7098,6 +7494,14 @@ function actionNode(detail, uid, status) {
       node.detail = clipText(cot.trim(), MAX_ACTION_OUTPUT);
       node.output = node.detail;
     }
+  }
+  // MCP / bash / read / search results: also mirror a clipped plaintext body onto
+  // the node so History/live sheets still show output when agentActionsEnc is
+  // missing (or decrypt fails on a peer device). Full body still rides the blob.
+  if (OUTPUT_KINDS.has(kind) && typeof d.output === "string" && d.output.trim()) {
+    const body = clipText(d.output.trim(), kind === "mcp" ? 4000 : 1400);
+    if (!node.detail) node.detail = body;
+    if (!node.output) node.output = body;
   }
   return node;
 }
@@ -7623,13 +8027,14 @@ function codexStoredTitles() {
         const rows = JSON.parse(raw || "[]");
         for (const row of Array.isArray(rows) ? rows : []) {
           const id = row && typeof row.id === "string" ? row.id : "";
-          const title = cleanTopicCandidate(row && row.title);
-          const rawTitle = clip(row && row.title, 500);
-          const firstMessage = clip(row && row.first_user_message, 500);
-          // Before Codex generates a title it stores the entire first prompt in
-          // `threads.title`. That is not a conversation name; leave it untitled
-          // unless the title diverged from the first message.
-          if (id && title && rawTitle && rawTitle !== firstMessage) titles.set(id, title);
+          const rawTitle = String((row && row.title) || "").trim();
+          const firstMessage = String((row && row.first_user_message) || "").trim();
+          // Before Codex generates a title it stores the entire first prompt
+          // (or a truncated prefix) in `threads.title`. Those are not conversation
+          // names — only accept titles that clearly diverge from the first message.
+          if (!id || !rawTitle || isRawCodexTitleCandidate(rawTitle, firstMessage)) continue;
+          const title = cleanTopicCandidate(rawTitle);
+          if (title && !isWeakCodexTitle(title)) titles.set(id, title);
         }
         break;
       } catch (_) {
@@ -7647,8 +8052,12 @@ function codexStoredTitles() {
       let row;
       try { row = JSON.parse(line); } catch { continue; }
       const id = row && typeof row.id === "string" ? row.id : "";
-      const title = cleanTopicCandidate(row && row.thread_name);
-      if (id && title) titles.set(id, title);
+      const rawName = String((row && row.thread_name) || "").trim();
+      // session_index is the generated/renamed name; still reject anything that
+      // looks like a leftover first-prompt dump.
+      if (!id || !rawName || isRawCodexTitleCandidate(rawName)) continue;
+      const title = cleanTopicCandidate(rawName);
+      if (title && !isWeakCodexTitle(title)) titles.set(id, title);
     }
   } catch (_) {}
 
@@ -7690,9 +8099,9 @@ async function codexSummaryFromHead(file) {
     if (topic && !isWeakCodexTitle(topic) && messages >= 2) return false;
     if (topic && isWeakCodexTitle(topic) && assistantTopic) return false;
   }, CODEX_SUMMARY_HEAD_BYTES);
-  const resolvedTopic = isWeakCodexTitle(topic) ? (assistantTopic || topic) : topic;
+  const resolvedTopic = resolveCodexTopic(null, topic, assistantTopic);
   const renderedMessages = userTurns > 0 ? userTurns * 2 : messages;
-  return { meta, topic: resolvedTopic || assistantTopic || "Codex session", lastTs: null, messages, renderedMessages };
+  return { meta, topic: resolvedTopic, lastTs: null, messages, renderedMessages };
 }
 
 async function codexSummary(file, opts = {}) {
@@ -7721,9 +8130,9 @@ async function codexSummary(file, opts = {}) {
       }
     }
   });
-  const resolvedTopic = isWeakCodexTitle(topic) ? (assistantTopic || topic) : topic;
+  const resolvedTopic = resolveCodexTopic(null, topic, assistantTopic);
   const renderedMessages = userTurns > 0 ? userTurns * 2 : messages;
-  return { meta, topic: resolvedTopic || assistantTopic || "Untitled", lastTs, messages, renderedMessages };
+  return { meta, topic: resolvedTopic, lastTs, messages, renderedMessages };
 }
 
 async function listCodex(limit) {
@@ -7753,7 +8162,7 @@ async function listCodex(limit) {
     results.push({
       provider: "codex",
       id,
-      topic: storedTitles.get(id) || sum.topic || "Codex session",
+      topic: resolveCodexTopic(storedTitles.get(id), sum.topic, null),
       project,
       projectName: project ? path.basename(project) : "",
       updatedAt: new Date(f.mtime).toISOString(),
@@ -7882,11 +8291,11 @@ async function codexDetail(id, limit, before) {
   flushTurn();
   // Topic from the FULL set (the opening message), then keep the most recent
   // `limit` messages — see claudeDetail for rationale (tail, not head; stable uid).
-  const topic =
-    codexStoredTitles().get(id) ||
-    (isWeakCodexTitle(fallbackTopic) ? (assistantFallbackTopic || fallbackTopic) : fallbackTopic) ||
-    assistantFallbackTopic ||
-    "Codex session";
+  const topic = resolveCodexTopic(
+    codexStoredTitles().get(id),
+    fallbackTopic,
+    assistantFallbackTopic
+  );
   const window = windowHistoryMessages(messages, limit, before);
   return {
     provider: "codex",
@@ -9810,6 +10219,10 @@ async function buildUsageReport(provider, chatId, task) {
     // Prefer a live stream cache; otherwise scan recent Codex session logs so
     // the phone sheet works even before a Vibe-spawned run this process.
     let cached = lastRateLimitsByProvider.get("codex");
+    if (cached && Date.now() - (cached.at || 0) > 30 * 60 * 1000) {
+      lastRateLimitsByProvider.delete("codex");
+      cached = null;
+    }
     if (!cached || !Array.isArray(cached.buckets) || !cached.buckets.length) {
       const disk = fetchCodexUtilizationFromDisk();
       if (disk && disk.buckets && disk.buckets.length) {
@@ -10424,21 +10837,22 @@ const TOOL = {
   }
 };
 const ADVISOR_TOOL = {
+  // Wire id stays ask_fable (agents / MCP already call this). UI labels use "Ask Advisor".
   name: "ask_fable",
   description:
-    "Ask Fable for explicit second-opinion advice during the current run. Pass the concrete " +
+    "Ask Advisor for explicit second-opinion advice during the current run. Pass the concrete " +
     "question plus relevant context, snippets, diffs, constraints, and current assumptions. " +
     "Use this when the built-in advisor is unavailable or when you need a deliberate critique. " +
-    "Fable returns advice only; the calling model remains responsible for implementation and verification.",
+    "Advisor returns advice only; the calling model remains responsible for implementation and verification.",
   inputSchema: {
     type: "object",
     properties: {
-      question: { type: "string", description: "The exact advice question for Fable." },
+      question: { type: "string", description: "The exact advice question for the advisor." },
       context: { type: "string", description: "Relevant run context, findings, errors, and assumptions." },
       diff: { type: "string", description: "Optional patch or git diff to review." },
       constraints: {
         type: "array",
-        description: "Important constraints Fable must respect.",
+        description: "Important constraints the advisor must respect.",
         items: { type: "string" }
       },
       files: {
@@ -10565,14 +10979,47 @@ function buildAdvisorPrompt(args) {
   if (args.diff) parts.push("Diff or proposed patch:\\n" + compactText(args.diff, diffBudget));
   return compactText(parts.join("\\n\\n"), budget);
 }
-function runAdvisor(prompt) {
+// Advisor fallback chain: try Fable first, then fall back when Fable is
+// rate-limited / usage-limited / unavailable so ask_fable still returns real
+// advice instead of a hard "unavailable". Order: Fable -> Opus -> GPT (codex).
+// Sonnet is deliberately NOT in the chain. Override with
+// VIBE_FABLE_FALLBACK_MODELS (comma-separated; "gpt"/"codex" routes to codex).
+function advisorChain() {
+  const primary = ADVISOR_MODEL || "fable";
+  const envFallback = (process.env.VIBE_FABLE_FALLBACK_MODELS || "").trim();
+  let names;
+  if (envFallback) {
+    names = [primary].concat(envFallback.split(","));
+  } else if (primary === "opus") {
+    names = ["opus", "gpt"];
+  } else {
+    names = ["fable", "opus", "gpt"];
+  }
+  const seen = {};
+  const out = [];
+  for (const n of names) {
+    const trimmed = String(n || "").trim();
+    if (!trimmed) continue;
+    const norm = /gpt|codex/i.test(trimmed) ? "gpt" : normalizeAdvisorModel(trimmed);
+    if (norm && norm !== "sonnet" && !seen[norm]) {
+      seen[norm] = 1;
+      out.push(norm);
+    }
+  }
+  return out.length ? out : ["opus"];
+}
+function runAdvisorClaude(prompt, model) {
   return new Promise((resolve) => {
     const cmd = process.env.VIBE_CLAUDE_COMMAND || "claude";
+    // Both Fable and Opus advise WITH thinking: --effort raises reasoning depth.
+    const effort = process.env.VIBE_ADVISOR_CLAUDE_EFFORT || "high";
     const args = [
       "-p",
       prompt,
       "--model",
-      ADVISOR_MODEL,
+      model,
+      "--effort",
+      effort,
       "--output-format",
       "json",
       "--permission-mode",
@@ -10588,10 +11035,10 @@ function runAdvisor(prompt) {
     let stdout = "";
     let stderr = "";
     let done = false;
-    const finish = (text) => {
+    const finish = (res) => {
       if (done) return;
       done = true;
-      resolve(text);
+      resolve(res);
     };
     const child = spawn(cmd, args, {
       cwd: CWD,
@@ -10604,16 +11051,18 @@ function runAdvisor(prompt) {
         VIBE_CLAUDE_ADVISOR_MODEL: ""
       }
     });
+    // A slow model is not helped by trying another one; only fast failures
+    // (rate-limit / auth / non-zero exit) cascade to the next model.
     const timer = setTimeout(() => {
       try { child.kill("SIGTERM"); } catch (_) {}
-      finish("Fable advisor unavailable: timed out.");
+      finish({ ok: false, retriable: false, text: "Advisor (" + model + ") unavailable: timed out." });
     }, ADVISOR_TIMEOUT_MS);
     if (timer.unref) timer.unref();
     child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
     child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
     child.on("error", (err) => {
       clearTimeout(timer);
-      finish("Fable advisor unavailable: " + (err && err.message ? err.message : "spawn failed"));
+      finish({ ok: false, retriable: true, text: "Advisor (" + model + ") unavailable: " + (err && err.message ? err.message : "spawn failed") });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
@@ -10622,10 +11071,89 @@ function runAdvisor(prompt) {
       let parsed = null;
       try { parsed = raw ? JSON.parse(raw.split("\\n").pop()) : null; } catch (_) {}
       const text = parsed && typeof parsed.result === "string" ? parsed.result.trim() : raw;
-      if (code === 0 && text) finish(text);
-      else finish("Fable advisor unavailable: " + compactText((stderr || raw || ("claude exited " + code)).trim(), 2000));
+      if (code === 0 && text) finish({ ok: true, retriable: false, text: text });
+      else finish({ ok: false, retriable: true, text: "Advisor (" + model + ") unavailable: " + compactText((stderr || raw || ("claude exited " + code)).trim(), 2000) });
     });
   });
+}
+// GPT advisor via the codex CLI (used when the claude-based models are exhausted).
+function runAdvisorCodex(prompt) {
+  return new Promise((resolve) => {
+    const cmd = process.env.VIBE_CODEX_COMMAND || "codex";
+    // GPT advisor = GPT-5.6-Sol thinking hard (xhigh; the model also supports
+    // max/ultra). Override with VIBE_ADVISOR_CODEX_MODEL / VIBE_ADVISOR_CODEX_EFFORT.
+    const gptModel = process.env.VIBE_ADVISOR_CODEX_MODEL || "gpt-5.6-sol";
+    const effort = process.env.VIBE_ADVISOR_CODEX_EFFORT || "xhigh";
+    const args = ["exec", "--json", "--sandbox", "read-only", "--skip-git-repo-check", "-m", gptModel, "-c", 'model_reasoning_effort="' + effort + '"', prompt];
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    const finish = (res) => {
+      if (done) return;
+      done = true;
+      resolve(res);
+    };
+    const child = spawn(cmd, args, {
+      cwd: CWD,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, VIBE_ASK_MCP: "0", VIBE_FABLE_MCP: "0" }
+    });
+    const timer = setTimeout(() => {
+      try { child.kill("SIGTERM"); } catch (_) {}
+      finish({ ok: false, retriable: false, text: "Advisor (gpt) unavailable: timed out." });
+    }, ADVISOR_TIMEOUT_MS);
+    if (timer.unref) timer.unref();
+    child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
+    child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      finish({ ok: false, retriable: true, text: "Advisor (gpt) unavailable: " + (err && err.message ? err.message : "spawn failed") });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (done) return;
+      // codex emits JSONL; the final answer is the last agent_message. Shapes seen:
+      //  {type:"item.completed", item:{type:"agent_message", text:"..."}}   (exec --json)
+      //  {payload:{type:"task_complete", last_agent_message:"..."}}          (session-file)
+      //  {type:"agent_message", text|message:"..."}
+      let answer = "";
+      const lines = stdout.split("\\n");
+      for (const ln of lines) {
+        const t = ln.trim();
+        if (!t) continue;
+        let obj = null;
+        try { obj = JSON.parse(t); } catch (_) { continue; }
+        const item = obj && obj.item ? obj.item : null;
+        if (item && (item.type === "agent_message" || item.type === "assistant_message") && typeof item.text === "string" && item.text.trim()) {
+          answer = item.text.trim();
+          continue;
+        }
+        const p = obj && obj.payload ? obj.payload : obj;
+        if (p && typeof p.last_agent_message === "string" && p.last_agent_message.trim()) { answer = p.last_agent_message.trim(); continue; }
+        if (p && p.type === "agent_message" && typeof p.text === "string" && p.text.trim()) { answer = p.text.trim(); continue; }
+        if (p && p.type === "agent_message" && typeof p.message === "string" && p.message.trim()) { answer = p.message.trim(); continue; }
+      }
+      if (code === 0 && answer) finish({ ok: true, retriable: false, text: answer });
+      else finish({ ok: false, retriable: true, text: "Advisor (gpt) unavailable: " + compactText((stderr || ("codex exited " + code)).trim(), 2000) });
+    });
+  });
+}
+async function runAdvisor(prompt) {
+  const chain = advisorChain();
+  let last = "Fable advisor unavailable.";
+  for (let i = 0; i < chain.length; i++) {
+    const name = chain[i];
+    const res = name === "gpt" ? await runAdvisorCodex(prompt) : await runAdvisorClaude(prompt, name);
+    if (res && res.ok) {
+      // Be transparent: if a fallback answered, say so rather than passing it
+      // off as Fable.
+      if (i === 0) return res.text;
+      return "[advisor: " + name + " — Fable was unavailable/rate-limited]\\n\\n" + res.text;
+    }
+    last = res && res.text ? res.text : last;
+    if (res && res.retriable === false) break;
+  }
+  return last;
 }
 async function askFable(args) {
   if (!ADVISOR_ENABLED) return "Fable advisor MCP is disabled by VIBE_FABLE_MCP=0.";
@@ -10758,6 +11286,14 @@ const DEFAULT_AGENT_CONFIG_TOML = `# Vibe agent config — controls how Claude C
 # Always-blocked in mobile/auto/full (denied even in full): rm -rf, sudo, git push,
 # git reset --hard, dd, mkfs, curl|sh, npm publish, ...
 approval_mode = "local"
+
+# team_orchestration:
+#   "server"       -> DEFAULT/legacy: the server classifies @team runs and fans out
+#                     separate worker tasks (VIBE_TEAM_SPAWN markers).
+#   "agent_native" -> the lead agent CLI loads .vibe/instructions/team-lead.md and
+#                     spawns worker CLIs itself as background subprocesses; the
+#                     bridge suppresses the legacy fan-out. See docs/team-architecture.md.
+team_orchestration = "server"
 
 # Extra Bash commands to auto-allow (substring match) on top of the built-in safe list
 # (ls/cat/grep/find/git status|diff|log/echo/... and any build — building is free).
@@ -11209,6 +11745,10 @@ const LAN_SERVICE_TYPE = "_vibegram-bridge._tcp";
 const LAN_AUTH_TIMEOUT_MS = 6000;
 let lanServer = null;
 let lanAdvertiseProc = null;
+let lanAdvertisePort = 0;
+let lanAdvertiseUser = null;
+let lanAdvertiseRestartTimer = null;
+let lanAdvertiseHealthTimer = null;
 const lanClients = new Set();
 
 function startLanServer(userId) {
@@ -11266,6 +11806,7 @@ function makeLanTransport(sock) {
     },
   };
   return {
+    _lanSocket: sock,
     get state() {
       return sock.readyState === WebSocket.OPEN ? "joined" : "closed";
     },
@@ -11294,6 +11835,7 @@ function handleLanConnection(sock, req, userId) {
     }
   }, LAN_AUTH_TIMEOUT_MS);
   // Challenge first: the client must echo this nonce back sealed with the pairing key.
+  console.log(`[vibe-bridge] LAN connection from ${peer} — issuing auth challenge`);
   send({ type: "lan_challenge", nonce, bridgeUser: userId, proto: 1 });
   sock.on("message", (raw) => {
     let msg = null;
@@ -11307,15 +11849,23 @@ function handleLanConnection(sock, req, userId) {
           clearTimeout(authTimer);
           lanClients.add(sock);
           lanTransport = makeLanTransport(sock);
-          console.log(`[vibe-bridge] LAN client authenticated from ${peer}`);
+          console.log(`[vibe-bridge] LAN client authenticated from ${peer} ✓`);
           // Prove the bridge holds the key too (mutual), hand over identity, and push the
           // current bridge status (linked repos etc.) so the LAN client is immediately usable.
           send({ type: "lan_ready", proof: encryptRuntimeBlob({ nonce, role: "bridge" }), user: userId });
           try { pushBridgeStatus(lanTransport); } catch (_) {}
         } else {
-          console.warn(`[vibe-bridge] LAN auth REJECTED from ${peer} (bad or missing proof)`);
+          // Split the two failure modes so a post-rescan issue is diagnosable from the log:
+          //  - no `opened` → the phone sealed with a DIFFERENT key (re-scan the pairing QR)
+          //  - nonce mismatch → a stale/replayed challenge
+          const why = !opened
+            ? "proof failed to decrypt — phone key ≠ bridge key (re-scan the pairing QR)"
+            : "nonce mismatch — stale/replayed challenge";
+          console.warn(`[vibe-bridge] LAN auth REJECTED from ${peer} — ${why}`);
           try { sock.close(4403, "auth_failed"); } catch (_) {}
         }
+      } else {
+        console.warn(`[vibe-bridge] LAN pre-auth frame ignored from ${peer}: type=${msg && msg.type}`);
       }
       return;
     }
@@ -11367,31 +11917,74 @@ function handleLanConnection(sock, req, userId) {
 
 function advertiseLanService(port, userId) {
   if (!port) return;
+  lanAdvertisePort = port;
+  lanAdvertiseUser = userId;
   stopLanAdvertise();
   try {
     const label = `Vibe Bridge (${os.hostname()})`;
     // macOS ships `dns-sd`, so Bonjour registration needs no npm dependency. The uid TXT
     // record lets the phone pick the bridge for THIS account when several share a network.
-    lanAdvertiseProc = spawn(
+    const proc = spawn(
       "dns-sd",
       ["-R", label, LAN_SERVICE_TYPE, ".", String(port), `uid=${userId}`],
       { stdio: "ignore" }
     );
-    lanAdvertiseProc.on("error", (err) => {
+    lanAdvertiseProc = proc;
+    proc.on("error", (err) => {
       console.warn(
         `[vibe-bridge] Bonjour advertise failed (${(err && err.message) || err}) — LAN still reachable by direct IP`
       );
     });
-    console.log(`[vibe-bridge] advertising ${LAN_SERVICE_TYPE} on port ${port} via Bonjour`);
+    // The dns-sd registration is ONLY live while this child runs. If it dies (which we
+    // have seen happen silently) the service vanishes and phones get stuck "searching"
+    // forever — so respawn it. Guard against a superseding advertise having replaced it.
+    proc.on("exit", (code, signal) => {
+      if (proc !== lanAdvertiseProc) return;
+      lanAdvertiseProc = null;
+      console.warn(
+        `[vibe-bridge] Bonjour advertise exited (code=${code} signal=${signal || "-"}) — re-advertising`
+      );
+      scheduleReadvertise();
+    });
+    console.log(`[vibe-bridge] advertising ${LAN_SERVICE_TYPE} on port ${port} via Bonjour (pid ${proc.pid})`);
+    startLanAdvertiseHealthCheck();
   } catch (err) {
     console.warn(`[vibe-bridge] Bonjour advertise error: ${(err && err.message) || err}`);
+    scheduleReadvertise();
   }
+}
+
+// Debounced respawn of the Bonjour registration after its child dies.
+function scheduleReadvertise() {
+  if (lanAdvertiseRestartTimer) return;
+  lanAdvertiseRestartTimer = setTimeout(() => {
+    lanAdvertiseRestartTimer = null;
+    if (!lanServer || !lanAdvertisePort || lanAdvertiseProc) return;
+    advertiseLanService(lanAdvertisePort, lanAdvertiseUser);
+  }, 2000);
+  if (lanAdvertiseRestartTimer.unref) lanAdvertiseRestartTimer.unref();
+}
+
+// Belt-and-suspenders: even if the `exit` event is ever missed, re-assert the
+// advertisement periodically so a dead registration self-heals within a minute.
+function startLanAdvertiseHealthCheck() {
+  if (lanAdvertiseHealthTimer) return;
+  lanAdvertiseHealthTimer = setInterval(() => {
+    if (!lanServer || !lanAdvertisePort) return;
+    const alive = lanAdvertiseProc && lanAdvertiseProc.exitCode == null && !lanAdvertiseProc.killed;
+    if (!alive) {
+      console.warn("[vibe-bridge] Bonjour advertise health check found it dead — re-advertising");
+      advertiseLanService(lanAdvertisePort, lanAdvertiseUser);
+    }
+  }, 45000);
+  if (lanAdvertiseHealthTimer.unref) lanAdvertiseHealthTimer.unref();
 }
 
 function stopLanAdvertise() {
   if (lanAdvertiseProc) {
-    try { lanAdvertiseProc.kill(); } catch (_) {}
-    lanAdvertiseProc = null;
+    const dying = lanAdvertiseProc;
+    lanAdvertiseProc = null; // clear first so the exit handler's guard skips the respawn
+    try { dying.kill(); } catch (_) {}
   }
 }
 
@@ -11428,6 +12021,45 @@ function connect(server, token, userId) {
     stopAllHistoryWatches(); // watchers hold a now-stale channel
   });
   socket.connect();
+
+  // Transport watchdog — the ONLY self-heal that runs when the channel is NOT joined.
+  //
+  // A CLEAN socket close (code=1000: LB recycle / server deploy) never triggers
+  // phoenix.js auto-reconnect (it only retries abnormal closes), and the app
+  // heartbeat below early-returns while channel.state !== "joined" — so a clean
+  // close used to wedge the bridge cloud-dead FOREVER while the process (and LAN)
+  // stayed up (observed 2026-07-15: 'socket closed code=1000' with no reconnect,
+  // every dispatch → {:error, :offline}). If the transport sits closed with no
+  // connection attempt for 20s+, force a fresh socket.connect(). During normal
+  // phoenix backoff the state flips to "connecting" on every attempt, which
+  // resets the timer — this only fires when phoenix has genuinely given up.
+  let transportDownSince = null;
+  setInterval(() => {
+    let st = "unknown";
+    try {
+      st = typeof socket.connectionState === "function" ? socket.connectionState() : "unknown";
+    } catch (_) {}
+    if (st === "open" || st === "connecting") {
+      transportDownSince = null;
+      return;
+    }
+    if (transportDownSince == null) {
+      transportDownSince = Date.now();
+      return;
+    }
+    const downMs = Date.now() - transportDownSince;
+    if (downMs >= 20000) {
+      console.error(
+        `[vibe-bridge] transport ${st} for ${downMs}ms with no reconnect attempt — forcing socket.connect()`
+      );
+      transportDownSince = null;
+      try {
+        socket.connect();
+      } catch (e) {
+        console.error(`[vibe-bridge] watchdog connect failed: ${(e && e.message) || e}`);
+      }
+    }
+  }, 10000);
 
   const channel = socket.channel(`bridge:${userId}`, {});
   channel.on("bridge_identity", (payload) => {
@@ -11640,8 +12272,55 @@ async function runSelfTest() {
  *
  * Management commands (--status, --install, --help, …) skip this.
  */
+// Stamp {pid, ts, active} so another starter can see we're alive and how many CLI tasks
+// we're running. Called on a timer AND at every task register/finish so the active count
+// is never stale across the yield decision window.
+function writeBridgeHeartbeat() {
+  try {
+    fs.writeFileSync(
+      SINGLETON_HEARTBEAT_FILE,
+      JSON.stringify({ pid: process.pid, ts: Date.now(), active: runningTasks.size }),
+      { mode: 0o600 }
+    );
+  } catch (_) {}
+}
+
+let bridgeHeartbeatTimer = null;
+function startBridgeHeartbeat() {
+  writeBridgeHeartbeat();
+  bridgeHeartbeatTimer = setInterval(writeBridgeHeartbeat, SINGLETON_HEARTBEAT_MS);
+  if (bridgeHeartbeatTimer && bridgeHeartbeatTimer.unref) bridgeHeartbeatTimer.unref();
+}
+
+function readBridgeHeartbeat() {
+  try {
+    const o = JSON.parse(fs.readFileSync(SINGLETON_HEARTBEAT_FILE, "utf8"));
+    if (o && Number.isFinite(o.pid) && Number.isFinite(o.ts)) return o;
+  } catch (_) {}
+  return null;
+}
+
 function ensureBridgeSingleton() {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+
+  // Never take over a bridge that is actively running work — its child worker CLIs
+  // (claude/grok/codex) would die with it (exit 143/130), gutting a team run mid-flight.
+  // If a healthy bridge is already up and BUSY, yield (exit) instead of killing it. An
+  // idle or stale/wedged holder is still replaced, so relaunching to pick up new bridge
+  // code keeps working.
+  const holder = readBridgePidFile();
+  if (holder && holder !== process.pid && isProcessAlive(holder)) {
+    const hb = readBridgeHeartbeat();
+    const fresh = hb && hb.pid === holder && Date.now() - hb.ts < SINGLETON_HEARTBEAT_STALE_MS;
+    if (fresh && Number(hb.active) > 0) {
+      console.log(
+        `[vibe-bridge] an existing bridge is running ${hb.active} task(s) pid=${holder}; ` +
+          `yielding so its workers aren't killed (exit). Use --stop/--restart to replace it.`
+      );
+      process.exit(0);
+    }
+  }
+
   killOtherBridgeProcesses();
 
   // Serialize concurrent starters via exclusive O_EXCL create of a lock stamp.
@@ -11657,7 +12336,21 @@ function ensureBridgeSingleton() {
     if (err && err.code === "EEXIST") {
       const holder = readLockFilePid(SINGLETON_LOCK_FILE);
       if (holder && holder !== process.pid && isProcessAlive(holder)) {
-        // Live holder — kill it (user asked: auto-kill duplicates), then claim.
+        // A live lock-holder that is BUSY running tasks must not be killed — yield to it
+        // (same reason as the top guard; covers the near-simultaneous-start race).
+        const hb = readBridgeHeartbeat();
+        const busy =
+          hb && hb.pid === holder &&
+          Date.now() - hb.ts < SINGLETON_HEARTBEAT_STALE_MS &&
+          Number(hb.active) > 0;
+        if (busy) {
+          console.log(
+            `[vibe-bridge] lock-holder pid=${holder} is running ${hb.active} task(s); ` +
+              `yielding (exit).`
+          );
+          process.exit(0);
+        }
+        // Idle/stale live holder — replace it (auto-kill duplicates), then claim.
         try {
           process.kill(holder, "SIGTERM");
           console.log(
@@ -11742,6 +12435,7 @@ function ensureBridgeSingleton() {
     } catch (_) {}
   }, 1500);
 
+  startBridgeHeartbeat();
   console.log(`[vibe-bridge] singleton ready pid=${process.pid}`);
 }
 
@@ -12008,6 +12702,7 @@ module.exports = {
   codexUnwrapActionPayloads,
   codexUserMessageText,
   codexFallbackTitle,
+  codexOutputText,
   extractVibeUserPrompt,
   parseApplyPatchEnvelope,
   newRuntimeAccumulator,

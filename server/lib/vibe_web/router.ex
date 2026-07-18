@@ -93,8 +93,21 @@ defmodule VibeWeb.Router do
 
     # Account devices — linked-device management + approving a pending pairing.
     get "/account/devices", AccountDeviceController, :index
+    post "/account/devices/current", AccountDeviceController, :register_current
     delete "/account/devices/:id", AccountDeviceController, :delete
     post "/account/devices/pairing/:code/approve", AccountDeviceController, :approve_pairing
+    get "/account/sessions", AccountDeviceController, :sessions
+    delete "/account/sessions/:id", AccountDeviceController, :delete_session
+
+    get "/settings", SettingsController, :show
+    patch "/settings/privacy", SettingsController, :update_privacy
+    patch "/settings/notifications", SettingsController, :update_notifications
+
+    # Canonical notification-preferences (camelCase contract, see
+    # docs/settings-account-architecture.md). GET returns the full object with
+    # defaults; PUT deep-merges provided keys and returns the merged object.
+    get "/account/notification-preferences", SettingsController, :index
+    put "/account/notification-preferences", SettingsController, :update
 
     # Chat
     post "/chat", ChatController, :create
@@ -245,6 +258,17 @@ defmodule VibeWeb.Router do
 
     post "/agents/:identifier/invoke", AgentsController, :invoke
     post "/agents/:identifier/events", AgentsController, :ingest_event
+
+    # Public A2A-compatible discovery card (published agents only; see
+    # docs/provider-platform.md).
+    get "/agents/:identifier/card", AgentsController, :card
+  end
+
+  # Standard well-known discovery path for the same agent card.
+  scope "/.well-known", VibeWeb do
+    pipe_through :public_agent_rate_limited
+
+    get "/agent-card/:identifier", AgentsController, :card
   end
 
   scope "/bridge/v1", VibeWeb do

@@ -21,6 +21,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
     appDelegateUITrace("AppDelegate didFinishLaunching")
+    // Giphy SDK key for native GIF panel (Info.plist / env GIPHY_API_KEY).
+    ChatGifPanelConfig.shared.reloadFromEnvironment()
     // Packet mesh is now opt-in (default direct). Downgrade any legacy
     // packet_mesh session to direct before the UI binds to the config so large
     // media sends (music/video/files) no longer fail immediately on mesh.
@@ -44,6 +46,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
 
   func applicationDidBecomeActive(_ application: UIApplication) {
     appDelegateUITrace("AppDelegate didBecomeActive")
+    // Resume the main-thread stall watchdog and reset its baseline so the time the
+    // process spent suspended in the background is NOT counted as a stall.
+    AppUIStallWatchdog.shared.setActive(true, context: "foreground")
   }
 
   func applicationWillResignActive(_ application: UIApplication) {
@@ -52,6 +57,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
 
   func applicationDidEnterBackground(_ application: UIApplication) {
     appDelegateUITrace("AppDelegate didEnterBackground")
+    // Pause the watchdog: once iOS suspends the process the main-beat timer can't
+    // tick, so on resume the elapsed wall-clock reads as a bogus ~20s "hang"
+    // (cpu=0, run=waiting). Pausing here kills that false positive.
+    AppUIStallWatchdog.shared.setActive(false, context: "background")
   }
 
   func applicationWillEnterForeground(_ application: UIApplication) {

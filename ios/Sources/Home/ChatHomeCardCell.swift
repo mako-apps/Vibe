@@ -22,23 +22,17 @@ final class ChatHomeCardCell: UITableViewCell {
   }
 
   /// Whether the last bridge-status snapshot reports a task actively running for `chatId`.
-  /// Read synchronously so a home row can show "Working…" even before its chat channel is
-  /// joined (a run started on the Mac/IDE, or a cold launch) — the status poll owns this
-  /// signal, independent of the per-chat agent-stream frames that drive `agentProgress`.
+  /// Only exact chatId matches count. Provider-wide / empty-chatId desktop tasks used
+  /// to paint every DM for that provider as "Working…" after sessions settled — false
+  /// positive. Desktop-only runs still surface via live `agentProgress` once the chat
+  /// channel is joined.
   static func hasRunningBridgeTask(chatId: String, provider: String?) -> Bool {
     let key = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !key.isEmpty else { return false }
-    let providerKey = provider?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     return (AgentPairingService.lastStatusSnapshot?.runningTasks ?? [])
       .contains { task in
         let taskChat = task.chatId.trimmingCharacters(in: .whitespacesAndNewlines)
-        if taskChat == key { return true }
-        // Desktop/IDE-owned sessions have no mobile chatId. They still belong to
-        // the provider's single DM row, so use the provider as the fallback scope.
-        // Accept the `desktop:` identity too so Home remains correct while an older
-        // bridge/server Presence snapshot still carries a stale mobile chatId.
-        let isDesktopOwned = taskChat.isEmpty || task.taskId.lowercased().hasPrefix("desktop:")
-        return isDesktopOwned && task.provider.lowercased() == providerKey
+        return taskChat == key
       }
   }
 
@@ -108,6 +102,7 @@ final class ChatHomeCardCell: UITableViewCell {
   private var hasCommittedSwipeGesture = false
   private var isPerformingSwipeAction = false
   private var didEmitLargeSwipeHaptic = false
+  private var suppressesPressOverlay = false
   private var leadingDisplaySpecs: [ChatHomeSwipeActionSpec] = []
   private var trailingDisplaySpecs: [ChatHomeSwipeActionSpec] = []
   private var leadingActionButtons: [ChatHomeSwipeActionButton] = []
@@ -143,15 +138,13 @@ final class ChatHomeCardCell: UITableViewCell {
     super.prepareForReuse()
     avatarLoadTask?.cancel()
     avatarLoadTask = nil
-    avatarToken = UUID().uuidString
-    // Do NOT clear avatarImageView.image here — configure() will either paint a
-    // disk/memory hit immediately or replace entity-keyed content. Blanking caused
-    // the initials↔photo flicker on every cell recycle / cold scroll.
-    lastAvatarURLString = nil
+    // Keep avatarToken / lastAvatarURLString / imageView.image until configure.
+    // Clearing them here forced a re-apply of the same cached photo (flicker) on
+    // every reconfigure / bridge poll of already-visible rows.
     usesIconFallback = false
+    // Keep whatever photo was on screen until the next configure replaces it.
+    // Only hide icon glyph (archive/saved) so it doesn't stick across rows.
     avatarFallbackIconView.isHidden = true
-    avatarFallbackLabel.isHidden = false
-    avatarContainer.layer.sublayers?.removeAll(where: { $0.name == self.avatarGradientLayerName })
     unreadBadge.isHidden = true
     tierBadgeImageView.isHidden = true
     muteIconView.isHidden = true
@@ -174,6 +167,8 @@ final class ChatHomeCardCell: UITableViewCell {
     closeSwipe(animated: false, notifyDelegate: false)
     currentEditingLayout = false
     transform = .identity
+    suppressesPressOverlay = false
+    pressOverlayView.alpha = 0
   }
 
   override func setHighlighted(_ highlighted: Bool, animated: Bool) {
@@ -300,8 +295,8 @@ final class ChatHomeCardCell: UITableViewCell {
     onlineDot.isHidden = !row.isOnline
     selectionOverlayView.backgroundColor = selectedOverlayColor
     selectionOverlayView.alpha = isEditSelected ? 1 : 0
-    editSelectionContainer.alpha = isEditing ? 1 : 0
-    editSelectionBackgroundView.isHidden = !isEditing
+    // Selection chrome visibility is driven by updateEditingLayout (animated).
+    // Don't snap alpha/hidden here or the edit gutter "pops".
     editSelectionBackgroundView.backgroundColor = isEditSelected ? badgeBackground : selectionIdleBackgroundColor
     editSelectionBackgroundView.layer.borderColor = (isEditSelected ? badgeBackground : selectionRingColor).cgColor
     editSelectionCheckView.isHidden = !(isEditing && isEditSelected)
@@ -318,8 +313,9 @@ final class ChatHomeCardCell: UITableViewCell {
     } else {
       avatarFallbackLabel.text = Self.getFallbackInitials(from: row.title)
     }
-    // Reveal the fallback for now; the async image load hides it if a photo lands.
-    showAvatarFallback(true)
+    // Do NOT force-show the letter before loadAvatarImage — that flash is the
+    // flicker users see. loadAvatarImage decides: cache hit → photo; miss with
+    // previous image → keep photo; empty URL → letter; load fail → letter.
 
     // Every row now has a gradient behind the fallback: an explicit one if the
     // caller passed it, the Saved/Archive teal, else the SAME deterministic
@@ -338,14 +334,35 @@ final class ChatHomeCardCell: UITableViewCell {
     )
     pressOverlayView.backgroundColor = pressedColor
     dividerView.backgroundColor = dividerColor
+    // Capture identity before swipe config overwrites `currentRow`.
+    let previousChatId = currentRow?.chatId
+    let previousAvatarKey = lastAvatarURLString
     updateEditingLayout(isEditing, animated: true)
     configureSwipeActions(for: row, isEditing: isEditing)
 
     // Telegram-style group rows: when the group has no photo of its own, build a
     // mosaic from its members' avatars so you see who's in it right from the list.
     let ownAvatar = (row.avatarUri ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let sameChat = previousChatId == row.chatId
+    let sameAvatarKey =
+      previousAvatarKey == ownAvatar
+      || (ownAvatar.isEmpty && (previousAvatarKey == nil || previousAvatarKey?.isEmpty == true))
+    // Photo already on screen for this row+URI — leave it alone.
+    let sameRowPhoto =
+      sameChat && sameAvatarKey && avatarImageView.image != nil
+    // Photoless letter already stable for this row — leave letter alone.
+    let sameRowLetter =
+      sameChat && sameAvatarKey && avatarImageView.image == nil
+      && !avatarFallbackLabel.isHidden && !usesIconFallback
+    let sameRowIcon =
+      sameChat && sameAvatarKey && usesIconFallback && !avatarFallbackIconView.isHidden
+
     if row.isGroup, ownAvatar.isEmpty, row.members.count >= 2 {
       loadGroupCompositeAvatar(members: row.members, isDark: isDark)
+    } else if sameRowPhoto {
+      showAvatarFallback(false)
+    } else if sameRowLetter || sameRowIcon {
+      // Initials/icon already correct — never re-toggle isHidden (fade thrash).
     } else {
       loadAvatarImage(urlString: row.avatarUri)
     }
@@ -364,33 +381,68 @@ final class ChatHomeCardCell: UITableViewCell {
     let targetLeading: CGFloat = isEditing ? 44 : 0
     let updates = {
       self.rowContentLeadingConstraint?.constant = targetLeading
+      self.contentView.layoutIfNeeded()
       self.layoutIfNeeded()
     }
 
     let shouldAnimate = animated && currentEditingLayout != isEditing
     currentEditingLayout = isEditing
 
+    // Crossfade selection chrome with the leading shift so edit mode doesn't pop.
     if shouldAnimate {
+      if isEditing {
+        editSelectionContainer.alpha = 0
+        editSelectionBackgroundView.isHidden = false
+      }
       UIView.animate(
-        withDuration: 0.24,
+        withDuration: 0.30,
         delay: 0,
-        options: [.curveEaseInOut, .beginFromCurrentState]
+        usingSpringWithDamping: 0.88,
+        initialSpringVelocity: 0.15,
+        options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction]
       ) {
         updates()
+        self.editSelectionContainer.alpha = isEditing ? 1 : 0
+      } completion: { _ in
+        if !isEditing {
+          self.editSelectionBackgroundView.isHidden = true
+        }
       }
     } else {
       updates()
+      editSelectionContainer.alpha = isEditing ? 1 : 0
+      editSelectionBackgroundView.isHidden = !isEditing
     }
   }
 
   private func setPressedState(_ pressed: Bool, animated: Bool) {
-    let targetAlpha: CGFloat = pressed ? 1 : 0
+    let targetAlpha: CGFloat = (pressed && !suppressesPressOverlay) ? 1 : 0
     if animated {
       UIView.animate(withDuration: 0.14) {
         self.pressOverlayView.alpha = targetAlpha
       }
     } else {
       pressOverlayView.alpha = targetAlpha
+    }
+  }
+
+  /// The preview hold is its own gesture, not a tap: once it engages, the tap
+  /// highlight must leave the card (and stay out of the expansion snapshot).
+  /// Quick taps never reach suppression, so they keep their normal flash.
+  func setPressOverlaySuppressed(_ suppressed: Bool, animated: Bool) {
+    suppressesPressOverlay = suppressed
+    guard suppressed else { return }
+    if animated {
+      UIView.animate(
+        withDuration: 0.12,
+        delay: 0,
+        options: [.beginFromCurrentState, .allowUserInteraction]
+      ) {
+        self.pressOverlayView.alpha = 0
+      }
+    } else {
+      pressOverlayView.layer.removeAllAnimations()
+      pressOverlayView.alpha = 0
     }
   }
 
@@ -1289,20 +1341,32 @@ final class ChatHomeCardCell: UITableViewCell {
   /// Show/hide the no-photo fallback as one unit: the glyph for archive/saved
   /// rows, the gradient+initials label for everything else. Photo present ⇒ both
   /// hidden, so a loaded avatar never has a letter sitting on top of it.
+  /// No-ops when already in the requested state (stops letter fade thrash).
   private func showAvatarFallback(_ show: Bool) {
-    avatarFallbackIconView.isHidden = !(show && usesIconFallback)
-    avatarFallbackLabel.isHidden = !(show && !usesIconFallback)
+    let nextIconHidden = !(show && usesIconFallback)
+    let nextLabelHidden = !(show && !usesIconFallback)
+    if avatarFallbackIconView.isHidden != nextIconHidden {
+      avatarFallbackIconView.isHidden = nextIconHidden
+    }
+    if avatarFallbackLabel.isHidden != nextLabelHidden {
+      avatarFallbackLabel.isHidden = nextLabelHidden
+    }
   }
 
   private func loadAvatarImage(urlString: String?) {
     let normalizedURL = (urlString ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+    // Same URL already resolved — leave chrome alone (stable letter or photo).
     if normalizedURL == lastAvatarURLString {
       if avatarImageView.image != nil {
         showAvatarFallback(false)
         return
       }
       if avatarLoadTask != nil {
-        showAvatarFallback(true)
+        return
+      }
+      // Photoless + already showing letter for this (empty) key.
+      if normalizedURL.isEmpty, !avatarFallbackLabel.isHidden || !avatarFallbackIconView.isHidden {
         return
       }
     }
@@ -1311,38 +1375,37 @@ final class ChatHomeCardCell: UITableViewCell {
       avatarLoadTask?.cancel()
       avatarLoadTask = nil
     }
-    avatarToken = UUID().uuidString
+    let token = UUID().uuidString
+    avatarToken = token
     lastAvatarURLString = normalizedURL
 
     guard !normalizedURL.isEmpty else {
-      avatarImageView.image = nil
+      // Stable photoless tile — only clear photo if one is still painted.
+      if avatarImageView.image != nil {
+        avatarImageView.image = nil
+      }
       showAvatarFallback(true)
-      lastAvatarURLString = nil
       return
     }
 
     if let cached = ChatAvatarImageStore.cached(for: normalizedURL) {
-      VibeAvatarDisplay.apply(
-        cached,
-        to: avatarImageView,
-        fallbackLabel: avatarFallbackLabel,
-        animated: false,
-        keepPreviousIfNil: false
-      )
+      if avatarImageView.image !== cached {
+        // Never pass fallbackLabel into apply when we manage it ourselves —
+        // apply toggles isHidden and causes letter flash on reconfigure.
+        avatarImageView.image = cached
+      }
       showAvatarFallback(false)
       return
     }
 
-    // No memory/disk hit. Keep any previous photo while loading; only show
-    // quiet gradient (hide letter) — never flash initials over a real avatar.
-    if avatarImageView.image == nil {
-      showAvatarFallback(true)
-      avatarFallbackLabel.isHidden = true
-    } else {
+    // No cache. Keep previous photo if any; if none, keep letter stable while loading
+    // (do NOT show letter then immediately hide it — that was the fade thrash).
+    if avatarImageView.image != nil {
       showAvatarFallback(false)
+    } else {
+      showAvatarFallback(true)
     }
 
-    let token = avatarToken
     let task = Task { [weak self] in
       let image = await ChatAvatarImageStore.load(from: normalizedURL)
       guard !Task.isCancelled else { return }
@@ -1350,16 +1413,11 @@ final class ChatHomeCardCell: UITableViewCell {
         guard let self, token == self.avatarToken else { return }
         self.avatarLoadTask = nil
         if let image {
-          VibeAvatarDisplay.apply(
-            image,
-            to: self.avatarImageView,
-            fallbackLabel: self.avatarFallbackLabel,
-            animated: true,
-            keepPreviousIfNil: false
-          )
+          if self.avatarImageView.image !== image {
+            self.avatarImageView.image = image
+          }
           self.showAvatarFallback(false)
         } else if self.avatarImageView.image == nil {
-          // Load failed and nothing to keep — restore letter.
           self.showAvatarFallback(true)
         }
       }
@@ -1384,21 +1442,18 @@ final class ChatHomeCardCell: UITableViewCell {
     lastAvatarURLString = cacheKey
 
     if let cached = ChatAvatarImageStore.cached(for: cacheKey) {
-      VibeAvatarDisplay.apply(
-        cached,
-        to: avatarImageView,
-        fallbackLabel: avatarFallbackLabel,
-        animated: false,
-        keepPreviousIfNil: false
-      )
+      if avatarImageView.image !== cached {
+        avatarImageView.image = cached
+      }
       showAvatarFallback(false)
       return
     }
 
-    // Keep prior composite if any; otherwise quiet gradient while mosaic builds.
-    if avatarImageView.image == nil {
+    // Keep prior composite if any; otherwise keep letter stable while mosaic builds.
+    if avatarImageView.image != nil {
+      showAvatarFallback(false)
+    } else {
       showAvatarFallback(true)
-      avatarFallbackLabel.isHidden = true
     }
     let token = UUID().uuidString
     avatarToken = token
@@ -1422,13 +1477,9 @@ final class ChatHomeCardCell: UITableViewCell {
       await MainActor.run {
         guard let self, token == self.avatarToken else { return }
         self.avatarLoadTask = nil
-        VibeAvatarDisplay.apply(
-          composite,
-          to: self.avatarImageView,
-          fallbackLabel: self.avatarFallbackLabel,
-          animated: true,
-          keepPreviousIfNil: false
-        )
+        if self.avatarImageView.image !== composite {
+          self.avatarImageView.image = composite
+        }
         self.showAvatarFallback(false)
       }
     }

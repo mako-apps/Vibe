@@ -27,12 +27,54 @@ defmodule Vibe.Accounts do
 
   def get_user(id), do: Repo.get(User, id)
 
-  def get_user_by_token(token) do
+  @privacy_fields %{
+    "forwarded_messages" => :privacy_forward,
+    "calls" => :privacy_calls,
+    "phone_number" => :privacy_phone_number,
+    "profile_photos" => :privacy_profile_photos,
+    "bio" => :privacy_bio,
+    "gifts" => :privacy_gifts,
+    "birthday" => :privacy_birthday,
+    "saved_music" => :privacy_saved_music
+  }
+
+  def privacy_settings(%User{} = user) do
+    Map.new(@privacy_fields, fn {key, field} -> {key, Map.fetch!(user, field)} end)
+  end
+
+  def update_privacy_settings(%User{} = user, attrs) when is_map(attrs) do
+    updates =
+      Enum.reduce(attrs, %{}, fn {key, value}, acc ->
+        case Map.fetch(@privacy_fields, to_string(key)) do
+          {:ok, field} -> Map.put(acc, field, value)
+          :error -> acc
+        end
+      end)
+
+    update_user(user, updates)
+  end
+
+  def get_user_by_token(token) when is_binary(token) and byte_size(token) > 0 do
     case Repo.get_by(User, login_token: token) do
       nil ->
-        {:error, :not_found}
+        case get_session_by_token(token) do
+          {:ok, session} ->
+            case get_user(session.user_id) do
+              nil -> {:error, :not_found}
+              %User{is_agent: true} -> {:error, :not_found}
+              user -> {:ok, user}
+            end
+
+          {:error, :expired} ->
+            {:error, :token_expired}
+
+          _ ->
+            {:error, :not_found}
+        end
+
       %User{is_agent: true} ->
         {:error, :not_found}
+
       user ->
         # SECURITY: Check token expiration
         if token_valid?(user) do
@@ -43,12 +85,15 @@ defmodule Vibe.Accounts do
     end
   end
 
+  def get_user_by_token(_token), do: {:error, :not_found}
+
   # Push a still-valid token's expiry forward on use, so an actively-used app never
   # gets logged out. With key-only login that lockout can mean permanent account
   # loss, so keeping live sessions alive is the safer default. Writes only once the
   # window has slipped past @token_slide_after_seconds (≈ one DB write/day/active
   # user); a failed extension is non-fatal — the caller still gets the user.
   defp maybe_slide_token_expiry(%User{token_expires_at: nil} = user), do: user
+
   defp maybe_slide_token_expiry(%User{token_expires_at: expires_at} = user) do
     now = DateTime.utc_now()
     remaining = DateTime.diff(expires_at, now, :second)
@@ -73,13 +118,14 @@ defmodule Vibe.Accounts do
   Returns true if token_expires_at is in the future or not set (legacy users).
   """
   def token_valid?(%User{token_expires_at: nil}), do: true
+
   def token_valid?(%User{token_expires_at: expires_at}) do
     DateTime.compare(expires_at, DateTime.utc_now()) == :gt
   end
 
   def get_user_by_username(username) do
     lower_username = String.downcase(username)
-    Repo.one(from u in User, where: fragment("LOWER(?)", u.username) == ^lower_username)
+    Repo.one(from(u in User, where: fragment("LOWER(?)", u.username) == ^lower_username))
   end
 
   def get_user_by_phone(phone_number) do
@@ -89,9 +135,10 @@ defmodule Vibe.Accounts do
 
       normalized_phone ->
         Repo.one(
-          from u in User,
+          from(u in User,
             where: normalized_phone_expr(u.phone_number) == ^normalized_phone,
             limit: 1
+          )
         )
     end
   end
@@ -110,13 +157,15 @@ defmodule Vibe.Accounts do
       limit = Keyword.get(opts, :limit, 500)
 
       query =
-        from u in User,
-          where: normalized_phone_expr(u.phone_number) in ^normalized_phones and u.is_agent == false,
+        from(u in User,
+          where:
+            normalized_phone_expr(u.phone_number) in ^normalized_phones and u.is_agent == false,
           limit: ^limit
+        )
 
       query =
         if exclude_id do
-          from u in query, where: u.id != ^exclude_id
+          from(u in query, where: u.id != ^exclude_id)
         else
           query
         end
@@ -142,7 +191,9 @@ defmodule Vibe.Accounts do
   def normalize_phone_number(_), do: nil
 
   def username_exists?(username) do
-    Repo.exists?(from u in User, where: fragment("LOWER(?)", u.username) == ^String.downcase(username))
+    Repo.exists?(
+      from(u in User, where: fragment("LOWER(?)", u.username) == ^String.downcase(username))
+    )
   end
 
   def reserved_username?(username) when is_binary(username) do
@@ -210,7 +261,9 @@ defmodule Vibe.Accounts do
 
   defp verify_with_iterations(password, salt_bin, expected_hash_bin, iterations)
        when is_binary(expected_hash_bin) and byte_size(expected_hash_bin) > 0 do
-    derived_bin = :crypto.pbkdf2_hmac(:sha512, password, salt_bin, iterations, byte_size(expected_hash_bin))
+    derived_bin =
+      :crypto.pbkdf2_hmac(:sha512, password, salt_bin, iterations, byte_size(expected_hash_bin))
+
     secure_compare(derived_bin, expected_hash_bin)
   end
 
@@ -223,7 +276,9 @@ defmodule Vibe.Accounts do
   def upgrade_password_hash(%User{} = user, password) do
     salt = :crypto.strong_rand_bytes(16)
     derived_bin = :crypto.pbkdf2_hmac(:sha512, password, salt, @pbkdf2_iterations, 64)
-    new_hash = Base.encode16(salt, case: :lower) <> ":" <> Base.encode16(derived_bin, case: :lower)
+
+    new_hash =
+      Base.encode16(salt, case: :lower) <> ":" <> Base.encode16(derived_bin, case: :lower)
 
     update_user(user, %{"password_hash" => new_hash})
   end
@@ -235,8 +290,10 @@ defmodule Vibe.Accounts do
   end
 
   def unblock_user(user_id, blocked_user_id) do
-    query = from ub in UserBlock,
-      where: ub.user_id == ^user_id and ub.blocked_user_id == ^blocked_user_id
+    query =
+      from(ub in UserBlock,
+        where: ub.user_id == ^user_id and ub.blocked_user_id == ^blocked_user_id
+      )
 
     case Repo.one(query) do
       nil -> {:error, :not_found}
@@ -245,20 +302,395 @@ defmodule Vibe.Accounts do
   end
 
   def list_blocked_users(user_id) do
-    query = from ub in UserBlock,
-      join: u in User, on: u.id == ub.blocked_user_id,
-      where: ub.user_id == ^user_id,
-      select: u
+    query =
+      from(ub in UserBlock,
+        join: u in User,
+        on: u.id == ub.blocked_user_id,
+        where: ub.user_id == ^user_id,
+        select: u
+      )
 
     Repo.all(query)
   end
 
   def blocked?(user_id, target_id) do
-    query = from ub in UserBlock,
-      where: ub.user_id == ^user_id and ub.blocked_user_id == ^target_id
+    query =
+      from(ub in UserBlock,
+        where: ub.user_id == ^user_id and ub.blocked_user_id == ^target_id
+      )
 
     Repo.exists?(query)
   end
 
+  # -- Device & Session Management -------------------------------------------
 
+  alias Vibe.Schemas.AccountDevice
+  alias Vibe.Schemas.DeviceSession
+  alias Vibe.Schemas.DeviceLinkRequest
+
+  @session_validity_seconds 30 * 24 * 60 * 60
+  @link_request_validity_seconds 5 * 60
+
+  @doc "Registers or refreshes the calling device and returns {:ok, account_device}."
+  def register_device(user_id, attrs) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    identifier = attrs["device_identifier"] || attrs[:device_identifier]
+
+    case Repo.get_by(AccountDevice, user_id: user_id, device_identifier: identifier) do
+      nil ->
+        %AccountDevice{}
+        |> AccountDevice.changeset(
+          Map.merge(stringify_keys(attrs), %{"user_id" => user_id, "last_seen_at" => now})
+        )
+        |> Repo.insert()
+
+      existing ->
+        existing
+        |> AccountDevice.changeset(
+          Map.merge(stringify_keys(attrs), %{"last_seen_at" => now, "revoked_at" => nil})
+        )
+        |> Repo.update()
+    end
+  end
+
+  @doc "Lists non-revoked devices for a user, most recently seen first."
+  def list_devices(user_id) do
+    AccountDevice
+    |> where([d], d.user_id == ^user_id and is_nil(d.revoked_at))
+    |> order_by([d], desc: d.last_seen_at)
+    |> Repo.all()
+  end
+
+  @doc "Lists non-revoked sessions for a user, most recently used first."
+  def list_sessions(user_id) do
+    DeviceSession
+    |> join(:inner, [s], d in AccountDevice, on: s.account_device_id == d.id)
+    |> where([s, d], s.user_id == ^user_id and is_nil(s.revoked_at) and is_nil(d.revoked_at))
+    |> order_by([s, d], desc: s.last_used_at, desc: s.inserted_at)
+    |> preload([s, d], account_device: d)
+    |> Repo.all()
+  end
+
+  @doc "Revokes a device and cascades revocation to its active sessions."
+  def revoke_device(user_id, device_id) do
+    case Repo.get_by(AccountDevice, id: device_id, user_id: user_id) do
+      nil ->
+        {:error, :not_found}
+
+      device ->
+        now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+        Repo.transaction(fn ->
+          {:ok, device} =
+            device
+            |> AccountDevice.changeset(%{"revoked_at" => now})
+            |> Repo.update()
+
+          {_count, _} =
+            DeviceSession
+            |> where([s], s.account_device_id == ^device_id and is_nil(s.revoked_at))
+            |> Repo.update_all(set: [revoked_at: now])
+
+          device
+        end)
+    end
+  end
+
+  def revoke_device(user_id, device_id, current_device_identifier) do
+    case Repo.get_by(AccountDevice, id: device_id, user_id: user_id) do
+      nil -> {:error, :not_found}
+      %{device_identifier: ^current_device_identifier} -> {:error, :current_session}
+      _device -> revoke_device(user_id, device_id)
+    end
+  end
+
+  @doc "Issues a device-scoped session token; returns {:ok, plaintext_token, session}."
+  def create_device_session(user_id, account_device_id) do
+    token = generate_session_token()
+    token_hash = hash_session_token(token)
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    expires_at = DateTime.add(now, @session_validity_seconds, :second)
+
+    case %DeviceSession{}
+         |> DeviceSession.changeset(%{
+           user_id: user_id,
+           account_device_id: account_device_id,
+           token_hash: token_hash,
+           expires_at: expires_at
+         })
+         |> Repo.insert() do
+      {:ok, session} -> {:ok, token, session}
+      error -> error
+    end
+  end
+
+  @doc "Resolves a bearer token to its live session and records its use."
+  def get_session_by_token(token) when is_binary(token) and byte_size(token) > 0 do
+    token_hash = hash_session_token(token)
+
+    Repo.transaction(fn ->
+      case Repo.get_by(DeviceSession, token_hash: token_hash) do
+        nil ->
+          Repo.rollback(:not_found)
+
+        session ->
+          # Lock the device first, matching revoke_device/2's lock order. Refetch and
+          # lock the session afterwards so a concurrent revocation is observed before
+          # this authentication attempt can succeed.
+          device =
+            Repo.one(
+              from(d in AccountDevice,
+                where: d.id == ^session.account_device_id,
+                lock: "FOR UPDATE"
+              )
+            )
+
+          if is_nil(device) do
+            Repo.rollback(:not_found)
+          end
+
+          locked_session =
+            Repo.one(
+              from(s in DeviceSession,
+                where:
+                  s.id == ^session.id and s.token_hash == ^token_hash and
+                    s.account_device_id == ^device.id,
+                lock: "FOR UPDATE"
+              )
+            )
+
+          now = DateTime.utc_now()
+
+          cond do
+            is_nil(locked_session) ->
+              Repo.rollback(:not_found)
+
+            not is_nil(device.revoked_at) or not is_nil(locked_session.revoked_at) ->
+              Repo.rollback(:revoked)
+
+            device.user_id != locked_session.user_id ->
+              Repo.rollback(:not_found)
+
+            not DeviceSession.active?(locked_session, now) ->
+              Repo.rollback(:expired)
+
+            true ->
+              touch_session_and_device(locked_session, device, now)
+          end
+      end
+    end)
+  end
+
+  def get_session_by_token(_token), do: {:error, :not_found}
+
+  defp touch_session_and_device(session, device, now) do
+    truncated = DateTime.truncate(now, :second)
+
+    with {:ok, updated_session} <-
+           session
+           |> DeviceSession.changeset(%{last_used_at: truncated})
+           |> Repo.update(),
+         {:ok, updated_device} <-
+           device
+           |> AccountDevice.changeset(%{last_seen_at: truncated})
+           |> Repo.update() do
+      %{updated_session | account_device: updated_device}
+    else
+      {:error, changeset} -> Repo.rollback(changeset)
+    end
+  end
+
+  @doc "Revokes a single device session (e.g. explicit sign-out)."
+  def revoke_session(user_id, session_id) do
+    case Repo.get_by(DeviceSession, id: session_id, user_id: user_id) do
+      nil ->
+        {:error, :not_found}
+
+      session ->
+        session
+        |> DeviceSession.changeset(%{
+          revoked_at: DateTime.utc_now() |> DateTime.truncate(:second)
+        })
+        |> Repo.update()
+    end
+  end
+
+  def revoke_session(user_id, session_id, current_device_identifier) do
+    case Repo.get_by(DeviceSession, id: session_id, user_id: user_id)
+         |> Repo.preload(:account_device) do
+      nil ->
+        {:error, :not_found}
+
+      %{account_device: %{device_identifier: ^current_device_identifier}} ->
+        {:error, :current_session}
+
+      session ->
+        revoke_session(user_id, session.id)
+    end
+  end
+
+  @doc "Starts a pairing request from a not-yet-authenticated requester device."
+  def start_link_request(attrs) do
+    code = generate_pairing_code()
+    code_hash = hash_session_token(code)
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    expires_at = DateTime.add(now, @link_request_validity_seconds, :second)
+
+    case %DeviceLinkRequest{}
+         |> DeviceLinkRequest.changeset(
+           Map.merge(stringify_keys(attrs), %{
+             "code_hash" => code_hash,
+             "expires_at" => expires_at
+           })
+         )
+         |> Repo.insert() do
+      {:ok, request} -> {:ok, code, request}
+      error -> error
+    end
+  end
+
+  @doc "Looks up a pending, unexpired link request by its plaintext code."
+  def get_pending_link_request(code) when is_binary(code) and byte_size(code) > 0 do
+    code_hash = hash_session_token(code)
+
+    DeviceLinkRequest
+    |> Repo.get_by(code_hash: code_hash)
+    |> pending_link_request(DateTime.utc_now())
+  end
+
+  def get_pending_link_request(_code), do: {:error, :not_found}
+
+  @doc "Approves a pending link request."
+  def approve_link_request(user_id, code, wrapped_key_envelope)
+      when is_binary(code) and byte_size(code) > 0 do
+    code_hash = hash_session_token(code)
+
+    Repo.transaction(fn ->
+      now = DateTime.utc_now()
+
+      request =
+        Repo.one(
+          from(r in DeviceLinkRequest,
+            where: r.code_hash == ^code_hash,
+            lock: "FOR UPDATE"
+          )
+        )
+
+      case pending_link_request(request, now) do
+        {:ok, pending_request} ->
+          case pending_request
+               |> DeviceLinkRequest.approve_changeset(%{
+                 user_id: user_id,
+                 wrapped_key_envelope: wrapped_key_envelope,
+                 approved_at: DateTime.truncate(now, :second)
+               })
+               |> Repo.update() do
+            {:ok, approved_request} -> approved_request
+            {:error, changeset} -> Repo.rollback(changeset)
+          end
+
+        {:error, reason} ->
+          Repo.rollback(reason)
+      end
+    end)
+  end
+
+  def approve_link_request(_user_id, _code, _wrapped_key_envelope) do
+    {:error, :not_found}
+  end
+
+  defp pending_link_request(nil, _now), do: {:error, :not_found}
+
+  defp pending_link_request(%DeviceLinkRequest{} = request, now) do
+    cond do
+      not is_nil(request.consumed_at) ->
+        {:error, :consumed}
+
+      not is_nil(request.rejected_at) ->
+        {:error, :rejected}
+
+      not match?(%DateTime{}, request.expires_at) ->
+        {:error, :expired}
+
+      DateTime.compare(request.expires_at, now) != :gt ->
+        {:error, :expired}
+
+      true ->
+        {:ok, request}
+    end
+  end
+
+  @doc "Claims a pairing code."
+  def claim_link_request(code) when is_binary(code) and byte_size(code) > 0 do
+    code_hash = hash_session_token(code)
+
+    Repo.transaction(fn ->
+      now = DateTime.utc_now()
+
+      request =
+        Repo.one(
+          from(r in DeviceLinkRequest,
+            where: r.code_hash == ^code_hash,
+            lock: "FOR UPDATE"
+          )
+        )
+
+      with {:ok, pending_request} <- pending_link_request(request, now),
+           :ok <- claimable_link_request(pending_request),
+           {:ok, consumed_request} <-
+             pending_request
+             |> DeviceLinkRequest.changeset(%{
+               consumed_at: DateTime.truncate(now, :second)
+             })
+             |> Repo.update(),
+           {:ok, device} <-
+             register_device(pending_request.user_id, %{
+               "device_identifier" => pending_request.requester_device_identifier,
+               "name" => pending_request.requester_name,
+               "platform" => pending_request.requester_platform,
+               "public_key" => pending_request.requester_public_key
+             }),
+           {:ok, token, session} <-
+             create_device_session(pending_request.user_id, device.id) do
+        %{
+          user_id: pending_request.user_id,
+          device: device,
+          session: session,
+          session_token: token,
+          wrapped_key_envelope: consumed_request.wrapped_key_envelope
+        }
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  def claim_link_request(_code), do: {:error, :not_found}
+
+  defp claimable_link_request(%DeviceLinkRequest{} = request) do
+    if is_nil(request.approved_at) or is_nil(request.user_id) or
+         is_nil(request.wrapped_key_envelope) do
+      {:error, :not_approved}
+    else
+      :ok
+    end
+  end
+
+  defp generate_session_token do
+    :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
+  end
+
+  defp generate_pairing_code do
+    :crypto.strong_rand_bytes(6) |> Base.encode32(case: :upper, padding: false)
+  end
+
+  defp hash_session_token(token) do
+    :crypto.hash(:sha256, token)
+  end
+
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn {k, v} ->
+      {to_string(k), if(is_map(v), do: stringify_keys(v), else: v)}
+    end)
+  end
 end

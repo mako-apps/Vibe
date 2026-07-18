@@ -11,9 +11,11 @@ import {
 import Haptics from '../haptics';
 import VoiceBubble from './VoiceBubble';
 import GifPicker from './GifPicker';
+import MessageBubbleTail from './MessageBubbleTail';
 import { Chat, Message } from '../types';
 import { formatTime, formatDuration } from '../utils';
 import PatternWallpaper from './PatternWallpaper';
+import { VIBE_APPEARANCE } from '../theme/appearance';
 
 interface ChatInterfaceProps {
     activeChat: Chat;
@@ -233,6 +235,11 @@ const MessageRow = React.memo(({
                     onPointerCancel={handlePointerUp}
                     onDoubleClick={() => handleCopy(m)}
                 >
+                    <MessageBubbleTail
+                        isMe={isMe}
+                        cornerRadius={VIBE_APPEARANCE.messageCornerRadius}
+                        curvature={VIBE_APPEARANCE.messageTailCurvature}
+                    />
                     {m.replyToId && (() => {
                         const repliedMsg = activeChat.messages.find(rm => rm.id === m.replyToId);
                         const rText = repliedMsg ? (repliedMsg.type === 'text' ? getMsgText(repliedMsg) : (repliedMsg.type === 'image' ? 'Photo' : 'Voice')) : 'Deleted';
@@ -527,24 +534,26 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                             />
                         </div>
                         <button
+                            type="button"
                             className="icon-btn chat-search-close-btn"
+                            onClick={() => { setIsSearching(false); setSearchQuery(''); }}
                         >
                             <X size={18} />
                         </button>
                     </div>
                 ) : (
                     <>
-                        <button className="icon-btn" onClick={() => setView('chats')}>
+                        <button type="button" className="icon-btn" onClick={() => setView('chats')}>
                             <ArrowLeft size={18} />
                         </button>
                         <div className="header-title-area header-title-container" onClick={() => setView('contact')}>
                             <div className="header-title-column">
                                 <h2 className="header-title-text">{activeChat?.friendName}</h2>
                                 {activeChat?.friendId && typingUsers.has(activeChat.friendId.toUpperCase()) ? (
-                                    <span className="typing-shine header-typing-status">typing...</span>
+                                    <span className="typing-shine header-typing-status">typing…</span>
                                 ) : (
                                     activeChat?.friendId && onlineUsers.has(activeChat.friendId.toUpperCase()) ? (
-                                        <span className="header-last-seen" style={{ color: '#34d399' }}>Online</span>
+                                        <span className="header-last-seen header-online">Online</span>
                                     ) : (
                                         <span className="header-last-seen">Last seen recently</span>
                                     )
@@ -552,13 +561,18 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                             </div>
                         </div>
                         <div className="header-actions-right">
-                            <div onClick={() => setView('contact')} className="header-contact-btn">
+                            <div onClick={() => setView('contact')} className="header-contact-btn" role="button" tabIndex={0}>
                                 {activeChat?.friendImage ? (
                                     <div className="header-avatar-circle">
-                                        <img src={activeChat.friendImage} className="header-avatar-img" />
+                                        <img src={activeChat.friendImage} className="header-avatar-img" alt="" />
                                     </div>
                                 ) : (
-                                    <div className="icon-btn">
+                                    <div
+                                        className="header-avatar-circle header-avatar-fallback"
+                                        style={{
+                                            background: `linear-gradient(135deg, var(--bubble-me-solid, #8B7CFF), var(--bubble-me, #08C6B4))`,
+                                        }}
+                                    >
                                         {(activeChat?.friendName || '?')[0]?.toUpperCase()}
                                     </div>
                                 )}
@@ -566,7 +580,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                         </div>
                     </>
                 )}
-            </header >
+            </header>
 
             {/* Scrollable Viewport */}
             < div className="chat-viewport" ref={viewportRef} onScroll={handleScroll} >
@@ -859,6 +873,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                         ) : (
                             <motion.button
                                 key="send-btn"
+                                type="button"
                                 initial={{ opacity: 0, scale: 0.5 }}
                                 animate={{ opacity: 1, scale: 1 }}
                                 exit={{ opacity: 0, scale: 0.5 }}
@@ -870,12 +885,12 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                                     display: 'flex', alignItems: 'center', justifyContent: 'center',
                                     border: 'none', cursor: 'pointer',
                                     marginLeft: 6,
-                                    background: 'var(--accent)',
-                                    color: '#18181b',
-                                    boxShadow: '0 4px 12px rgba(0,0,0,0.2)'
+                                    background: 'var(--bubble-me-gradient, var(--accent))',
+                                    color: '#04211e',
+                                    boxShadow: '0 6px 16px -4px rgba(8, 198, 180, 0.45)'
                                 }}
                             >
-                                <ArrowUp size={20} strokeWidth={3} color="#18181b" />
+                                <ArrowUp size={20} strokeWidth={3} color="#04211e" />
                             </motion.button>
                         )}
                     </AnimatePresence>
@@ -921,6 +936,11 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                                 >
                                     {/* Re-render bubble content */}
                                     <div className={`msg-box cloned-bubble-inner ${contextMenu.isMe ? 'msg-box--sent' : 'msg-box--received'} ${contextMenu.message.type === 'image' ? 'msg-box--image' : ''} ${contextMenu.message.status === 'error' ? 'msg-box--error' : ''}`}>
+                                        <MessageBubbleTail
+                                            isMe={contextMenu.isMe}
+                                            cornerRadius={VIBE_APPEARANCE.messageCornerRadius}
+                                            curvature={VIBE_APPEARANCE.messageTailCurvature}
+                                        />
                                         {renderMessageContent(contextMenu.message)}
                                     </div>
                                 </motion.div>

@@ -20,6 +20,9 @@ defmodule Vibe.AI.StandaloneAgent do
     requested_output_mode = normalize_string(params["outputMode"] || params["output_mode"])
     reply_to_id = normalize_string(params["replyToId"] || params["reply_to_id"])
     requester_user_id = normalize_string(params["requesterUserId"] || params["requester_user_id"])
+    # Controller may attach a normalized vibe.content.v1 envelope here (Wave 2).
+    # When present, thread onto message metadata as "content" for rich clients.
+    provider_content = provider_content_from_params(params)
 
     cond do
       agent.status != "published" ->
@@ -43,10 +46,16 @@ defmodule Vibe.AI.StandaloneAgent do
                  requested_output_mode,
                  vibe_chat_id,
                  requester_user_id
-               ),
-             {:ok, deliveries} <-
-               maybe_deliver(agent, vibe_chat_id, outputs, response_mode, reply_to_id) do
-          {:ok, %{outputs: outputs, vibe_deliveries: deliveries}}
+               ) do
+          # Attach provider content onto each output's metadata so it flows into
+          # both the invoke response `outputs` map and Chat.add_message attrs
+          # (via output_metadata → deliver_output_to_chat metadata merge).
+          outputs = put_provider_content_on_outputs(outputs, provider_content)
+
+          with {:ok, deliveries} <-
+                 maybe_deliver(agent, vibe_chat_id, outputs, response_mode, reply_to_id) do
+            {:ok, %{outputs: outputs, vibe_deliveries: deliveries}}
+          end
         end
     end
   end
@@ -601,6 +610,30 @@ defmodule Vibe.AI.StandaloneAgent do
   end
 
   defp output_metadata(_), do: %{}
+
+  # params["providerContent"] is the normalized vibe.content.v1 envelope set by
+  # AgentsController.merge_provider_content/1. Only maps are accepted; anything
+  # else is treated as absent (zero behavior change).
+  defp provider_content_from_params(%{"providerContent" => content}) when is_map(content),
+    do: content
+
+  defp provider_content_from_params(_), do: nil
+
+  defp put_provider_content_on_outputs(outputs, nil), do: outputs
+
+  defp put_provider_content_on_outputs(outputs, content) when is_map(content) do
+    Enum.map(List.wrap(outputs), fn
+      output when is_map(output) ->
+        meta = output_metadata(output) |> Map.put("content", content)
+
+        output
+        |> Map.drop([:metadata, "metadata"])
+        |> Map.put(:metadata, meta)
+
+      other ->
+        other
+    end)
+  end
 
   defp image_output?(url, mime_type) do
     mime_type in ["image/png", "image/jpeg", "image/webp", "image/gif"] or

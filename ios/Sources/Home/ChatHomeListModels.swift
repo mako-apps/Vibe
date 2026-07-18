@@ -385,6 +385,13 @@ enum VibeAvatarDisplay {
       fallbackLabel?.isHidden = false
       return
     }
+    // Same instance already on screen — never re-assign or touch fallback (avoids letter fade).
+    if imageView.image === image {
+      if let fallbackLabel, !fallbackLabel.isHidden {
+        fallbackLabel.isHidden = true
+      }
+      return
+    }
     let hadPhoto = imageView.image != nil
     if animated, hadPhoto {
       UIView.transition(
@@ -397,7 +404,9 @@ enum VibeAvatarDisplay {
     } else {
       imageView.image = image
     }
-    fallbackLabel?.isHidden = true
+    if let fallbackLabel, !fallbackLabel.isHidden {
+      fallbackLabel.isHidden = true
+    }
   }
 }
 

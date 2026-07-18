@@ -208,7 +208,8 @@ enum ChatHomeService {
       peerTier: nil,
       previewRows: [],
       initialMessages: [],
-      members: []
+      members: [],
+      lastMessageAt: Double(summary?.timestampMs ?? 0)
     )
   }
 

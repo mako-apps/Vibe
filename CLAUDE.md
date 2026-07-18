@@ -32,6 +32,9 @@ npm publish, ...) are blocked in every remote mode, even `full`.
 **Required** on complex tasks (multi-step, ambiguous, unfamiliar/risky, hard debug,
 architecture). Skip for simple one-liners.
 
+**If you ARE Fable** (model id `claude-fable-5` / Claude Fable 5): do NOT call the
+advisor or `ask_fable` — you'd be asking yourself. Just proceed with the task.
+
 ### How to call
 
 1. Prefer the built-in **`advisor`** tool when available.
@@ -54,6 +57,25 @@ paste whole files or re-ask with the same dump.
 
 Full how-to (response path + optimise tips): see [Agents.md](Agents.md)
 → **Ask Fable (advisor) on complex tasks**.
+
+## Complex task? Diagnose yourself, then dispatch worker CLIs
+
+When a task is multi-slice and you have FINISHED diagnosing (you know exactly what
+must change where), don't patch everything yourself — dispatch worker CLIs as
+background subprocesses for speed and cost. The full operating guide (loop, board
+protocol, routing, review rules) is `agent-bridge/instructions/team-lead.md` — follow
+it. The essentials:
+
+- Write a board (`.vibe/team/<run>-board.md`) with FROZEN contract names + ownership
+  (one owner per file, disjoint), then one self-contained brief per worker.
+- Exact worker invocations (verified 2026-07-18):
+  - codex: `codex exec --json -c sandbox_mode="workspace-write" -c approval_policy="never" -c model_reasoning_effort="<low|medium|high>" --cd <repo> --skip-git-repo-check "<prompt>"`
+  - grok: `~/.grok/bin/grok --prompt-file <brief> --always-approve --max-turns 80 --output-format plain --cwd <repo>` (acceptEdits is silently DROPPED headless; default max-turns cuts workers off)
+  - agy: `~/.local/bin/agy -p "Read and execute the brief at <path>" --mode accept-edits --dangerously-skip-permissions --print-timeout 30m` (UI/low-risk only — never auth/security/payments/migrations)
+- Review DIFFS vs baseline, never handoff prose. One verify pass (compile/tests/build)
+  at the end — workers never commit, build, or launch.
+- **Clean up when the run settles**: fold durable learnings into docs/memory, then
+  delete that run's `.vibe/team/<run>*` board and brief files.
 
 ## Prefer commands that run without approval
 

@@ -2,9 +2,30 @@ defmodule VibeWeb.AgentsController do
   use VibeWeb, :controller
   require Logger
 
+  alias Vibe.AgentCard
   alias Vibe.Agents
+  alias Vibe.ProviderContent
   alias Vibe.AI.AgentEventRuntime
   alias Vibe.AI.StandaloneAgent
+
+  @doc """
+  Public A2A-compatible agent card for a published agent.
+
+  Lookup matches `invoke/2` (`Agents.get_invoke_target/1`). Only
+  `status == "published"` returns 200; missing, draft, disabled, and
+  archived agents all return the same 404 so existence is not leaked.
+  No auth required — integrator mounts this on the public rate-limited scope.
+  """
+  def card(conn, %{"identifier" => identifier}) do
+    case Agents.get_invoke_target(identifier) do
+      %{status: "published"} = agent ->
+        base_url = VibeWeb.Endpoint.url()
+        json(conn, AgentCard.build(agent, base_url))
+
+      _ ->
+        conn |> put_status(:not_found) |> json(%{error: "not_found"})
+    end
+  end
 
   def index(conn, _params) do
     owner_id = conn.assigns.current_user.id
@@ -153,6 +174,7 @@ defmodule VibeWeb.AgentsController do
     with %{} = agent <- Agents.get_invoke_target(identifier),
          :ok <- ensure_agent_published(agent),
          :ok <- ensure_secret(agent, secret),
+         {:ok, params} <- merge_provider_content(params),
          {:ok, result} <- StandaloneAgent.invoke(agent, params),
          {:ok, invocation} <-
            Agents.record_invocation(agent, %{
@@ -192,11 +214,44 @@ defmodule VibeWeb.AgentsController do
         Logger.warning("[AgentsController] invoke chat not attached identifier=#{identifier}")
         conn |> put_status(:forbidden) |> json(%{error: "Agent not attached to target chat"})
 
+      {:error, {:invalid_content, reason}} ->
+        Logger.warning(
+          "[AgentsController] invoke invalid content identifier=#{identifier} reason=#{inspect(reason)}"
+        )
+
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{error: "invalid_content", detail: inspect(reason)})
+
       {:error, reason} ->
         Logger.error("[AgentsController] invoke failed identifier=#{identifier} reason=#{inspect(reason)}")
         conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
+
+  # vibe.content.v1 (docs/provider-content-contract.md): when the body carries a
+  # parts envelope, validate it and degrade to the message/attachments shape the
+  # invoke pipeline already understands. The envelope's text lanes are
+  # authoritative over a bare "message" param (dual-publish). Requests without a
+  # content envelope pass through untouched.
+  defp merge_provider_content(%{"content" => %{"contract" => _} = content} = params) do
+    case ProviderContent.parse(content) do
+      {:ok, normalized} ->
+        attrs = ProviderContent.to_message_attrs(normalized)
+        merged_attachments = List.wrap(params["attachments"]) ++ (attrs["attachments"] || [])
+
+        {:ok,
+         params
+         |> Map.put("message", attrs["text"])
+         |> Map.put("attachments", merged_attachments)
+         |> Map.put("providerContent", normalized)}
+
+      {:error, reason} ->
+        {:error, {:invalid_content, reason}}
+    end
+  end
+
+  defp merge_provider_content(params), do: {:ok, params}
 
   def integrations(conn, %{"id" => id}) do
     owner_id = conn.assigns.current_user.id
@@ -337,7 +392,8 @@ defmodule VibeWeb.AgentsController do
       with true <- is_binary(identifier),
            %{} = agent <- Agents.get_invoke_target(identifier),
            :ok <- ensure_agent_published(agent),
-           {:ok, result} <- AgentEventRuntime.ingest(agent, Map.drop(params, ["identifier"]), secret: secret) do
+           {:ok, event_params} <- merge_provider_content(Map.drop(params, ["identifier"])),
+           {:ok, result} <- AgentEventRuntime.ingest(agent, event_params, secret: secret) do
         Logger.info(
           "[AgentsController] ingest_event success " <>
             "identifier=#{identifier} agent_id=#{agent.id} result=#{inspect(result)}"
@@ -372,6 +428,15 @@ defmodule VibeWeb.AgentsController do
         {:error, :missing_event_type} ->
           Logger.warning("[AgentsController] ingest_event missing event type identifier=#{identifier}")
           conn |> put_status(:unprocessable_entity) |> json(%{error: "eventType is required"})
+
+        {:error, {:invalid_content, reason}} ->
+          Logger.warning(
+            "[AgentsController] ingest_event invalid content identifier=#{identifier} reason=#{inspect(reason)}"
+          )
+
+          conn
+          |> put_status(:unprocessable_entity)
+          |> json(%{error: "invalid_content", detail: inspect(reason)})
 
         {:error, reason} ->
           Logger.error("[AgentsController] ingest_event failed identifier=#{identifier} reason=#{inspect(reason)}")

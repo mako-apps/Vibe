@@ -232,6 +232,9 @@ struct AgentBridgeRunningTask: Hashable, Identifiable {
   let workMode: String?
   let model: String?
   let startedAt: String?
+  let teamRunId: String?
+  let teamMode: String?
+  let teamWorker: String?
 
   var id: String {
     if let sessionId, !sessionId.isEmpty { return sessionId }
@@ -1381,18 +1384,53 @@ enum AgentPairingService {
   static func status(config: AppSessionConfig) async throws -> AgentBridgeStatus {
     let request = try buildRequest(config: config, path: "/agent-bridge/status", method: "GET")
     let object = try await perform(request)
+    let result = statusSnapshot(from: object, directBridge: false)
+    await publishStatus(result, source: "rest")
+    return result
+  }
+
+  /// The authenticated LAN bridge publishes the same status payload on every task
+  /// start/finish and provider scan. Treat it as an immediate, authoritative snapshot so
+  /// an open chat does not depend on Home's REST polling to retire a stopped team card.
+  @MainActor
+  static func ingestLanStatusSnapshot(_ object: [String: Any]) {
+    let result = statusSnapshot(from: object, directBridge: true)
+    publishStatus(result, source: "lan")
+  }
+
+  private static func statusSnapshot(
+    from object: [String: Any],
+    directBridge: Bool
+  ) -> AgentBridgeStatus {
     let repositories = repositoryList(object["repositories"])
-    let devices = deviceList(object["devices"])
+    var devices = deviceList(object["devices"])
     let runningTasks = runningTaskList(object["runningTasks"] ?? object["running_tasks"])
     let models = modelCatalogMap(object["models"] ?? object["modelCatalog"] ?? object["model_catalog"])
-    let result = AgentBridgeStatus(
-      connected: boolValue(object["connected"]),
-      paired: boolValue(object["paired"]),
+    if directBridge, devices.isEmpty {
+      devices = [
+        AgentBridgeDevice(
+          label: normalizedString(object["deviceLabel"] ?? object["device_label"])
+            ?? "Computer",
+          cwd: normalizedString(object["cwd"]),
+          repositories: repositories,
+          runningTasks: runningTasks,
+          id: normalizedString(object["computerId"] ?? object["computer_id"] ?? object["id"])
+            ?? ""
+        )
+      ]
+    }
+    return AgentBridgeStatus(
+      connected: directBridge ? true : boolValue(object["connected"]),
+      paired: directBridge ? true : boolValue(object["paired"]),
       repositories: repositories.isEmpty ? devices.flatMap(\.repositories) : repositories,
       devices: devices,
       runningTasks: runningTasks.isEmpty ? devices.flatMap(\.runningTasks) : runningTasks,
       models: models
     )
+  }
+
+  @MainActor
+  private static func publishStatus(_ result: AgentBridgeStatus, source: String) {
     lastDeviceLabel = result.devices.first?.label
     lastConnected = result.connected
     lastStatusSnapshot = result
@@ -1402,17 +1440,15 @@ enum AgentPairingService {
       return "\(task.provider):\(task.taskId.prefix(18))@\(chatScope)"
     }.joined(separator: ",")
     AppUITrace.notice(
-      "AgentBridgeStatus connected=\(result.connected) devices=\(result.devices.count) tasks=\(result.runningTasks.count) [\(taskSummary)]"
+      "AgentBridgeStatus source=\(source) connected=\(result.connected) devices=\(result.devices.count) tasks=\(result.runningTasks.count) [\(taskSummary)]"
     )
-    if !models.isEmpty {
-      AgentBridgeSelectionStore.ingestLiveModels(models)
+    if !result.models.isEmpty {
+      AgentBridgeSelectionStore.ingestLiveModels(result.models)
     }
 
-    await MainActor.run {
-      lastStatus = result
-      NotificationCenter.default.post(name: statusDidChangeNotification, object: result)
-    }
-    return result
+    lastStatus = result
+    NotificationCenter.default.post(name: statusDidChangeNotification, object: result)
+    ChatEngine.shared.reconcileAgentBridgeStatus(result, source: source)
   }
 
   /// Parse `{ "claude": [ { title, value/id, efforts, ... } ], ... }` model catalogs from status.
@@ -1628,7 +1664,10 @@ enum AgentPairingService {
       cwd: normalizedString(object["cwd"]),
       workMode: normalizedString(object["workMode"] ?? object["work_mode"]),
       model: normalizedString(object["model"]),
-      startedAt: normalizedString(object["startedAt"] ?? object["started_at"])
+      startedAt: normalizedString(object["startedAt"] ?? object["started_at"]),
+      teamRunId: normalizedString(object["teamRunId"] ?? object["team_run_id"]),
+      teamMode: normalizedString(object["teamMode"] ?? object["team_mode"]),
+      teamWorker: normalizedString(object["teamWorker"] ?? object["team_worker"])
     )
   }
 }
@@ -1684,9 +1723,18 @@ final class LanBridgeService {
   private var authed = false
   private var desiredUserId: String?
   private var _state: State = .idle
+  private var browseRetryCount = 0
+  /// A lock-free mirror of `_state` so `currentState` never has to `queue.sync` from the
+  /// main thread — a busy LAN queue must not be able to stall UI reads of the state hint.
+  private let stateLock = NSLock()
+  private var _cachedState: State = .idle
 
   /// Last known state — safe to read from the main thread for a UI hint.
-  var currentState: State { queue.sync { _state } }
+  var currentState: State {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return _cachedState
+  }
 
   private init() {}
 
@@ -1701,20 +1749,39 @@ final class LanBridgeService {
       self.desiredUserId = userId
       guard AgentRuntimeCrypto.hasKey else {
         self.setStateLocked(.unavailable)
-        NSLog("[LanBridge] no pairing key — direct LAN link unavailable (cloud relay only)")
+        NSLog("[LanBridge] start: no pairing key — direct LAN link unavailable (cloud relay only)")
         return
       }
       guard AgentBridgeTransport.preference != .cloud else {
         self.setStateLocked(.idle)
+        NSLog("[LanBridge] start: transport pinned to Cloud — LAN discovery idle")
         return
       }
-      guard self.browser == nil else { return } // already searching / connected
+      guard self.browser == nil else {
+        NSLog("[LanBridge] start: already active (state=\(self._state)) — no-op")
+        return
+      } // already searching / connected
+      NSLog("[LanBridge] start: hasKey ✓ pref=\(AgentBridgeTransport.preference) uid=\(userId ?? "nil") — beginning discovery")
+      self.browseRetryCount = 0
       self.startBrowseLocked()
     }
   }
 
   func stop() {
     queue.async { self.teardownAllLocked(state: .idle) }
+  }
+
+  /// Send a request frame over the authenticated direct link. Returns false (best-effort,
+  /// lock-free) when the link isn't ready so the caller falls back to the cloud channel.
+  /// The frame shape `{type, payload}` matches what the bridge's LAN handler dispatches.
+  @discardableResult
+  func send(type: String, payload: [String: Any]) -> Bool {
+    guard isAuthenticated else { return false }
+    queue.async { [weak self] in
+      guard let self, self.authed, self.connection != nil else { return }
+      self.sendLocked(["type": type, "payload": payload])
+    }
+    return true
   }
 
   /// React to the user flipping the Auto/Local/Cloud control.
@@ -1741,10 +1808,20 @@ final class LanBridgeService {
       self.queue.async {
         switch st {
         case .ready:
+          self.browseRetryCount = 0
           NSLog("[LanBridge] browsing _vibegram-bridge._tcp on the local network")
+        case .waiting(let error):
+          // Almost always the iOS Local Network permission not (yet) granted, or Wi‑Fi off.
+          NSLog("[LanBridge] browse waiting: \(error) — likely Local Network permission not granted (Settings ▸ Vibe ▸ Local Network)")
         case .failed(let error):
-          NSLog("[LanBridge] browse failed: \(error)")
+          // A failed NWBrowser NEVER recovers on its own (e.g. NoAuth before the Local
+          // Network prompt is answered). Tear it down so a later start()/retry can spin up
+          // a fresh one — otherwise start()'s `browser == nil` guard no-ops forever.
+          NSLog("[LanBridge] browse failed: \(error) — tearing down for retry")
+          self.browser?.cancel()
+          self.browser = nil
           self.setStateLocked(.failed("browse: \(error)"))
+          self.scheduleBrowseRetryLocked()
         case .cancelled:
           break
         default:
@@ -1761,8 +1838,37 @@ final class LanBridgeService {
     browser.start(queue: queue)
   }
 
+  /// A failed NWBrowser won't self-heal; retry with a short bounded backoff so the link
+  /// comes up once Local Network permission is granted, without a hot loop if it's denied.
+  /// Each explicit start() (foreground / QR scan) resets the budget.
+  private func scheduleBrowseRetryLocked() {
+    guard AgentRuntimeCrypto.hasKey, AgentBridgeTransport.preference != .cloud else { return }
+    guard browser == nil, connection == nil, !authed else { return }
+    guard browseRetryCount < 6 else {
+      NSLog("[LanBridge] browse retry cap reached — will retry on next foreground / QR scan")
+      return
+    }
+    browseRetryCount += 1
+    let delay = min(2.0 * Double(browseRetryCount), 8.0)
+    NSLog("[LanBridge] scheduling browse retry #\(browseRetryCount) in \(delay)s")
+    queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+      guard let self else { return }
+      guard self.browser == nil, self.connection == nil, !self.authed else { return }
+      guard AgentRuntimeCrypto.hasKey, AgentBridgeTransport.preference != .cloud else { return }
+      self.startBrowseLocked()
+    }
+  }
+
   private func handleBrowseResultsLocked(_ results: Set<NWBrowser.Result>) {
     guard !authed, connection == nil else { return }
+    NSLog("[LanBridge] browse results: \(results.count) service(s) visible (want uid=\(desiredUserId ?? "any"))")
+    for r in results {
+      if case let .service(svcName, _, _, _) = r.endpoint {
+        var uid = "none"
+        if case let .bonjour(txt) = r.metadata { uid = txt["uid"] ?? "none" }
+        NSLog("[LanBridge]   candidate \"\(svcName)\" uid=\(uid)")
+      }
+    }
     guard let pick = pickResultLocked(results) else {
       if results.isEmpty { setStateLocked(.searching) }
       return
@@ -1806,6 +1912,8 @@ final class LanBridgeService {
         case .ready:
           NSLog("[LanBridge] socket ready to \(name) — starting handshake")
           self.receiveLocked()
+        case .waiting(let error):
+          NSLog("[LanBridge] socket waiting to \(name): \(error)")
         case .failed(let error):
           self.teardownConnectionLocked(reason: "connect: \(error)")
         case .cancelled:
@@ -1841,18 +1949,21 @@ final class LanBridgeService {
       switch type {
       case "lan_challenge":
         guard let nonce = obj["nonce"] as? String else { return }
+        NSLog("[LanBridge] received lan_challenge — sealing proof with pairing key")
         handshakeNonce = nonce
         guard let proof = AgentRuntimeCrypto.encrypt(["nonce": nonce, "role": "phone"]) else {
           teardownConnectionLocked(reason: "no key to seal proof")
           return
         }
         sendLocked(["type": "lan_auth", "proof": proof])
+        NSLog("[LanBridge] sent lan_auth proof — awaiting lan_ready")
       case "lan_ready":
         let opened = AgentRuntimeCrypto.decrypt(obj["proof"])
         if let opened, opened["role"] as? String == "bridge",
           (opened["nonce"] as? String) == handshakeNonce
         {
           authed = true
+          browseRetryCount = 0
           let name = connectedName ?? "your Mac"
           setStateLocked(.authenticated(name))
           NSLog("[LanBridge] authenticated with \(name) ✓ — direct LAN link ready")
@@ -1866,9 +1977,10 @@ final class LanBridgeService {
     }
 
     // Authenticated: route live agent traffic into ChatEngine so co-located phones
-    // do not wait on the cloud relay for every progress tick.
+    // do not wait on the cloud relay for every progress tick, and read replies
+    // (history) that were requested over the direct link.
     switch type {
-    case "progress", "result", "status", "bridge_status":
+    case "progress", "result", "status", "bridge_status", "history_result":
       let payload = (obj["payload"] as? [String: Any]) ?? obj
       DispatchQueue.main.async {
         ChatEngine.shared.ingestLanBridgeEvent(type: type, payload: payload)
@@ -1917,6 +2029,9 @@ final class LanBridgeService {
   private func setStateLocked(_ next: State) {
     guard _state != next else { return }
     _state = next
+    stateLock.lock()
+    _cachedState = next
+    stateLock.unlock()
     DispatchQueue.main.async {
       NotificationCenter.default.post(name: Self.stateChangedNotification, object: nil)
     }

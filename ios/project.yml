@@ -19,6 +19,10 @@ settings:
     OTHER_LDFLAGS[sdk=iphonesimulator*][arch=x86_64]:
       - "$(SRCROOT)/Vendor/Packet/ios-sim-x86_64/libphantom_client.a"
       - "-lresolv"
+packages:
+  GiphyUISDK:
+    url: https://github.com/Giphy/giphy-ios-sdk
+    from: 2.2.16
 targets:
   Vibe:
     type: application
@@ -32,18 +36,25 @@ targets:
           - ChatHomeListView.swift
           - ChatListViewCells.swift.patch
           - VibeCallUiCoordinator.swift
+    dependencies:
+      - package: GiphyUISDK
+        product: GiphyUISDK
     info:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Vibe
         UILaunchScreen: {}
         LSRequiresIPhoneOS: true
+        GIPHY_API_KEY: sXpGFDGZs0Dv1mmNFvYaGUvYwKX0PWIh
         NSFaceIDUsageDescription: Use Face ID to unlock privacy controls and reveal protected account data.
         NSCameraUsageDescription: Use the camera for video calls and to capture story photos and videos.
         NSMicrophoneUsageDescription: Use the microphone for calls, story videos, and voice messages.
         NSSpeechRecognitionUsageDescription: Transcribe your speech to text so you can dictate messages to the agent.
         NSPhotoLibraryUsageDescription: Use the photo library to choose photos and videos for stories.
         NSPhotoLibraryAddUsageDescription: Save edited stories to your photo library when you choose download.
+        NSLocalNetworkUsageDescription: Vibe connects directly to the Vibe bridge on your Mac over your local network for faster, private agent updates when your phone and Mac share Wi‑Fi.
+        NSBonjourServices:
+          - _vibegram-bridge._tcp
         UIBackgroundModes:
           - audio
           - voip

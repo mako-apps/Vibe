@@ -2168,6 +2168,13 @@ private struct ChatHomeScreen: View {
   @State private var isShowingGroupCreation = false
   @State private var homeSearchQuery = ""
   @State private var isHomeSearchFocused = false
+  /// The overlay's animated pose. Visibility (isHomeSearchFocused) and pose are
+  /// separate states: the permanently-mounted surface shows sitting on the
+  /// capsule slot, springs to presented, and descends back before hiding.
+  @State private var searchPresented = false
+  /// Close phase 1: xmark retracts to restore the capsule's full width before
+  /// the field descends back onto the in-list slot (executed natively).
+  @State private var searchCloseRetracting = false
   @State private var locallyHiddenChatIDs = Set<String>()
   @State private var pendingDeleteConfirmation: ChatHomeDeleteConfirmation?
   @State private var pendingDeletion: ChatHomePendingDeletion?
@@ -2335,7 +2342,9 @@ private struct ChatHomeScreen: View {
   }
 
   private func handleGlobalUserTap(_ user: ContactSearchUser) {
-    isHomeSearchFocused = false
+    // Must go through closeHomeSearch — a bare state flip would leave the nav
+    // bar faded/non-interactive forever.
+    closeHomeSearch()
     Task { _ = await openChat(for: user) }
   }
 
@@ -2353,28 +2362,50 @@ private struct ChatHomeScreen: View {
   }
 
   private func openHomeSearch() {
+    guard !isHomeSearchFocused else { return }
+    SearchMorphProfiler.shared.begin("open")
+    searchCloseRetracting = false
     setTabBarHidden(true, animated: true)
+    // Header is a pure fade — it never rides the vertical transition. The UIKit
+    // alpha fade also disables bar interaction so the nav band passes touches
+    // through to the docked field.
+    setNavigationBarFaded(true)
     if isEditingHome {
       isEditingHome = false
       selectedChatIDs.removeAll()
     }
-    // Instant toolbar hide (no spring / matchedGeometry Y translate).
-    var txn = Transaction()
-    txn.disablesAnimations = true
-    withTransaction(txn) {
-      isHomeSearchFocused = true
-    }
+    // The input's flight is 100% UIKit/Core Animation now — the in-list
+    // capsule ITSELF is reparented into a window overlay and flown by the
+    // native controller (reacting to these flags). This SwiftUI commit only
+    // reveals the static results sheet, so it stays tiny.
+    isHomeSearchFocused = true
+    searchPresented = true
   }
 
   private func closeHomeSearch() {
-    var txn = Transaction()
-    txn.disablesAnimations = true
-    withTransaction(txn) {
-      isHomeSearchFocused = false
+    guard isHomeSearchFocused, !searchCloseRetracting else { return }
+    SearchMorphProfiler.shared.begin("close")
+    // Phase 1 (native side reacts to this flag): the xmark retracts offscreen
+    // and the flying capsule re-widens + drops its glass at the dock.
+    searchCloseRetracting = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
+      setNavigationBarFaded(false)
+      SearchMorphProfiler.mark("descend")
+      // Phase 2: the capsule flies back onto its slot (native spring), the
+      // sheet fades out and the home cells return. Query clears so it lands
+      // showing the empty "Search".
+      searchPresented = false
       homeSearchQuery = ""
       globalResults = []
+      setTabBarHidden(isEditingHome, animated: true)
+      // Phase 3: drop the sheet gate after landing — the capsule itself is
+      // reattached to the list by the flight animator's completion.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.36) {
+        SearchMorphProfiler.mark("overlay gate off")
+        isHomeSearchFocused = false
+        searchCloseRetracting = false
+      }
     }
-    setTabBarHidden(isEditingHome, animated: true)
   }
 
   var body: some View {
@@ -2384,29 +2415,35 @@ private struct ChatHomeScreen: View {
         // No SwiftUI safeAreaInset — that fought UIKit contentInset and covered cells.
         listContent
           .ignoresSafeArea(.container, edges: [.top, .bottom])
-          .background(palette.background.ignoresSafeArea())
-          .opacity(isHomeSearchFocused ? 0 : 1)
-          .allowsHitTesting(!isHomeSearchFocused)
-          .zIndex(0)
-
-        // Focused search is a full-screen overlay (opacity only — no Y morph).
-        if isHomeSearchFocused {
-          HomeTelegramSearchView(
-            query: $homeSearchQuery,
-            isFocused: $isHomeSearchFocused,
-            recentRows: recentSearchRows,
-            filteredChats: filteredRows.filter { !$0.isArchiveEntry || trimmedHomeQuery.isEmpty },
-            people: combinedPeopleResults,
-            isGlobalSearching: isGlobalSearching,
-            isDark: colorScheme == .dark,
-            palette: palette,
-            onSelectChat: { openLocalChatRow($0) },
-            onSelectPerson: { handleGlobalUserTap($0) },
-            onClose: closeHomeSearch
+          // The background goes CLEAR the instant search focuses: the results
+          // sheet (identical palette background) sits BEHIND the list, so the
+          // swap is pixel-invisible — and the cells fading out then REVEAL the
+          // results that were "already there". Restored instantly at gate-off.
+          .background(
+            (isHomeSearchFocused ? Color.clear : palette.background)
+              .ignoresSafeArea()
           )
-          .transition(.opacity)
+          .allowsHitTesting(!isHomeSearchFocused)
           .zIndex(1)
-        }
+
+        // Focused search results sheet — PERMANENTLY mounted, pre-warmed, and
+        // BELOW the list: it never animates (no fade, no motion). The home
+        // cells fading out over it are the reveal; the input itself flies in
+        // a UIKit window overlay above everything.
+        HomeTelegramSearchView(
+          query: $homeSearchQuery,
+          visible: isHomeSearchFocused,
+          recentRows: recentSearchRows,
+          filteredChats: filteredRows.filter { !$0.isArchiveEntry || trimmedHomeQuery.isEmpty },
+          people: combinedPeopleResults,
+          isGlobalSearching: isGlobalSearching,
+          isDark: colorScheme == .dark,
+          palette: palette,
+          onSelectChat: { openLocalChatRow($0) },
+          onSelectPerson: { handleGlobalUserTap($0) }
+        )
+        .allowsHitTesting(isHomeSearchFocused)
+        .zIndex(0)
 
         // Edit pills: fixed overlay in the tab-bar band (tab bar only fades).
         if isEditingHome && !isHomeSearchFocused {
@@ -2464,8 +2501,11 @@ private struct ChatHomeScreen: View {
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: pendingDeletion?.id)
         .animation(.spring(response: 0.22, dampingFraction: 0.9), value: pendingDeleteConfirmation?.id)
         .navigationBarTitleDisplayMode(.inline)
-        // Always keep toolbar items mounted. Search focus uses SwiftUI
-        // `.toolbar(.hidden)` only — no Y translate / spring collapse.
+        // The bar is NEVER hidden — hiding collapses the top safe area, which
+        // re-insets the table (rows jump) and Y-slides the bar itself. Search
+        // focus fades the item contents in place (plus the UIKit bar alpha via
+        // setNavigationBarFaded, which also lets band touches reach the docked
+        // field). The header never translates.
         .toolbar {
           ToolbarItem(placement: .topBarLeading) {
             Button(isEditingHome ? "Done" : "Edit") {
@@ -2477,6 +2517,8 @@ private struct ChatHomeScreen: View {
             .fontWeight(.semibold)
             .tint(colorScheme == .dark ? .white : .black)
             .disabled(filteredRows.isEmpty && !isEditingHome)
+            .opacity(searchPresented ? 0 : 1)
+            .allowsHitTesting(!isHomeSearchFocused)
           }
 
           ToolbarItem(placement: .principal) {
@@ -2484,6 +2526,8 @@ private struct ChatHomeScreen: View {
               state: model.headerState,
               palette: palette
             )
+            .opacity(searchPresented ? 0 : 1)
+            .allowsHitTesting(!isHomeSearchFocused)
           }
 
           if !isEditingHome {
@@ -2523,12 +2567,12 @@ private struct ChatHomeScreen: View {
                 .contentShape(Rectangle())
               }
               .padding(.horizontal, 6)
+              .opacity(searchPresented ? 0 : 1)
+              .allowsHitTesting(!isHomeSearchFocused)
             }
           }
         }
         .toolbarBackground(.hidden, for: .navigationBar)
-        // SwiftUI hide only — open/close disables animations so nav never Y-springs.
-        .toolbar(isHomeSearchFocused ? .hidden : .visible, for: .navigationBar)
         // Search entry lives in UITableView.tableHeaderView (not safeAreaInset).
         .onChange(of: isHomeSearchFocused) { _, isPresented in
           if isPresented {
@@ -2672,7 +2716,10 @@ private struct ChatHomeScreen: View {
         // safeAreaInset / contentInset fight with the UIKit table.
         searchText: $homeSearchQuery,
         isSearchFocused: Binding(
-          get: { isHomeSearchFocused },
+          // The native list keys off the animated POSE, not the mount: cells
+          // fade/lift when the field takes off, and restore when the descent
+          // starts (not at the later unmount).
+          get: { isHomeSearchFocused && searchPresented },
           set: { focused in
             if focused {
               openHomeSearch()
@@ -2681,6 +2728,10 @@ private struct ChatHomeScreen: View {
             }
           }
         ),
+        isSearchOverlayVisible: isHomeSearchFocused,
+        // Close phase 1: native side retracts the xmark and re-widens the
+        // (flying) capsule at the dock before the descent.
+        isSearchRetracting: searchCloseRetracting,
         recentRows: recentSearchRows,
         peopleResults: combinedPeopleResults,
         isGlobalSearching: isGlobalSearching,
@@ -2766,6 +2817,34 @@ private struct ChatHomeScreen: View {
       AppUITrace.error("ChatsRootView bulkAction error action=\(action) error=\(error.localizedDescription)")
       AppToastController.shared.show(error.localizedDescription)
     }
+  }
+
+  /// Same philosophy as `setTabBarHidden`: fade only, never hide. Hiding the
+  /// bar collapses the top safe area — the table's contentInset tracks it and
+  /// every row jumps ("home is shifting"), and the system Y-slides the bar.
+  /// With alpha 0 + interaction off, the band stays reserved, the header fades
+  /// in place, and touches fall through to the search field docked in the band.
+  private func setNavigationBarFaded(_ faded: Bool) {
+    guard let tab = coordinator.tabBarController,
+      let rootView = tab.selectedViewController?.view,
+      let bar = Self.findNavigationBar(in: rootView)
+    else { return }
+    bar.isUserInteractionEnabled = !faded
+    UIView.animate(
+      withDuration: faded ? 0.22 : 0.28,
+      delay: 0,
+      options: [.beginFromCurrentState, .curveEaseInOut, .allowUserInteraction]
+    ) {
+      bar.alpha = faded ? 0.0 : 1.0
+    }
+  }
+
+  private static func findNavigationBar(in view: UIView) -> UINavigationBar? {
+    if let bar = view as? UINavigationBar { return bar }
+    for sub in view.subviews {
+      if let bar = findNavigationBar(in: sub) { return bar }
+    }
+    return nil
   }
 
   private func setTabBarHidden(_ hidden: Bool, animated: Bool) {
@@ -3603,52 +3682,122 @@ private struct ArchivedChatHomeListScreen: View {
 /// only label opacity reflects enabled/disabled.
 // MARK: - Home search (Telegram-style shared field + close slide-in)
 
-/// System-searchable fill — full capsule (corner radius = half height).
+/// Frame-hitch + phase logger for the search focus/blur morph. `begin` starts
+/// a 1.2s CADisplayLink watch: any frame gap over ~2 refresh intervals is
+/// logged with its offset-from-begin, so a laggy open can be pinned to a
+/// phase (pose flip, keyboard, glass-on, native fade). Capture on-device with
+/// Console.app filtered to "SearchMorph", or:
+///   log stream --predicate 'eventMessage CONTAINS "[SearchMorph]"'
+private final class SearchMorphProfiler: NSObject {
+  static let shared = SearchMorphProfiler()
+
+  private var link: CADisplayLink?
+  private var label = ""
+  private var startedAt: CFTimeInterval = 0
+  private var lastFrame: CFTimeInterval = 0
+  private var hitchCount = 0
+  private var worstMs = 0.0
+
+  private override init() {
+    super.init()
+    let center = NotificationCenter.default
+    center.addObserver(
+      self, selector: #selector(keyboardWillShow),
+      name: UIResponder.keyboardWillShowNotification, object: nil)
+    center.addObserver(
+      self, selector: #selector(keyboardDidShow),
+      name: UIResponder.keyboardDidShowNotification, object: nil)
+  }
+
+  func begin(_ label: String) {
+    finish(logSummary: false)
+    self.label = label
+    startedAt = CACurrentMediaTime()
+    lastFrame = 0
+    hitchCount = 0
+    worstMs = 0
+    NSLog("[SearchMorph] %@ begin", label)
+    let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+    link.add(to: .main, forMode: .common)
+    self.link = link
+    let generation = startedAt
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+      // Generation guard: a later begin() must not have its watch cut short
+      // by this earlier session's scheduled stop.
+      guard let self, self.startedAt == generation else { return }
+      self.finish(logSummary: true)
+    }
+  }
+
+  static func mark(_ event: String) {
+    let profiler = shared
+    guard profiler.link != nil else { return }
+    NSLog(
+      "[SearchMorph] %@ +%.0fms %@",
+      profiler.label, (CACurrentMediaTime() - profiler.startedAt) * 1000, event)
+  }
+
+  @objc private func tick(_ link: CADisplayLink) {
+    if lastFrame > 0 {
+      let frameMs = (link.timestamp - lastFrame) * 1000
+      let expectedMs = link.duration * 1000
+      if frameMs > max(expectedMs * 2.2, 20) {
+        hitchCount += 1
+        worstMs = max(worstMs, frameMs)
+        NSLog(
+          "[SearchMorph] %@ HITCH +%.0fms frame=%.1fms (budget %.1fms)",
+          label, (link.timestamp - startedAt) * 1000, frameMs, expectedMs)
+      }
+    }
+    lastFrame = link.timestamp
+  }
+
+  @objc private func keyboardWillShow() { Self.mark("keyboardWillShow") }
+  @objc private func keyboardDidShow() { Self.mark("keyboardDidShow") }
+
+  private func finish(logSummary: Bool) {
+    guard link != nil else { return }
+    link?.invalidate()
+    link = nil
+    if logSummary {
+      NSLog(
+        "[SearchMorph] %@ end — hitches=%ld worst=%.1fms", label, hitchCount, worstMs)
+    }
+  }
+}
+
+/// Shared metrics for the search flight (the capsule itself is UIKit —
+/// HomeSearchCapsuleView — and flies in a window overlay).
 private enum HomeSearchChrome {
-  static let fieldHeight: CGFloat = 40
   static let closeSize: CGFloat = 34
 
-  static var fieldFill: Color {
-    Color(uiColor: UIColor { traits in
-      traits.userInterfaceStyle == .dark
-        ? UIColor(white: 0.18, alpha: 1.0)
-        : UIColor.tertiarySystemFill
-    })
-  }
-
-  static var closeFill: Color {
-    Color(uiColor: UIColor { traits in
-      traits.userInterfaceStyle == .dark
-        ? UIColor(white: 0.22, alpha: 1.0)
-        : UIColor.tertiarySystemFill
-    })
+  /// Dock Y for the focused field: centered in the nav band, just under the
+  /// status bar. Derived from the key window (status inset only — the nav
+  /// band never affects window insets), NOT from a GeometryReader inside an
+  /// `ignoresSafeArea` view, whose reported insets under-measure and pushed
+  /// the field into the status-bar region.
+  static var dockTop: CGFloat {
+    let statusTop =
+      UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .flatMap { $0.windows }
+      .first { $0.isKeyWindow }?.safeAreaInsets.top ?? 59
+    return statusTop + 2
   }
 }
 
-/// Full-capsule search field chrome (focused overlay).
-private struct HomeSearchCapsuleField<Content: View>: View {
-  @ViewBuilder var content: () -> Content
+// MARK: - Focused search surface (overlay)
 
-  var body: some View {
-    content()
-      .padding(.horizontal, 12)
-      .frame(
-        maxWidth: .infinity,
-        minHeight: HomeSearchChrome.fieldHeight,
-        maxHeight: HomeSearchChrome.fieldHeight,
-        alignment: .leading
-      )
-      .background(HomeSearchChrome.fieldFill, in: Capsule(style: .continuous))
-      .clipShape(Capsule(style: .continuous))
-  }
-}
-
-// MARK: - Focused search surface (overlay — no matchedGeometry Y morph)
-
-/// Full-screen search UI. Opacity present only; nav is hidden via `.toolbar(.hidden)`.
+/// Full-screen focused-search RESULTS SHEET (the input is not here — the
+/// native in-list capsule itself flies in a UIKit window overlay above this).
+/// It NEVER animates: it sits BELOW the home list, "already there", and the
+/// home cells fading out over it are the reveal. Permanently mounted;
+/// `visible` is the instant on/off gate.
 private struct HomeTelegramSearchView: View {
   @Binding var query: String
-  @Binding var isFocused: Bool
+  /// Instant visibility (never animated) — flips in the same commit the
+  /// capsule flight starts/ends and the list's background goes clear.
+  let visible: Bool
   let recentRows: [ChatHomeListRow]
   let filteredChats: [ChatHomeListRow]
   let people: [ContactSearchUser]
@@ -3657,65 +3806,36 @@ private struct HomeTelegramSearchView: View {
   let palette: AppThemePalette
   let onSelectChat: (ChatHomeListRow) -> Void
   let onSelectPerson: (ContactSearchUser) -> Void
-  let onClose: () -> Void
-
-  @FocusState private var fieldFocused: Bool
 
   private var showRecentsStrip: Bool {
     query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
   var body: some View {
-    VStack(spacing: 0) {
-      // Full-capsule field + circular close (Telegram layout).
-      HStack(spacing: 10) {
-        HomeSearchCapsuleField {
-          HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-              .font(.system(size: 16, weight: .medium))
-              .foregroundStyle(palette.secondaryText)
-            TextField("Search", text: $query)
-              .textFieldStyle(.plain)
-              .textInputAutocapitalization(.never)
-              .autocorrectionDisabled()
-              .focused($fieldFocused)
-              .font(.system(size: 17))
-              .foregroundStyle(palette.text)
-              .submitLabel(.search)
-            if !query.isEmpty {
-              Button {
-                query = ""
-              } label: {
-                Image(systemName: "xmark.circle.fill")
-                  .font(.system(size: 16))
-                  .symbolRenderingMode(.hierarchical)
-                  .foregroundStyle(palette.secondaryText.opacity(0.75))
-              }
-              .buttonStyle(.plain)
-            }
-          }
-        }
+    ZStack(alignment: .top) {
+      palette.background
+        .ignoresSafeArea()
+      resultsPane
+        .padding(
+          .top,
+          HomeSearchChrome.dockTop + HomeSearchCapsuleView.fieldHeight + 10)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    .ignoresSafeArea(.container, edges: .top)
+    // Instant show/hide gate — flipped outside any animation. NO fades here:
+    // the sheet is static behind the list; the cells' fade is the reveal.
+    .opacity(visible ? 1 : 0)
+    .onChange(of: visible) { _, shown in
+      SearchMorphProfiler.mark(shown ? "overlay visible" : "overlay hidden")
+    }
+  }
 
-        Button(action: onClose) {
-          Image(systemName: "xmark")
-            .font(.system(size: 14, weight: .semibold))
-            .foregroundStyle(palette.text.opacity(0.9))
-            .frame(width: HomeSearchChrome.closeSize, height: HomeSearchChrome.closeSize)
-            .background(
-              Circle().fill(HomeSearchChrome.closeFill)
-            )
-            .clipShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Close search")
-      }
-      .padding(.horizontal, 16)
-      .padding(.top, 8)
-      .padding(.bottom, 10)
-
-      // Results scroll under the pinned bar (searchable-like).
+  private var resultsPane: some View {
+    // Results scroll under the pinned bar (searchable-like).
+    ScrollViewReader { proxy in
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 0) {
+          Color.clear.frame(height: 0).id("searchResultsTop")
           if showRecentsStrip && !recentRows.isEmpty {
             ScrollView(.horizontal, showsIndicators: false) {
               HStack(spacing: 14) {
@@ -3724,7 +3844,8 @@ private struct HomeTelegramSearchView: View {
                     onSelectChat(row)
                   } label: {
                     VStack(spacing: 5) {
-                      HomeSearchAvatarView(row: row, isDark: isDark, size: 54)
+                      HomeSearchAvatarView(
+                        row: row, isDark: isDark, palette: palette, size: 54)
                       Text(row.title)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(palette.secondaryText)
@@ -3808,11 +3929,11 @@ private struct HomeTelegramSearchView: View {
         }
         .padding(.bottom, 24)
       }
-    }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(palette.background.ignoresSafeArea())
-    .onAppear {
-      fieldFocused = true
+      .onChange(of: visible) { _, shown in
+        // The pre-warmed pane keeps its scroll offset across sessions — snap
+        // back to the top while hidden so every open starts fresh.
+        if !shown { proxy.scrollTo("searchResultsTop", anchor: .top) }
+      }
     }
   }
 
@@ -3835,7 +3956,7 @@ private struct HomeSearchCompactRow: View {
 
   var body: some View {
     HStack(spacing: 12) {
-      HomeSearchAvatarView(row: row, isDark: isDark, size: 42)
+      HomeSearchAvatarView(row: row, isDark: isDark, palette: palette, size: 42)
       VStack(alignment: .leading, spacing: 2) {
         Text(row.title)
           .font(.system(size: 16, weight: .medium))
@@ -3868,22 +3989,16 @@ private struct HomeSearchCompactPersonRow: View {
 
   var body: some View {
     HStack(spacing: 12) {
-      ZStack {
-        let colors = ChatProfileAppearanceStore.avatarColors(
-          title: user.username, peerUserId: user.userID, chatId: nil)
-        Circle()
-          .fill(
-            LinearGradient(
-              colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
-              startPoint: .topLeading,
-              endPoint: .bottomTrailing
-            )
-          )
-        Text(String(user.username.prefix(1)).uppercased())
-          .font(.system(size: 15, weight: .semibold))
-          .foregroundStyle(.white)
-      }
-      .frame(width: 42, height: 42)
+      HomeListStyleAvatar(
+        title: user.username,
+        peerUserId: user.userID,
+        chatId: nil,
+        avatarURI: user.profileImage,
+        fallback: ChatHomeCardCell.getFallbackInitials(from: user.username),
+        isDark: isDark,
+        palette: palette,
+        size: 42
+      )
       VStack(alignment: .leading, spacing: 2) {
         Text(user.username)
           .font(.system(size: 16, weight: .medium))
@@ -3907,34 +4022,20 @@ private struct HomeSearchCompactPersonRow: View {
 private struct HomeSearchAvatarView: View {
   let row: ChatHomeListRow
   let isDark: Bool
+  let palette: AppThemePalette
   var size: CGFloat = 56
 
   var body: some View {
-    ZStack {
-      let colors = ChatProfileAppearanceStore.avatarColors(
-        title: row.title, peerUserId: row.peerUserId, chatId: row.chatId)
-      Circle()
-        .fill(
-          LinearGradient(
-            colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-          )
-        )
-      Text(ChatHomeCardCell.getFallbackInitials(from: row.title))
-        .font(.system(size: size * 0.32, weight: .semibold))
-        .foregroundStyle(.white)
-      if let uri = row.avatarUri, let url = URL(string: uri) {
-        AsyncImage(url: url) { phase in
-          if case .success(let image) = phase {
-            image.resizable().scaledToFill()
-          }
-        }
-        .frame(width: size, height: size)
-        .clipShape(Circle())
-      }
-    }
-    .frame(width: size, height: size)
+    HomeListStyleAvatar(
+      title: row.title,
+      peerUserId: row.peerUserId,
+      chatId: row.chatId,
+      avatarURI: row.avatarUri,
+      fallback: ChatHomeCardCell.getFallbackInitials(from: row.title),
+      isDark: isDark,
+      palette: palette,
+      size: size
+    )
   }
 }
 
@@ -3942,54 +4043,169 @@ private struct HomeSearchAvatarView: View {
 
 /// Full-capsule search entry at the top of the home list (`tableHeaderView`).
 /// Tapping opens the focused search surface — field is not a sticky safeAreaInset.
-private final class ChatHomeInListSearchHeader: UIView {
-  var onFocusChange: ((Bool) -> Void)?
-
-  private let capsule = UIView()
-  private let iconView = UIImageView()
-  private let placeholderLabel = UILabel()
-  private let hitButton = UIButton(type: .system)
-  private var isDark = true
-
-  private static let fieldHeight: CGFloat = 40
-  private static let horizontalInset: CGFloat = 16
-  private static let verticalInset: CGFloat = 6
-
-  var preferredHeight: CGFloat {
-    Self.fieldHeight + Self.verticalInset * 2
+/// Window-level flight layer: passes touches through everywhere except its
+/// actual subviews (the flying capsule + close button).
+private final class SearchFlightContainerView: UIView {
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    let view = super.hitTest(point, with: event)
+    return view === self ? nil : view
   }
+}
+
+/// THE one search capsule. It lives in the table header when idle and is
+/// REPARENTED into a window-level container and flown to the nav band on
+/// focus — the same UIView travels, so there is no native→ghost handoff and
+/// nothing inside the input can ever jump. Inner layout is AutoLayout (it
+/// animates under UIViewPropertyAnimator frame changes); the capsule itself is
+/// frame-positioned so reparenting never tears down constraints.
+private final class HomeSearchCapsuleView: UIView {
+  static let fieldHeight: CGFloat = 44
+
+  let iconView = UIImageView()
+  let textField = UITextField()
+  let placeholderLabel = UILabel()
+  private let fillView = UIView()
+  private var glassView: UIVisualEffectView?
+  var onTextChanged: ((String) -> Void)?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
-    setup()
-  }
+    layer.cornerRadius = Self.fieldHeight * 0.5
+    layer.cornerCurve = .continuous
+    layer.masksToBounds = true
 
-  required init?(coder: NSCoder) {
-    fatalError("init(coder:) has not been implemented")
-  }
+    fillView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(fillView)
 
-  private func setup() {
-    backgroundColor = .clear
-
-    capsule.translatesAutoresizingMaskIntoConstraints = false
-    // Full capsule — radius always half of field height.
-    capsule.layer.cornerRadius = Self.fieldHeight * 0.5
-    capsule.layer.cornerCurve = .continuous
-    capsule.layer.masksToBounds = true
-    capsule.clipsToBounds = true
-    addSubview(capsule)
+    if #available(iOS 26.0, *) {
+      // Docked look only — alpha stays 0 through the flight (Liquid Glass
+      // crossfading mid-spring costs frames) and fades in after settle.
+      let glass = UIVisualEffectView(effect: UIGlassEffect())
+      glass.translatesAutoresizingMaskIntoConstraints = false
+      glass.alpha = 0
+      glass.isUserInteractionEnabled = false
+      addSubview(glass)
+      NSLayoutConstraint.activate([
+        glass.leadingAnchor.constraint(equalTo: leadingAnchor),
+        glass.trailingAnchor.constraint(equalTo: trailingAnchor),
+        glass.topAnchor.constraint(equalTo: topAnchor),
+        glass.bottomAnchor.constraint(equalTo: bottomAnchor),
+      ])
+      glassView = glass
+    }
 
     iconView.translatesAutoresizingMaskIntoConstraints = false
     iconView.image = UIImage(systemName: "magnifyingglass")
     iconView.contentMode = .scaleAspectFit
     iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
       pointSize: 15, weight: .medium)
-    capsule.addSubview(iconView)
+    addSubview(iconView)
+
+    textField.translatesAutoresizingMaskIntoConstraints = false
+    textField.font = .systemFont(ofSize: 17, weight: .regular)
+    textField.autocorrectionType = .no
+    textField.autocapitalizationType = .none
+    textField.returnKeyType = .search
+    textField.clearButtonMode = .whileEditing
+    // Idle in the list: taps go to the header's hit button; the flight
+    // controller enables interaction when docked.
+    textField.isUserInteractionEnabled = false
+    textField.addTarget(self, action: #selector(textChanged), for: .editingChanged)
+    addSubview(textField)
 
     placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
     placeholderLabel.text = "Search"
     placeholderLabel.font = .systemFont(ofSize: 17, weight: .regular)
-    capsule.addSubview(placeholderLabel)
+    placeholderLabel.isUserInteractionEnabled = false
+    addSubview(placeholderLabel)
+
+    NSLayoutConstraint.activate([
+      fillView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      fillView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      fillView.topAnchor.constraint(equalTo: topAnchor),
+      fillView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+      iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+      iconView.widthAnchor.constraint(equalToConstant: 18),
+      iconView.heightAnchor.constraint(equalToConstant: 18),
+
+      textField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+      textField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+      textField.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+      placeholderLabel.leadingAnchor.constraint(equalTo: textField.leadingAnchor),
+      placeholderLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+    ])
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  func applyPalette(isDark: Bool) {
+    fillView.backgroundColor =
+      isDark ? UIColor(white: 0.18, alpha: 1.0) : UIColor.tertiarySystemFill
+    let secondary =
+      isDark ? UIColor.white.withAlphaComponent(0.45) : UIColor.secondaryLabel
+    iconView.tintColor = secondary
+    placeholderLabel.textColor = secondary
+    textField.textColor = isDark ? .white : .label
+  }
+
+  func syncText(_ text: String) {
+    if textField.text != text { textField.text = text }
+    placeholderLabel.isHidden = !(textField.text ?? "").isEmpty
+  }
+
+  func setGlass(
+    _ on: Bool, animated: Bool = true, duration: TimeInterval = 0.15,
+    delay: TimeInterval = 0
+  ) {
+    guard let glassView else { return }
+    let apply = {
+      glassView.alpha = on ? 1 : 0
+      self.fillView.alpha = on ? 0 : 1
+    }
+    if animated {
+      UIView.animate(
+        withDuration: duration, delay: delay,
+        options: [.beginFromCurrentState, .curveEaseInOut],
+        animations: apply)
+    } else {
+      apply()
+    }
+  }
+
+  @objc private func textChanged() {
+    placeholderLabel.isHidden = !(textField.text ?? "").isEmpty
+    onTextChanged?(textField.text ?? "")
+  }
+}
+
+private final class ChatHomeInListSearchHeader: UIView {
+  var onFocusChange: ((Bool) -> Void)?
+
+  let capsuleView = HomeSearchCapsuleView()
+  private let hitButton = UIButton(type: .system)
+
+  var preferredHeight: CGFloat {
+    HomeSearchCapsuleView.fieldHeight + 12
+  }
+
+  /// The capsule's home slot in header coordinates — the flight's takeoff and
+  /// landing frame.
+  var capsuleSlotFrame: CGRect {
+    CGRect(
+      x: 16, y: 6, width: bounds.width - 32,
+      height: HomeSearchCapsuleView.fieldHeight)
+  }
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    backgroundColor = .clear
+
+    addSubview(capsuleView)
 
     hitButton.translatesAutoresizingMaskIntoConstraints = false
     hitButton.addTarget(self, action: #selector(handleTap), for: .touchUpInside)
@@ -3997,25 +4213,32 @@ private final class ChatHomeInListSearchHeader: UIView {
     addSubview(hitButton)
 
     NSLayoutConstraint.activate([
-      capsule.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.horizontalInset),
-      capsule.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.horizontalInset),
-      capsule.topAnchor.constraint(equalTo: topAnchor, constant: Self.verticalInset),
-      capsule.heightAnchor.constraint(equalToConstant: Self.fieldHeight),
-
-      iconView.leadingAnchor.constraint(equalTo: capsule.leadingAnchor, constant: 12),
-      iconView.centerYAnchor.constraint(equalTo: capsule.centerYAnchor),
-      iconView.widthAnchor.constraint(equalToConstant: 18),
-      iconView.heightAnchor.constraint(equalToConstant: 18),
-
-      placeholderLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
-      placeholderLabel.trailingAnchor.constraint(equalTo: capsule.trailingAnchor, constant: -12),
-      placeholderLabel.centerYAnchor.constraint(equalTo: capsule.centerYAnchor),
-
       hitButton.leadingAnchor.constraint(equalTo: leadingAnchor),
       hitButton.trailingAnchor.constraint(equalTo: trailingAnchor),
       hitButton.topAnchor.constraint(equalTo: topAnchor),
       hitButton.bottomAnchor.constraint(equalTo: bottomAnchor),
     ])
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    // Only place the capsule while it is actually home — never fight the
+    // window-level flight for its frame.
+    if capsuleView.superview === self {
+      capsuleView.frame = capsuleSlotFrame
+    }
+  }
+
+  /// Land the capsule back onto its slot after a flight.
+  func attach(_ capsule: HomeSearchCapsuleView) {
+    addSubview(capsule)
+    capsule.frame = capsuleSlotFrame
+    capsule.textField.isUserInteractionEnabled = false
+    bringSubviewToFront(hitButton)
   }
 
   func apply(
@@ -4025,30 +4248,11 @@ private final class ChatHomeInListSearchHeader: UIView {
     recentRows: [ChatHomeListRow],
     animated: Bool
   ) {
-    _ = text
     _ = isFocused
     _ = recentRows
     _ = animated
-    self.isDark = isDark
-    let fill: UIColor =
-      isDark
-      ? UIColor(white: 0.18, alpha: 1.0)
-      : UIColor.tertiarySystemFill
-    let secondary: UIColor =
-      isDark
-      ? UIColor.white.withAlphaComponent(0.45)
-      : UIColor.secondaryLabel
-    capsule.backgroundColor = fill
-    iconView.tintColor = secondary
-    placeholderLabel.textColor = secondary
-    // Full corner radius (true pill).
-    capsule.layer.cornerRadius = Self.fieldHeight * 0.5
-    capsule.layer.masksToBounds = true
-  }
-
-  override func layoutSubviews() {
-    super.layoutSubviews()
-    capsule.layer.cornerRadius = Self.fieldHeight * 0.5
+    capsuleView.applyPalette(isDark: isDark)
+    capsuleView.syncText(text)
   }
 
   @objc private func handleTap() {
@@ -4324,6 +4528,10 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   let selectedChatIDs: Set<String>
   var searchText: Binding<String>? = nil
   var isSearchFocused: Binding<Bool>? = nil
+  /// Instant (unanimated) overlay visibility — sheet gate bookkeeping.
+  var isSearchOverlayVisible: Bool = false
+  /// Close phase 1 — triggers the native retract (xmark out, capsule re-widen).
+  var isSearchRetracting: Bool = false
   var recentRows: [ChatHomeListRow] = []
   var peopleResults: [ContactSearchUser] = []
   var isGlobalSearching: Bool = false
@@ -4344,6 +4552,8 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
     controller.onSelectPerson = onSelectPerson
     controller.searchTextBinding = searchText
     controller.isSearchFocusedBinding = isSearchFocused
+    controller.searchOverlayVisibleFlag = isSearchOverlayVisible
+    controller.searchRetractingFlag = isSearchRetracting
     controller.showsInListSearch = searchText != nil
     controller.apply(
       rows: rows,
@@ -4367,6 +4577,8 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
     uiViewController.onSelectPerson = onSelectPerson
     uiViewController.searchTextBinding = searchText
     uiViewController.isSearchFocusedBinding = isSearchFocused
+    uiViewController.searchOverlayVisibleFlag = isSearchOverlayVisible
+    uiViewController.searchRetractingFlag = isSearchRetracting
     uiViewController.showsInListSearch = searchText != nil
     uiViewController.apply(
       rows: rows,
@@ -4385,16 +4597,18 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   UITableViewDelegate, UIGestureRecognizerDelegate, ChatHomeCardCellSwipeDelegate
 {
   private let tableView = UITableView(frame: .zero, style: .plain)
-  private lazy var previewLongPressRecognizer: UILongPressGestureRecognizer = {
+  private lazy var previewHoldRecognizer: UILongPressGestureRecognizer = {
     let recognizer = UILongPressGestureRecognizer(
       target: self,
-      action: #selector(handlePreviewLongPress(_:))
+      action: #selector(handlePreviewHold(_:))
     )
-    recognizer.minimumPressDuration = 0.24
-    recognizer.allowableMovement = 10.0
+    // Begin on touch-down so the press scale follows the finger for the whole
+    // recognition interval. The actual preview still commits after 0.19s.
+    recognizer.minimumPressDuration = 0
+    recognizer.allowableMovement = 10
     recognizer.delaysTouchesBegan = false
     recognizer.delaysTouchesEnded = false
-    recognizer.cancelsTouchesInView = true
+    recognizer.cancelsTouchesInView = false
     recognizer.delegate = self
     return recognizer
   }()
@@ -4407,6 +4621,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   fileprivate var onSelectPerson: ((ContactSearchUser) -> Void)?
   fileprivate var searchTextBinding: Binding<String>?
   fileprivate var isSearchFocusedBinding: Binding<Bool>?
+  fileprivate var searchOverlayVisibleFlag = false
+  fileprivate var searchRetractingFlag = false
   fileprivate var showsInListSearch = false
 
   private var rows: [ChatHomeListRow] = []
@@ -4418,6 +4634,14 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   private var showsRightCheckmark = false
   private var searchHeader: ChatHomeInListSearchHeader?
   private var lastSearchHeaderSignature = ""
+  private var presentedSearchFocus = false
+  private var presentedSearchOverlay = false
+  private var presentedSearchRetract = false
+  /// Window-level layer the capsule flies in (above the SwiftUI results sheet,
+  /// which lives inside the SwiftUI hierarchy below the window's top).
+  private var searchFlightContainer: UIView?
+  private var searchCloseButton: UIButton?
+  private var searchReturnAnimator: UIViewPropertyAnimator?
 
   override var preferredStatusBarStyle: UIStatusBarStyle {
     return isDark ? .lightContent : .darkContent
@@ -4425,7 +4649,15 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   private var selectedChatIDs = Set<String>()
   private var lastAppliedSignature = ""
   private weak var openSwipeCell: ChatHomeCardCell?
-  private weak var heldPreviewCell: ChatHomeCardCell?
+  private weak var previewHoldCell: ChatHomeCardCell?
+  private var previewHoldIndexPath: IndexPath?
+  private var activePreviewChatID: String?
+  private var previewHoldOrigin = CGPoint.zero
+  private var previewHoldOriginalTransform: CGAffineTransform = .identity
+  private var previewHoldCommitted = false
+  private var previewDepressAnimator: UIViewPropertyAnimator?
+  private var previewHoldEngagement: DispatchWorkItem?
+  private var pendingPreviewController: ChatHomeMiniPreviewController?
   private var suppressSelectionUntil: CFTimeInterval = 0
   private var bridgeStatusObserver: NSObjectProtocol?
   private var bridgeStatusPollTask: Task<Void, Never>?
@@ -4452,12 +4684,12 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   }
 
   private func updateInListSearchHeader(animated: Bool) {
-    // Hide in-list entry while editing or while the focused search overlay owns chrome
-    // (header is only for the scrollable unfocused field at the top of the list).
+    // Keep the header mounted through focus transitions so removing tableHeaderView
+    // cannot jump every row upward while the SwiftUI surface is morphing over it.
+    // Visible cells animate independently; this header never inherits their Y shift.
     let showHeader =
       showsInListSearch
       && !isEditingMode
-      && isSearchFocusedBinding?.wrappedValue != true
     guard showHeader else {
       if tableView.tableHeaderView != nil {
         tableView.tableHeaderView = nil
@@ -4470,9 +4702,14 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       header = existing
     } else {
       header = ChatHomeInListSearchHeader(
-        frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: 52))
+        frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: 56))
       header.onFocusChange = { [weak self] focused in
         self?.isSearchFocusedBinding?.wrappedValue = focused
+      }
+      // The capsule's UITextField is the ONE live input — its edits flow into
+      // the SwiftUI query binding that drives the results sheet.
+      header.capsuleView.onTextChanged = { [weak self] text in
+        self?.searchTextBinding?.wrappedValue = text
       }
       searchHeader = header
     }
@@ -4490,6 +4727,246 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     header.frame = CGRect(x: 0, y: 0, width: width, height: targetHeight)
     // Re-assign so UITableView picks up new header size without a body flash.
     tableView.tableHeaderView = header
+  }
+
+  private func updateSearchFocusPresentation(animated: Bool) {
+    let focused = isSearchFocusedBinding?.wrappedValue == true
+    let retracting = searchRetractingFlag
+    let focusChanged = focused != presentedSearchFocus
+    let overlayChanged = searchOverlayVisibleFlag != presentedSearchOverlay
+    let retractChanged = retracting != presentedSearchRetract
+    guard focusChanged || overlayChanged || retractChanged || !animated else { return }
+    presentedSearchFocus = focused
+    presentedSearchOverlay = searchOverlayVisibleFlag
+    presentedSearchRetract = retracting
+
+    let changes = {
+      // Only chat rows yield to the focused surface: they lift and fade in the
+      // same upward direction the field travels. The navigation header never
+      // moves (it fades in place via setNavigationBarFaded).
+      for cell in self.tableView.visibleCells {
+        cell.alpha = focused ? 0.0 : 1.0
+        cell.transform = focused
+          ? CGAffineTransform(translationX: 0, y: -10)
+          : .identity
+      }
+    }
+    guard animated else {
+      changes()
+      settleSearchFlight(focused: focused)
+      return
+    }
+
+    if retractChanged && retracting {
+      beginSearchCloseRetract()
+    }
+
+    guard focusChanged else { return }
+    if focused {
+      beginSearchFlightOpen()
+    } else {
+      beginSearchFlightReturn()
+    }
+    NSLog(
+      "[SearchMorph] native cells %@ visible=%ld",
+      focused ? "out" : "in", tableView.visibleCells.count)
+    // Cells ride the SAME spring as the capsule flight — true lockstep. A
+    // faster fixed-duration fade here finished its −10pt lift while the
+    // spring was still winding up: "the list shifts before the input moves".
+    let spring = UISpringTimingParameters(
+      mass: 1,
+      stiffness: focused ? 438 : 503,
+      damping: focused ? 37.7 : 41.3,
+      initialVelocity: .zero)
+    let cellAnimator = UIViewPropertyAnimator(duration: 0, timingParameters: spring)
+    cellAnimator.addAnimations(changes)
+    cellAnimator.startAnimation()
+  }
+
+  // MARK: Search capsule flight (pure UIKit/Core Animation)
+  //
+  // The in-list capsule ITSELF is reparented into a window-level container and
+  // flown to the nav band. One view, two poses — no ghost, no handoff, nothing
+  // inside the input can jump, and the CA spring keeps rendering even when the
+  // keyboard stalls the main thread (the stall is deliberately requested only
+  // AFTER the animation is committed to the render server).
+
+  private func searchDockFrame(in window: UIWindow, narrowed: Bool) -> CGRect {
+    let top = window.safeAreaInsets.top + 2
+    let width =
+      window.bounds.width - 32 - (narrowed ? HomeSearchChrome.closeSize + 10 : 0)
+    return CGRect(
+      x: 16, y: top, width: width, height: HomeSearchCapsuleView.fieldHeight)
+  }
+
+  private func ensureSearchFlightContainer(in window: UIWindow) -> UIView {
+    if let existing = searchFlightContainer, existing.window === window {
+      return existing
+    }
+    searchFlightContainer?.removeFromSuperview()
+    let container = SearchFlightContainerView(frame: window.bounds)
+    container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    window.addSubview(container)
+    searchFlightContainer = container
+    return container
+  }
+
+  private func ensureSearchCloseButton(in container: UIView) -> UIButton {
+    let size = HomeSearchChrome.closeSize
+    let button: UIButton
+    if let existing = searchCloseButton, existing.superview === container {
+      button = existing
+    } else {
+      searchCloseButton?.removeFromSuperview()
+      button = UIButton(type: .custom)
+      if #available(iOS 26.0, *) {
+        let glass = UIVisualEffectView(effect: UIGlassEffect())
+        glass.frame = CGRect(x: 0, y: 0, width: size, height: size)
+        glass.layer.cornerRadius = size / 2
+        glass.layer.masksToBounds = true
+        glass.isUserInteractionEnabled = false
+        button.insertSubview(glass, at: 0)
+      } else {
+        button.layer.cornerRadius = size / 2
+      }
+      let image = UIImage(
+        systemName: "xmark",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+      )?.withRenderingMode(.alwaysTemplate)
+      button.setImage(image, for: .normal)
+      button.accessibilityLabel = "Close search"
+      button.addTarget(self, action: #selector(handleSearchCloseTap), for: .touchUpInside)
+      container.addSubview(button)
+      searchCloseButton = button
+    }
+    if #available(iOS 26.0, *) {
+    } else {
+      button.backgroundColor =
+        isDark ? UIColor(white: 0.22, alpha: 1.0) : UIColor.tertiarySystemFill
+    }
+    button.tintColor = isDark ? UIColor.white.withAlphaComponent(0.9) : .label
+    return button
+  }
+
+  @objc private func handleSearchCloseTap() {
+    isSearchFocusedBinding?.wrappedValue = false
+  }
+
+  private func beginSearchFlightOpen() {
+    guard let header = searchHeader, let window = view.window else { return }
+    let capsule = header.capsuleView
+    searchReturnAnimator?.stopAnimation(true)
+    searchReturnAnimator = nil
+
+    let container = ensureSearchFlightContainer(in: window)
+    let start =
+      capsule.superview === container
+      ? capsule.frame
+      : header.convert(capsule.frame, to: window)
+    container.isHidden = false
+    window.bringSubviewToFront(container)
+    container.addSubview(capsule)
+    capsule.frame = start
+    capsule.textField.isUserInteractionEnabled = true
+
+    let close = ensureSearchCloseButton(in: container)
+    let dock = searchDockFrame(in: window, narrowed: true)
+    close.frame = CGRect(
+      x: window.bounds.width,
+      y: dock.midY - HomeSearchChrome.closeSize / 2,
+      width: HomeSearchChrome.closeSize,
+      height: HomeSearchChrome.closeSize)
+    close.alpha = 1
+
+    SearchMorphProfiler.mark("capsule flight begin")
+    let spring = UISpringTimingParameters(
+      mass: 1, stiffness: 438, damping: 37.7, initialVelocity: .zero)
+    let animator = UIViewPropertyAnimator(duration: 0, timingParameters: spring)
+    animator.addAnimations {
+      capsule.frame = dock
+      capsule.layoutIfNeeded()
+      close.frame.origin.x =
+        window.bounds.width - 16 - HomeSearchChrome.closeSize
+    }
+    animator.startAnimation()
+
+    // Glass crossfades in MIDWAY through the flight: the solid fill fades out
+    // as the glass fades in under the shared inner content — reads as the
+    // tapped solid input crossfading into a glass input while traveling, with
+    // no waiting-at-the-dock latency. The glass layer was created at init, so
+    // nothing is allocated mid-spring.
+    capsule.setGlass(true, duration: 0.20, delay: 0.10)
+
+    // Keyboard AFTER the flight is committed to the render server — its ~90ms
+    // main-thread stall can then no longer freeze the spring's first frames.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+      guard let self, self.presentedSearchFocus else { return }
+      SearchMorphProfiler.mark("focus request")
+      self.searchHeader?.capsuleView.textField.becomeFirstResponder()
+    }
+  }
+
+  private func beginSearchCloseRetract() {
+    guard let window = view.window, let header = searchHeader else { return }
+    let capsule = header.capsuleView
+    guard capsule.superview === searchFlightContainer else { return }
+    capsule.setGlass(false, duration: 0.12)
+    let full = searchDockFrame(in: window, narrowed: false)
+    let close = searchCloseButton
+    let animator = UIViewPropertyAnimator(duration: 0.12, curve: .easeOut) {
+      capsule.frame = full
+      capsule.layoutIfNeeded()
+      close?.frame.origin.x = window.bounds.width
+    }
+    animator.startAnimation()
+    // Resign AFTER this commit — dismissal stalls ~40ms on the main thread.
+    DispatchQueue.main.async {
+      SearchMorphProfiler.mark("keyboard dismiss request")
+      capsule.textField.resignFirstResponder()
+    }
+  }
+
+  private func beginSearchFlightReturn() {
+    guard let window = view.window, let header = searchHeader else { return }
+    let capsule = header.capsuleView
+    guard capsule.superview === searchFlightContainer else { return }
+    let target = header.convert(header.capsuleSlotFrame, to: window)
+    let spring = UISpringTimingParameters(
+      mass: 1, stiffness: 503, damping: 41.3, initialVelocity: .zero)
+    let animator = UIViewPropertyAnimator(duration: 0, timingParameters: spring)
+    animator.addAnimations {
+      capsule.frame = target
+      capsule.layoutIfNeeded()
+    }
+    animator.addCompletion { [weak self] _ in
+      SearchMorphProfiler.mark("capsule reattached")
+      self?.settleSearchFlight(focused: false)
+    }
+    searchReturnAnimator = animator
+    animator.startAnimation()
+  }
+
+  private func settleSearchFlight(focused: Bool) {
+    guard let header = searchHeader else { return }
+    let capsule = header.capsuleView
+    if focused {
+      guard let window = view.window else { return }
+      if capsule.superview !== searchFlightContainer {
+        let container = ensureSearchFlightContainer(in: window)
+        container.isHidden = false
+        container.addSubview(capsule)
+        capsule.textField.isUserInteractionEnabled = true
+      }
+      capsule.frame = searchDockFrame(in: window, narrowed: true)
+    } else {
+      searchReturnAnimator = nil
+      if capsule.superview !== header {
+        header.attach(capsule)
+      }
+      capsule.setGlass(false, animated: false)
+      searchFlightContainer?.isHidden = true
+      searchCloseButton?.alpha = 0
+    }
   }
 
   override func viewDidLoad() {
@@ -4517,7 +4994,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     // No UIRefreshControl — pull-to-refresh spinner removed from home.
     tableView.refreshControl = nil
     tableView.keyboardDismissMode = .onDrag
-    tableView.addGestureRecognizer(previewLongPressRecognizer)
+    tableView.addGestureRecognizer(previewHoldRecognizer)
     bridgeStatusObserver = NotificationCenter.default.addObserver(
       forName: AgentPairingService.statusDidChangeNotification,
       object: nil,
@@ -4544,6 +5021,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       tableView.reloadData()
     }
     updateInListSearchHeader(animated: false)
+    updateSearchFocusPresentation(animated: false)
     AppUIStallWatchdog.shared.updateContext(
       "ChatHomeNativeListController viewDidLoad rows=\(rows.count)"
     )
@@ -4595,6 +5073,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     if let bridgeStatusObserver {
       NotificationCenter.default.removeObserver(bridgeStatusObserver)
     }
+    // The flight layer lives in the window, not our view tree.
+    searchFlightContainer?.removeFromSuperview()
   }
 
   private func startBridgeStatusPolling() {
@@ -4639,7 +5119,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       selectedChatIDs: selectedChatIDs
     )
     let searchSig =
-      "\(searchTextBinding?.wrappedValue ?? "")|\(isSearchFocusedBinding?.wrappedValue == true)|\(recentRows.count)|\(peopleResults.count)|\(isGlobalSearching)"
+      "\(searchTextBinding?.wrappedValue ?? "")|\(isSearchFocusedBinding?.wrappedValue == true)|\(searchOverlayVisibleFlag)|\(searchRetractingFlag)|\(recentRows.count)|\(peopleResults.count)|\(isGlobalSearching)"
     let signatureUnchanged = nextSignature == lastAppliedSignature
     let searchUnchanged = searchSig == lastSearchHeaderSignature
     if signatureUnchanged && searchUnchanged { return }
@@ -4679,6 +5159,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     }
 
     updateInListSearchHeader(animated: true)
+    updateSearchFocusPresentation(animated: true)
 
     // Search-only header/recents update — don't reload the table body.
     if signatureUnchanged {
@@ -4871,6 +5352,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
           isEditSelected: self.selectedChatIDs.contains(row.chatId),
           showsRightCheckmark: self.showsRightCheckmark
         )
+        cell.isHidden = row.chatId == self.activePreviewChatID
       }
     }
     if animateEditLayout {
@@ -4940,95 +5422,326 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     return "tail:\(tail.count):\(firstID):\(newestID):\(revision)"
   }
 
-  @objc private func handlePreviewLongPress(_ recognizer: UILongPressGestureRecognizer) {
+  private func previewDebugLog(_ message: String) {
+    NSLog("[ChatHomePreview] t=%.3f %@", CACurrentMediaTime(), message)
+  }
+
+  @objc private func handlePreviewHold(_ recognizer: UILongPressGestureRecognizer) {
+    let point = recognizer.location(in: tableView)
+
     switch recognizer.state {
     case .began:
-      guard !isEditingMode, presentedViewController == nil else { return }
-      let point = recognizer.location(in: tableView)
       guard
+        !isEditingMode,
+        !presentedSearchFocus,
+        presentedViewController == nil,
         let indexPath = tableView.indexPathForRow(at: point),
-        rows.indices.contains(indexPath.row)
+        rows.indices.contains(indexPath.row),
+        !rows[indexPath.row].isArchiveEntry,
+        let cell = tableView.cellForRow(at: indexPath) as? ChatHomeCardCell
       else { return }
 
-      let row = rows[indexPath.row]
-      guard !row.isArchiveEntry else { return }
       openSwipeCell?.closeSwipe(animated: true)
       openSwipeCell = nil
-      suppressSelectionUntil = CACurrentMediaTime() + 1.0
+      previewDepressAnimator?.stopAnimation(true)
+      previewDepressAnimator = nil
+      previewHoldEngagement?.cancel()
+      previewHoldEngagement = nil
+      clearPendingPreview()
+      previewHoldCell = cell
+      previewHoldIndexPath = indexPath
+      previewHoldOrigin = point
+      previewHoldOriginalTransform = cell.transform
+      previewHoldCommitted = false
+      let row = rows[indexPath.row]
+      previewDebugLog(
+        "hold began row=\(indexPath.row) point=\(NSCoder.string(for: point))"
+      )
 
-      guard let cell = tableView.cellForRow(at: indexPath) as? ChatHomeCardCell else { return }
-      heldPreviewCell = cell
-      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-      setPreviewHoldFeedback(cell, held: true, animated: true)
-
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self, weak recognizer, weak cell] in
-        guard let self, let recognizer else { return }
-        guard recognizer.state == .began || recognizer.state == .changed else {
-          if let cell {
-            self.setPreviewHoldFeedback(cell, held: false, animated: true)
-          }
+      // The press reads in real time: the card sinks slowly for the whole hold
+      // window instead of popping to a settled scale. easeIn + the lead-in
+      // delay make the first ~150ms visually silent, so a quick tap never
+      // flashes the depress. When the sink lands, the expansion fires directly
+      // from that state — no second beat.
+      let depress = UIViewPropertyAnimator(duration: 0.35, curve: .easeIn) {
+        cell.transform = self.previewHoldOriginalTransform.scaledBy(x: 0.95, y: 0.95)
+      }
+      depress.addCompletion { [weak self, weak recognizer, weak cell] position in
+        guard let self else { return }
+        guard position == .end, let recognizer, let cell else { return }
+        guard
+          self.previewHoldCell === cell,
+          self.previewHoldIndexPath == indexPath,
+          self.rows.indices.contains(indexPath.row),
+          recognizer.state == .began || recognizer.state == .changed,
+          self.presentedViewController == nil,
+          self.tableView.panGestureRecognizer.state != .began,
+          self.tableView.panGestureRecognizer.state != .changed
+        else {
+          self.cancelPreviewHold(animated: true)
           return
         }
-        guard self.presentedViewController == nil else {
-          if let cell {
-            self.setPreviewHoldFeedback(cell, held: false, animated: false)
-          }
+
+        let currentPoint = recognizer.location(in: self.tableView)
+        guard hypot(
+          currentPoint.x - self.previewHoldOrigin.x,
+          currentPoint.y - self.previewHoldOrigin.y
+        ) <= 10 else {
+          self.cancelPreviewHold(animated: true)
           return
         }
-        if let cell {
-          self.setPreviewHoldFeedback(cell, held: false, animated: false)
-        }
-        self.presentMiniPreview(for: row, sourceIndexPath: indexPath)
+
+        self.previewHoldCommitted = true
+        self.previewDepressAnimator = nil
+        self.suppressSelectionUntil = CACurrentMediaTime() + 0.8
+        let holdPointInWindow = self.tableView.convert(self.previewHoldOrigin, to: nil)
+        self.previewDebugLog(
+          "hold commit row=\(indexPath.row) point=\(NSCoder.string(for: holdPointInWindow))"
+        )
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        self.presentMiniPreview(
+          for: self.rows[indexPath.row],
+          holdPointInWindow: holdPointInWindow,
+          sourceCell: cell
+        )
+      }
+      previewDepressAnimator = depress
+      depress.startAnimation(afterDelay: 0.10)
+
+      // The moment the hold visibly engages: the tap highlight leaves the card
+      // (it is a hold now, not a tap — and it must not be baked into the
+      // expansion snapshot) and a soft tick confirms the grab. Cancelled
+      // holds/taps never reach this.
+      let engagement = DispatchWorkItem { [weak self, weak cell] in
+        guard
+          let self,
+          let cell,
+          self.previewHoldCell === cell,
+          !self.previewHoldCommitted
+        else { return }
+        self.previewHoldEngagement = nil
+        cell.setPressOverlaySuppressed(true, animated: true)
+        UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.7)
+      }
+      previewHoldEngagement = engagement
+      // Late enough that even a slow tap has lifted; early enough that the
+      // highlight is long gone before the expansion snapshot is taken.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: engagement)
+
+      // Build + lay out the chat preview during the hold, on the next runloop
+      // turn so the depress animation is already committed to the render
+      // server before the heavy first layout briefly occupies the main thread.
+      // It prewarms attached to the window (hidden, behind everything) so the
+      // list materializes cells exactly like a real chat open — an offscreen
+      // layout left the conversation unmounted/blank once presented.
+      DispatchQueue.main.async { [weak self, weak cell] in
+        guard
+          let self,
+          let cell,
+          let window = cell.window ?? self.viewIfLoaded?.window,
+          self.previewHoldCell === cell,
+          !self.previewHoldCommitted,
+          self.pendingPreviewController == nil
+        else { return }
+        let controller = ChatHomeMiniPreviewController(
+          row: row,
+          isDark: self.isDark,
+          avatarGradientColors: self.resolvedAvatarGradientColors(for: row)
+        )
+        controller.prewarmLayout(
+          targetSize: self.predictedPreviewCardSize(for: row),
+          attachingTo: window
+        )
+        self.pendingPreviewController = controller
+      }
+
+    case .changed:
+      guard !previewHoldCommitted, previewHoldCell != nil else { return }
+      let moved = hypot(point.x - previewHoldOrigin.x, point.y - previewHoldOrigin.y)
+      let tableIsPanning = tableView.panGestureRecognizer.state == .began
+        || tableView.panGestureRecognizer.state == .changed
+      if moved > 10 || tableIsPanning {
+        cancelPreviewHold(animated: true)
       }
 
     case .ended, .cancelled, .failed:
-      suppressSelectionUntil = CACurrentMediaTime() + 0.7
-      if presentedViewController == nil, let heldPreviewCell {
-        setPreviewHoldFeedback(heldPreviewCell, held: false, animated: true)
+      if previewHoldCommitted {
+        previewDepressAnimator?.stopAnimation(true)
+        previewDepressAnimator = nil
+        previewHoldEngagement?.cancel()
+        previewHoldEngagement = nil
+        previewHoldCell = nil
+        previewHoldIndexPath = nil
+        previewHoldCommitted = false
+      } else {
+        cancelPreviewHold(animated: true)
       }
-      heldPreviewCell = nil
 
     default:
       break
     }
   }
 
-  private func setPreviewHoldFeedback(_ cell: ChatHomeCardCell, held: Bool, animated: Bool) {
-    // Uniform spring scale only (no Y-stretch / morph). ~2% shrink from list.
-    let changes = {
-      cell.transform = held ? CGAffineTransform(scaleX: 0.98, y: 0.98) : .identity
+  private func clearPendingPreview() {
+    // The prewarm parks its view hidden inside the window; abandoning the hold
+    // must also detach it or it would leak in the hierarchy.
+    pendingPreviewController?.view.removeFromSuperview()
+    pendingPreviewController = nil
+  }
+
+  private func cancelPreviewHold(animated: Bool) {
+    // Stopping without finishing also kills a still-delayed depress, so a
+    // released tap can never sink the card after the finger is already gone.
+    previewDepressAnimator?.stopAnimation(true)
+    previewDepressAnimator = nil
+    previewHoldEngagement?.cancel()
+    previewHoldEngagement = nil
+    clearPendingPreview()
+    guard let cell = previewHoldCell else {
+      previewHoldIndexPath = nil
+      previewHoldCommitted = false
+      return
     }
-    if !animated {
+    let originalTransform = previewHoldOriginalTransform
+    previewDebugLog("hold cancel animated=\(animated ? "Y" : "N")")
+    cell.setPressOverlaySuppressed(false, animated: false)
+    previewHoldCell = nil
+    previewHoldIndexPath = nil
+    previewHoldCommitted = false
+
+    let changes = {
+      cell.transform = originalTransform
+    }
+    guard animated else {
       changes()
       return
     }
     UIView.animate(
-      withDuration: held ? 0.22 : 0.28,
-      delay: 0.0,
-      usingSpringWithDamping: 0.78,
-      initialSpringVelocity: 0.4,
+      withDuration: 0.24,
+      delay: 0,
+      usingSpringWithDamping: 0.90,
+      initialSpringVelocity: 0,
       options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut],
       animations: changes
     )
   }
 
-  private func presentMiniPreview(for row: ChatHomeListRow, sourceIndexPath: IndexPath) {
-    let sourceFrame = tableView.rectForRow(at: sourceIndexPath)
-    let sourceFrameInWindow = tableView.convert(sourceFrame, to: nil)
+  /// Same math the overlay resolves after presentation: full-window bounds and
+  /// safe insets are known here already, so the prewarm size is exact.
+  private func predictedPreviewCardSize(for row: ChatHomeListRow) -> CGSize {
+    let host: UIView = viewIfLoaded?.window ?? tableView.window ?? view
+    let menuHeight = ChatHomePreviewMetrics.menuHeight(
+      rowCount: ChatHomePreviewMetrics.menuRowCount(for: row)
+    )
+    return ChatHomePreviewMetrics.cardSize(
+      in: host.bounds,
+      safeInsets: host.safeAreaInsets,
+      menuHeight: menuHeight
+    )
+  }
+
+  private func presentMiniPreview(
+    for row: ChatHomeListRow,
+    holdPointInWindow: CGPoint,
+    sourceCell: ChatHomeCardCell
+  ) {
+    guard presentedViewController == nil else {
+      cancelPreviewHold(animated: true)
+      return
+    }
+
+    sourceCell.layoutIfNeeded()
+    guard let sourceSnapshot = sourceCell.contentView.snapshotView(afterScreenUpdates: false) else {
+      cancelPreviewHold(animated: true)
+      return
+    }
+    let sourceFrameInWindow = sourceCell.contentView.convert(sourceCell.contentView.bounds, to: nil)
+    previewDebugLog(
+      "present source=\(NSCoder.string(for: sourceFrameInWindow)) hold=\(NSCoder.string(for: holdPointInWindow))"
+    )
+    sourceSnapshot.frame = sourceFrameInWindow
+    sourceSnapshot.clipsToBounds = true
+    sourceSnapshot.layer.cornerRadius = 22
+    sourceSnapshot.layer.cornerCurve = .continuous
+
+    // Prefer the controller prewarmed during the hold; its expensive first
+    // layout is already done. Fall back to building one now (still prewarmed
+    // synchronously) if the hold committed before the async build ran.
+    let previewController: ChatHomeMiniPreviewController
+    if let pending = pendingPreviewController, pending.chatId == row.chatId {
+      previewController = pending
+      pendingPreviewController = nil
+    } else {
+      clearPendingPreview()
+      previewController = ChatHomeMiniPreviewController(
+        row: row,
+        isDark: isDark,
+        avatarGradientColors: resolvedAvatarGradientColors(for: row)
+      )
+      previewController.prewarmLayout(
+        targetSize: predictedPreviewCardSize(for: row),
+        attachingTo: sourceCell.window ?? viewIfLoaded?.window
+      )
+    }
+    previewHoldEngagement?.cancel()
+    previewHoldEngagement = nil
+
+    let originalTransform = previewHoldOriginalTransform
     let overlay = ChatHomeMiniPreviewOverlayController(
       row: row,
       isDark: isDark,
       sourceFrameInWindow: sourceFrameInWindow,
+      holdPointInWindow: holdPointInWindow,
+      sourceSnapshot: sourceSnapshot,
+      previewController: previewController,
+      sourceFrameProvider: { [weak sourceCell] in
+        guard let sourceCell, sourceCell.window != nil else { return nil }
+        return sourceCell.contentView.convert(sourceCell.contentView.bounds, to: nil)
+      },
       onOpen: { [weak self] row in
         self?.onSelect(row)
       },
       onAction: { [weak self] action, row in
         self?.onAction(action, row)
+      },
+      onFirstFrame: { [weak sourceCell] in
+        // The original row disappears only in the transaction that paints the
+        // overlay's snapshot at the same spot. Hiding it at present() time left
+        // a black hole in the list for the frames UIKit needs to actually
+        // mount the presentation.
+        sourceCell?.isHidden = true
+      },
+      onDismiss: { [weak self] in
+        guard let self else { return }
+        self.activePreviewChatID = nil
+        let sourceIndexPath = self.rows.firstIndex(where: { $0.chatId == row.chatId })
+          .map { IndexPath(row: $0, section: 0) }
+        let visibleSourceCell = sourceIndexPath.flatMap {
+          self.tableView.cellForRow(at: $0) as? ChatHomeCardCell
+        }
+        for case let visibleCell as ChatHomeCardCell in self.tableView.visibleCells {
+          visibleCell.isHidden = false
+          visibleCell.setPressOverlaySuppressed(false, animated: false)
+        }
+        guard let visibleSourceCell else { return }
+        UIView.animate(
+          withDuration: 0.22,
+          delay: 0,
+          usingSpringWithDamping: 0.88,
+          initialSpringVelocity: 0,
+          options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+        ) {
+          visibleSourceCell.transform = originalTransform
+        }
       }
     )
     overlay.modalPresentationStyle = .overFullScreen
-    overlay.modalTransitionStyle = .crossDissolve
+    overlay.modalPresentationCapturesStatusBarAppearance = true
+
+    activePreviewChatID = row.chatId
     present(overlay, animated: false)
+    previewHoldCell = nil
+    previewHoldIndexPath = nil
   }
 
   func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
@@ -5060,7 +5773,26 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       isEditSelected: selectedChatIDs.contains(row.chatId),
       showsRightCheckmark: showsRightCheckmark
     )
+    if presentedSearchFocus {
+      cell.alpha = 0
+      cell.transform = CGAffineTransform(translationX: 0, y: -18)
+    } else {
+      cell.alpha = 1
+      cell.transform = .identity
+    }
+    cell.isHidden = row.chatId == activePreviewChatID
     return cell
+  }
+
+  func tableView(
+    _ tableView: UITableView,
+    willDisplay cell: UITableViewCell,
+    forRowAt indexPath: IndexPath
+  ) {
+    guard let cell = cell as? ChatHomeCardCell, rows.indices.contains(indexPath.row) else {
+      return
+    }
+    cell.isHidden = rows[indexPath.row].chatId == activePreviewChatID
   }
 
   func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
@@ -5135,7 +5867,32 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     _ gestureRecognizer: UIGestureRecognizer,
     shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
   ) -> Bool {
-    false
+    // Touch-down hold tracking must not delay the table's own pan. A real drag
+    // cancels the pending hold in handlePreviewHold while scrolling continues.
+    if gestureRecognizer === previewHoldRecognizer
+      || otherGestureRecognizer === previewHoldRecognizer
+    {
+      return gestureRecognizer === tableView.panGestureRecognizer
+        || otherGestureRecognizer === tableView.panGestureRecognizer
+        || gestureRecognizer is UIPanGestureRecognizer
+        || otherGestureRecognizer is UIPanGestureRecognizer
+    }
+    return false
+  }
+
+  func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    guard gestureRecognizer === previewHoldRecognizer else { return true }
+    guard
+      !isEditingMode,
+      !presentedSearchFocus,
+      presentedViewController == nil
+    else { return false }
+    let point = gestureRecognizer.location(in: tableView)
+    guard
+      let indexPath = tableView.indexPathForRow(at: point),
+      rows.indices.contains(indexPath.row)
+    else { return false }
+    return !rows[indexPath.row].isArchiveEntry
   }
 
   func tableView(
@@ -5384,41 +6141,108 @@ private protocol ChatHomePreviewActionMenuViewDelegate: AnyObject {
   func homePreviewActionMenu(_ menu: ChatHomePreviewActionMenuView, didSelect action: ChatHomePreviewActionMenuView.Action)
 }
 
+/// One source of truth for the preview card + menu geometry so the hold-time
+/// prewarm and the overlay's live layout can never disagree about sizes.
+private enum ChatHomePreviewMetrics {
+  static let menuGap: CGFloat = 10
+  static let menuRowHeight: CGFloat = 36
+  static let menuVerticalPadding: CGFloat = 12
+
+  // Mirrors ChatHomePreviewActionMenuView.actionItems(): "Open Chat" plus five
+  // remote actions when the row supports them.
+  static func menuRowCount(for row: ChatHomeListRow) -> Int {
+    row.supportsRemoteHomeActions ? 6 : 1
+  }
+
+  // The menu's height is deterministic (fixed-height rows inside fixed
+  // padding). Measuring the glass wrapper via systemLayoutSizeFitting returns
+  // a collapsed height — UIVisualEffectView's contentView is autoresized, not
+  // constrained, so no height chain reaches the outer view — which is what
+  // made the menu invisible and let the card grow nearly fullscreen.
+  static func menuHeight(rowCount: Int) -> CGFloat {
+    CGFloat(rowCount) * menuRowHeight + menuVerticalPadding
+  }
+
+  static func cardSize(in bounds: CGRect, safeInsets: UIEdgeInsets, menuHeight: CGFloat) -> CGSize {
+    guard bounds.width > 1, bounds.height > 1 else { return .zero }
+    let availableHeight = max(
+      320,
+      (bounds.height - safeInsets.bottom - 16) - (safeInsets.top + 12)
+    )
+    let width = min(max(300, bounds.width - 24), 560)
+    let maxHeight = max(320, availableHeight - menuHeight - menuGap)
+    let height = max(min(340, maxHeight), min(availableHeight * 0.56, maxHeight))
+    return CGSize(width: width, height: height)
+  }
+}
+
 
 private final class ChatHomeMiniPreviewOverlayController: UIViewController,
   UIGestureRecognizerDelegate, ChatHomePreviewActionMenuViewDelegate
 {
+  private struct PreviewLayout {
+    let previewFrame: CGRect
+    let menuFrame: CGRect
+    let assemblyFrame: CGRect
+    let menuAnchorX: CGFloat
+  }
+
   private let backgroundGlassView: UIVisualEffectView
   private let colorOverlayView = UIView()
   private let previewGroupView = UIView()
+  private let previewAssemblyView = UIView()
   private let previewContainerView = UIView()
+  private let sourceSnapshot: UIView
   private let menuView: ChatHomePreviewActionMenuView
   private let previewController: ChatHomeMiniPreviewController
   private let row: ChatHomeListRow
   private let isDark: Bool
   private let sourceFrameInWindow: CGRect
+  private let holdPointInWindow: CGPoint
+  private let sourceFrameProvider: () -> CGRect?
   private let onOpen: (ChatHomeListRow) -> Void
   private let onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void
+  private let onFirstFrame: () -> Void
+  private let onDismiss: () -> Void
   private var isClosing = false
+  private var isTransitioning = false
+  private var didAnimateIn = false
+  private var presentationAnimator: UIViewPropertyAnimator?
+  private var chromeFadeAnimator: UIViewPropertyAnimator?
+  private var didFinishDismissal = false
+  private var dismissStartedAt: CFTimeInterval?
   private var ignoreBackdropTapUntil: CFTimeInterval = 0
 
   init(
     row: ChatHomeListRow,
     isDark: Bool,
     sourceFrameInWindow: CGRect,
+    holdPointInWindow: CGPoint,
+    sourceSnapshot: UIView,
+    previewController: ChatHomeMiniPreviewController,
+    sourceFrameProvider: @escaping () -> CGRect?,
     onOpen: @escaping (ChatHomeListRow) -> Void,
-    onAction: @escaping (ChatHomeRowAction, ChatHomeListRow) -> Void
+    onAction: @escaping (ChatHomeRowAction, ChatHomeListRow) -> Void,
+    onFirstFrame: @escaping () -> Void,
+    onDismiss: @escaping () -> Void
   ) {
     self.row = row
     self.isDark = isDark
     self.sourceFrameInWindow = sourceFrameInWindow
+    self.holdPointInWindow = holdPointInWindow
+    self.sourceSnapshot = sourceSnapshot
+    self.sourceFrameProvider = sourceFrameProvider
     self.onOpen = onOpen
     self.onAction = onAction
+    self.onFirstFrame = onFirstFrame
+    self.onDismiss = onDismiss
     self.backgroundGlassView = UIVisualEffectView(
       effect: UIBlurEffect(style: isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight)
     )
     self.menuView = ChatHomePreviewActionMenuView(row: row, isDark: isDark)
-    self.previewController = ChatHomeMiniPreviewController(row: row, isDark: isDark)
+    // Built and laid out during the hold (prewarm) so presentation has no
+    // first-layout stall and the expansion can start on its first frame.
+    self.previewController = previewController
     super.init(nibName: nil, bundle: nil)
   }
 
@@ -5430,11 +6254,16 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     isDark ? .lightContent : .darkContent
   }
 
+  private func previewDebugLog(_ message: String) {
+    NSLog("[ChatHomePreviewOverlay] t=%.3f %@", CACurrentMediaTime(), message)
+  }
+
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = .clear
 
-    backgroundGlassView.alpha = 0
+    // Never animate a visual-effect view's alpha. The material remains fully
+    // resolved while the source, preview, and menu animate above it.
     backgroundGlassView.frame = view.bounds
     backgroundGlassView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     view.addSubview(backgroundGlassView)
@@ -5445,27 +6274,44 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     colorOverlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     backgroundGlassView.contentView.addSubview(colorOverlayView)
 
-    previewGroupView.alpha = 0
+    previewGroupView.alpha = 1
     view.addSubview(previewGroupView)
+
+    // Preview and menu are one transition surface. The assembly owns all
+    // geometry so the menu cannot lag behind or visually detach from the card.
+    previewAssemblyView.backgroundColor = .clear
+    previewGroupView.addSubview(previewAssemblyView)
 
     previewContainerView.clipsToBounds = true
     previewContainerView.layer.cornerRadius = 22
     previewContainerView.layer.cornerCurve = .continuous
-    previewContainerView.layer.shadowColor = UIColor.black.cgColor
-    previewContainerView.layer.shadowOpacity = isDark ? 0.28 : 0.18
-    previewContainerView.layer.shadowRadius = 24
-    previewContainerView.layer.shadowOffset = CGSize(width: 0, height: 14)
-    previewGroupView.addSubview(previewContainerView)
+    previewContainerView.backgroundColor = isDark ? UIColor(white: 0.07, alpha: 1) : .white
+    previewAssemblyView.addSubview(previewContainerView)
 
     addChild(previewController)
-    previewController.view.frame = previewContainerView.bounds
-    previewController.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    // The conversation keeps its prewarmed final-size layout — never resized:
+    // the container's animating bounds clip-reveal it. Re-framing it here (or
+    // scaling it with the container) is what squashed the content mid-flight
+    // and redid the expensive first layout during presentation.
     previewContainerView.addSubview(previewController.view)
+    // The prewarm parked this view hidden inside the app window; it is the
+    // card's real content now.
+    previewController.view.isHidden = false
     previewController.didMove(toParent: self)
 
+    // The selected row is the preview's first content state, not a second
+    // floating sibling above it. It stays at its natural row size pinned to the
+    // container top and only fades — stretching it over the grown card is what
+    // smeared the avatar/title across the conversation.
+    sourceSnapshot.clipsToBounds = true
+    sourceSnapshot.layer.cornerRadius = 22
+    sourceSnapshot.layer.cornerCurve = .continuous
+    previewContainerView.addSubview(sourceSnapshot)
+
     menuView.delegate = self
-    menuView.alpha = 0
-    previewGroupView.addSubview(menuView)
+    menuView.alpha = 1
+    menuView.isUserInteractionEnabled = false
+    previewAssemblyView.addSubview(menuView)
 
     let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleBackdropTap(_:)))
     tapRecognizer.delegate = self
@@ -5477,10 +6323,69 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
 
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
-    guard !isClosing else { return }
+    guard !isClosing, !isTransitioning else { return }
     backgroundGlassView.frame = view.bounds
     colorOverlayView.frame = backgroundGlassView.contentView.bounds
-    layoutPreviewAndMenu()
+    previewGroupView.frame = view.bounds
+
+    let layout = resolvedPreviewLayout()
+    guard layout.previewFrame.width > 1, layout.previewFrame.height > 1 else { return }
+    previewAssemblyView.transform = .identity
+    previewAssemblyView.frame = layout.assemblyFrame
+
+    let finalContainerFrame = CGRect(
+      x: layout.previewFrame.minX - layout.assemblyFrame.minX,
+      y: layout.previewFrame.minY - layout.assemblyFrame.minY,
+      width: layout.previewFrame.width,
+      height: layout.previewFrame.height
+    )
+    previewController.view.frame = CGRect(origin: .zero, size: layout.previewFrame.size)
+
+    menuView.layer.anchorPoint = CGPoint(x: layout.menuAnchorX, y: 0)
+    menuView.bounds = CGRect(origin: .zero, size: layout.menuFrame.size)
+    let menuFinalPosition = CGPoint(
+      x: layout.menuFrame.minX - layout.assemblyFrame.minX
+        + layout.menuFrame.width * layout.menuAnchorX,
+      y: layout.menuFrame.minY - layout.assemblyFrame.minY
+    )
+
+    if didAnimateIn {
+      previewContainerView.frame = finalContainerFrame
+      menuView.transform = .identity
+      menuView.alpha = 1
+      menuView.layer.position = menuFinalPosition
+      sourceSnapshot.alpha = 0
+      previewController.view.alpha = 1
+    } else {
+      let sourceFrame = sourceFrameInView
+      let collapsedContainerFrame = CGRect(
+        x: sourceFrame.minX - layout.assemblyFrame.minX,
+        y: sourceFrame.minY - layout.assemblyFrame.minY,
+        width: sourceFrame.width,
+        height: sourceFrame.height
+      )
+      previewContainerView.frame = collapsedContainerFrame
+      sourceSnapshot.frame = CGRect(origin: .zero, size: sourceFrame.size)
+      sourceSnapshot.alpha = 1
+      previewController.view.alpha = 0
+      // The menu is attached below the card's bottom edge from frame one and
+      // rides the same spring, so it can never pop in late or detach.
+      menuView.transform = CGAffineTransform(scaleX: 0.55, y: 0.55)
+      menuView.alpha = 0
+      menuView.layer.position = CGPoint(
+        x: menuFinalPosition.x,
+        y: collapsedContainerFrame.maxY + ChatHomePreviewMetrics.menuGap
+      )
+    }
+    if !didAnimateIn {
+      // First real frame: the source row hands off to the snapshot in this
+      // same transaction (never a black hole in the list), the conversation
+      // rests on its latest message, and the expansion starts immediately —
+      // no intermediate "floating card over blur" frame is ever rendered.
+      onFirstFrame()
+      previewController.snapToLatest()
+      animateIn()
+    }
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -5488,126 +6393,144 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     animateIn()
   }
 
-  @discardableResult
-  private func layoutPreviewAndMenu() -> CGRect {
+  private var sourceFrameInView: CGRect {
+    view.convert(sourceFrameProvider() ?? sourceFrameInWindow, from: nil)
+  }
+
+  private var holdPointInView: CGPoint {
+    view.convert(holdPointInWindow, from: nil)
+  }
+
+  private func resolvedPreviewLayout() -> PreviewLayout {
     let bounds = view.bounds
-    guard bounds.width > 1, bounds.height > 1 else { return .zero }
+    guard bounds.width > 1, bounds.height > 1 else {
+      return PreviewLayout(
+        previewFrame: .zero,
+        menuFrame: .zero,
+        assemblyFrame: .zero,
+        menuAnchorX: 0.5
+      )
+    }
 
-    let safeTop = view.safeAreaInsets.top + 14
-    let safeBottom = bounds.height - view.safeAreaInsets.bottom - 14
-    let safeLeft: CGFloat = 10
-    let safeRight = bounds.width - 10
-    let availableHeight = max(320, safeBottom - safeTop)
+    let safeTop = view.safeAreaInsets.top + 12
+    let safeBottom = bounds.height - view.safeAreaInsets.bottom - 16
+    let safeLeft: CGFloat = 12
+    let safeRight = bounds.width - 12
 
-    let menuWidth = min(max(220, bounds.width * 0.54), min(268, bounds.width - 32))
-    let menuHeight = menuView.systemLayoutSizeFitting(
-      CGSize(width: menuWidth, height: UIView.layoutFittingCompressedSize.height),
-      withHorizontalFittingPriority: .required,
-      verticalFittingPriority: .fittingSizeLevel
-    ).height
-    let menuGap: CGFloat = 4
+    let menuWidth = min(max(200, bounds.width * 0.52), min(236, bounds.width - 48))
+    let menuHeight = ChatHomePreviewMetrics.menuHeight(rowCount: menuView.rowCount)
 
-    let previewWidth = min(max(300, bounds.width - 20), 560)
-    let maxPreviewHeight = max(300, availableHeight - menuHeight - menuGap)
-    let minPreviewHeight = min(maxPreviewHeight, min(380, max(320, availableHeight * 0.48)))
-    let preferredPreviewHeight = min(bounds.height * 0.68, maxPreviewHeight)
-    let previewHeight = max(minPreviewHeight, preferredPreviewHeight)
-    let groupHeight = previewHeight + menuGap + menuHeight
-    let sourceFrame = view.convert(sourceFrameInWindow, from: nil)
-    let desiredGroupY = sourceFrame.midY - groupHeight * 0.22
+    // A floating card, not an almost-fullscreen sheet: the height is capped so
+    // the menu always fits below it and the group keeps clear margins all
+    // around instead of leaving sliver borders at the screen edges.
+    let cardSize = ChatHomePreviewMetrics.cardSize(
+      in: bounds,
+      safeInsets: view.safeAreaInsets,
+      menuHeight: menuHeight
+    )
+    let previewWidth = cardSize.width
+    let previewHeight = cardSize.height
+    let groupHeight = previewHeight + ChatHomePreviewMetrics.menuGap + menuHeight
+    let sourceFrame = sourceFrameInView
+    let holdPoint = holdPointInView
+    let desiredGroupY = sourceFrame.midY - groupHeight * 0.24
     let groupY = max(safeTop, min(safeBottom - groupHeight, desiredGroupY))
     let previewX = max(safeLeft, min(safeRight - previewWidth, (bounds.width - previewWidth) * 0.5))
     let previewFrame = CGRect(x: previewX, y: groupY, width: previewWidth, height: previewHeight)
 
-    let isRightAligned = sourceFrame.midX >= bounds.midX
-    let menuX: CGFloat
-    if isRightAligned {
-      menuX = previewFrame.maxX - menuWidth - 12
-    } else {
-      menuX = previewFrame.minX + 12
-    }
+    let menuX = max(safeLeft, min(safeRight - menuWidth, holdPoint.x - menuWidth * 0.5))
     let menuFrame = CGRect(
-      x: max(safeLeft, min(safeRight - menuWidth, menuX)),
-      y: previewFrame.maxY + menuGap,
+      x: menuX,
+      y: previewFrame.maxY + ChatHomePreviewMetrics.menuGap,
       width: menuWidth,
       height: menuHeight
     )
-
-    previewGroupView.frame = CGRect(
-      x: 0,
-      y: 0,
-      width: bounds.width,
-      height: bounds.height
+    let menuAnchorX = max(
+      0.08,
+      min(0.92, (holdPoint.x - menuFrame.minX) / max(1, menuFrame.width))
     )
-    previewContainerView.frame = previewFrame
-    previewController.view.frame = previewContainerView.bounds
-    menuView.frame = menuFrame
-    previewContainerView.layer.shadowPath = UIBezierPath(
-      roundedRect: previewContainerView.bounds,
-      cornerRadius: previewContainerView.layer.cornerRadius
-    ).cgPath
-    return previewFrame
+    let assemblyFrame = previewFrame.union(menuFrame)
+
+    return PreviewLayout(
+      previewFrame: previewFrame,
+      menuFrame: menuFrame,
+      assemblyFrame: assemblyFrame,
+      menuAnchorX: menuAnchorX
+    )
   }
 
   private func animateIn() {
+    guard !didAnimateIn else { return }
     view.layoutIfNeeded()
-    let finalPreviewFrame = layoutPreviewAndMenu()
-    guard finalPreviewFrame.width > 1, finalPreviewFrame.height > 1 else { return }
+    let layout = resolvedPreviewLayout()
+    guard layout.previewFrame.width > 1, layout.previewFrame.height > 1 else { return }
+    didAnimateIn = true
+    isTransitioning = true
 
-    let sourceFrame = view.convert(sourceFrameInWindow, from: nil)
-    let finalCenter = CGPoint(x: finalPreviewFrame.midX, y: finalPreviewFrame.midY)
-    let sourceCenter = CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)
-    // Uniform scale from the list row — never non-uniform X/Y stretch.
-    let uniformScale = max(
-      0.12,
-      min(
-        1.0,
-        min(
-          sourceFrame.width / max(1, finalPreviewFrame.width),
-          sourceFrame.height / max(1, finalPreviewFrame.height)
-        )
-      )
+    ignoreBackdropTapUntil = CACurrentMediaTime() + 0.36
+    previewContainerView.isUserInteractionEnabled = false
+    menuView.isUserInteractionEnabled = false
+
+    let finalContainerFrame = CGRect(
+      x: layout.previewFrame.minX - layout.assemblyFrame.minX,
+      y: layout.previewFrame.minY - layout.assemblyFrame.minY,
+      width: layout.previewFrame.width,
+      height: layout.previewFrame.height
+    )
+    let menuFinalPosition = CGPoint(
+      x: layout.menuFrame.minX - layout.assemblyFrame.minX
+        + layout.menuFrame.width * layout.menuAnchorX,
+      y: layout.menuFrame.minY - layout.assemblyFrame.minY
+    )
+    previewDebugLog(
+      "open start source=\(NSCoder.string(for: sourceFrameInView)) hold=\(NSCoder.string(for: holdPointInView)) assembly=\(NSCoder.string(for: layout.assemblyFrame)) preview=\(NSCoder.string(for: layout.previewFrame)) menu=\(NSCoder.string(for: layout.menuFrame)) progress=0.000"
     )
 
-    previewGroupView.alpha = 1
-    previewContainerView.center = sourceCenter
-    previewContainerView.bounds = CGRect(origin: .zero, size: finalPreviewFrame.size)
-    previewContainerView.transform = CGAffineTransform(scaleX: uniformScale, y: uniformScale)
-    previewController.view.frame = previewContainerView.bounds
-    // Glass is present immediately (no fade) — scale only.
-    backgroundGlassView.alpha = 1
+    // Animation blocks capture the views directly, never self: an animator's
+    // stored block retaining the overlay kept dismissed previews (and their
+    // live ChatMainViews) alive, re-rendering agent cells forever.
+    let snapshot = sourceSnapshot
+    let container = previewContainerView
+    let content: UIView = previewController.view
+    let menu = menuView
 
-    let finalMenuFrame = menuView.frame
-    menuView.frame = finalMenuFrame
-    menuView.layer.anchorPoint = CGPoint(x: finalMenuFrame.midX >= view.bounds.midX ? 1.0 : 0.0, y: 0.0)
-    menuView.center = CGPoint(x: finalMenuFrame.midX, y: finalMenuFrame.midY)
-    // Glass menu: scale only, never opacity fade.
-    menuView.alpha = 1
-    menuView.transform = CGAffineTransform(scaleX: 0.92, y: 0.92)
-
-    menuView.isUserInteractionEnabled = false
-    ignoreBackdropTapUntil = CACurrentMediaTime() + 0.65
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self] in
-      guard let self, !self.isClosing else { return }
+    // The row chrome leaves first: a fast fade at natural size, gone before the
+    // expansion visually takes over, so avatar/title never ride the grown card.
+    let chromeAnimator = UIViewPropertyAnimator(duration: 0.10, curve: .easeOut) {
+      snapshot.alpha = 0
+    }
+    // One spring drives the card's clip-reveal and the menu pinned to its
+    // bottom edge; both interpolate on the same clock so the menu stays
+    // attached the entire flight instead of popping in at the end.
+    let animator = UIViewPropertyAnimator(duration: 0.28, dampingRatio: 0.88) {
+      container.frame = finalContainerFrame
+      content.alpha = 1
+      menu.transform = .identity
+      menu.alpha = 1
+      menu.layer.position = menuFinalPosition
+    }
+    animator.addCompletion { [weak self] position in
+      guard let self else { return }
+      guard !self.isClosing else { return }
+      self.isTransitioning = false
+      self.previewContainerView.isUserInteractionEnabled = true
       self.menuView.isUserInteractionEnabled = true
+      // Belt and braces: the conversation must rest on its latest message with
+      // no dead space, even if rows arrived while the card was in flight.
+      self.previewController.snapToLatest()
+      self.previewDebugLog(
+        "open finish position=\(String(describing: position)) progress=1.000"
+      )
     }
-
-    UIView.animate(
-      withDuration: 0.38,
-      delay: 0.0,
-      usingSpringWithDamping: 0.82,
-      initialSpringVelocity: 0.35,
-      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
-    ) {
-      self.previewContainerView.transform = .identity
-      self.previewContainerView.center = finalCenter
-      self.menuView.transform = .identity
-    }
+    presentationAnimator = animator
+    chromeFadeAnimator = chromeAnimator
+    chromeAnimator.startAnimation()
+    animator.startAnimation()
   }
 
   @objc private func handleBackdropTap(_ recognizer: UITapGestureRecognizer) {
     guard CACurrentMediaTime() >= ignoreBackdropTapUntil else { return }
-    close()
+    close(reason: "backdrop")
   }
 
   func homePreviewActionMenu(
@@ -5616,54 +6539,95 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
   ) {
     switch action {
     case .open:
-      close(after: { [row, onOpen] in onOpen(row) })
+      close(reason: "action.open", after: { [row, onOpen] in onOpen(row) })
     case .markUnread:
-      close(after: { [row, onAction] in onAction(.markUnread(!row.hasUnreadState), row) })
+      close(reason: "action.unread", after: { [row, onAction] in onAction(.markUnread(!row.hasUnreadState), row) })
     case .pin:
-      close(after: { [row, onAction] in onAction(.pin(!row.pinned), row) })
+      close(reason: "action.pin", after: { [row, onAction] in onAction(.pin(!row.pinned), row) })
     case .mute:
-      close(after: { [row, onAction] in onAction(.mute(!row.muted), row) })
+      close(reason: "action.mute", after: { [row, onAction] in onAction(.mute(!row.muted), row) })
     case .archive:
-      close(after: { [row, onAction] in onAction(.archive(!row.archived), row) })
+      close(reason: "action.archive", after: { [row, onAction] in onAction(.archive(!row.archived), row) })
     case .delete:
-      close(after: { [row, onAction] in onAction(.delete, row) })
+      close(reason: "action.delete", after: { [row, onAction] in onAction(.delete, row) })
     }
   }
 
-  private func close(after action: (() -> Void)? = nil) {
+  private func close(reason: String, after action: (() -> Void)? = nil) {
     guard !isClosing else { return }
     isClosing = true
+    isTransitioning = true
+    dismissStartedAt = CACurrentMediaTime()
     menuView.isUserInteractionEnabled = false
+    previewDebugLog("dismiss start reason=\(reason)")
 
-    let sourceFrame = view.convert(sourceFrameInWindow, from: nil)
-    let finalPreviewFrame = previewContainerView.frame
-    let uniformScale = max(
-      0.12,
-      min(
-        1.0,
-        min(
-          sourceFrame.width / max(1, finalPreviewFrame.width),
-          sourceFrame.height / max(1, finalPreviewFrame.height)
-        )
-      )
+    for running in [presentationAnimator, chromeFadeAnimator] {
+      if let running, running.state == .active {
+        running.stopAnimation(false)
+        running.finishAnimation(at: .current)
+      }
+    }
+
+    let targetSourceFrame = sourceFrameInView
+    let assemblyFrame = previewAssemblyView.frame
+    let collapsedContainerFrame = CGRect(
+      x: targetSourceFrame.minX - assemblyFrame.minX,
+      y: targetSourceFrame.minY - assemblyFrame.minY,
+      width: targetSourceFrame.width,
+      height: targetSourceFrame.height
+    )
+    let menuCollapsedPosition = CGPoint(
+      x: menuView.layer.position.x,
+      y: collapsedContainerFrame.maxY + ChatHomePreviewMetrics.menuGap
+    )
+    sourceSnapshot.frame = CGRect(origin: .zero, size: targetSourceFrame.size)
+    previewDebugLog(
+      "dismiss geometry assembly=\(NSCoder.string(for: assemblyFrame)) target=\(NSCoder.string(for: targetSourceFrame)) progress=1.000→0.000"
     )
 
-    // Scale-only close — no glass fade (fade breaks the glass material).
-    UIView.animate(
-      withDuration: 0.28,
-      delay: 0.0,
-      usingSpringWithDamping: 0.9,
-      initialSpringVelocity: 0.2,
-      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
-    ) {
-      self.menuView.transform = CGAffineTransform(scaleX: 0.92, y: 0.92)
-      self.previewContainerView.center = CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)
-      self.previewContainerView.transform = CGAffineTransform(
-        scaleX: uniformScale, y: uniformScale)
-    } completion: { _ in
-      self.backgroundGlassView.alpha = 0
-      self.dismiss(animated: false, completion: action)
+    // Dismiss is the exact inverse: the card clip-collapses onto the source row
+    // with the menu riding its bottom edge, and the row chrome only returns at
+    // the very end, once the card is nearly row-sized again. Blocks capture the
+    // views, never self (see animateIn — retained blocks leaked the overlay).
+    let snapshot = sourceSnapshot
+    let container = previewContainerView
+    let content: UIView = previewController.view
+    let menu = menuView
+    let animator = UIViewPropertyAnimator(duration: 0.16, curve: .easeIn) {
+      container.frame = collapsedContainerFrame
+      content.alpha = 0
+      menu.transform = CGAffineTransform(scaleX: 0.45, y: 0.45)
+      menu.alpha = 0
+      menu.layer.position = menuCollapsedPosition
     }
+    let chromeAnimator = UIViewPropertyAnimator(duration: 0.08, curve: .easeIn) {
+      snapshot.alpha = 1
+    }
+    animator.addCompletion { [weak self] position in
+      guard let self else { return }
+      self.previewDebugLog(
+        "dismiss animator finish position=\(String(describing: position)) progress=0.000"
+      )
+      self.menuView.removeFromSuperview()
+      self.finishDismissal(action: action)
+    }
+    presentationAnimator = animator
+    chromeFadeAnimator = chromeAnimator
+    animator.startAnimation()
+    chromeAnimator.startAnimation(afterDelay: 0.07)
+  }
+
+  private func finishDismissal(action: (() -> Void)?) {
+    guard !didFinishDismissal else { return }
+    didFinishDismissal = true
+    // Drop the animators so no stored animation state can outlive dismissal —
+    // a retained overlay means a retained live ChatMainView burning CPU.
+    presentationAnimator = nil
+    chromeFadeAnimator = nil
+    let elapsed = dismissStartedAt.map { CACurrentMediaTime() - $0 } ?? 0
+    previewDebugLog("dismiss finish elapsed=\(String(format: "%.3f", elapsed))")
+    onDismiss()
+    dismiss(animated: false, completion: action)
   }
 
   func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch)
@@ -5671,16 +6635,16 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
   {
     guard CACurrentMediaTime() >= ignoreBackdropTapUntil else { return false }
     let point = touch.location(in: view)
-    if previewContainerView.frame.contains(point) { return false }
-    if menuView.frame.contains(point) { return false }
+    if previewContainerView.convert(previewContainerView.bounds, to: view).contains(point) { return false }
+    if menuView.convert(menuView.bounds, to: view).contains(point) { return false }
     return true
   }
 
   func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
     guard CACurrentMediaTime() >= ignoreBackdropTapUntil else { return false }
     let point = gestureRecognizer.location(in: view)
-    if previewContainerView.frame.contains(point) { return false }
-    if menuView.frame.contains(point) { return false }
+    if previewContainerView.convert(previewContainerView.bounds, to: view).contains(point) { return false }
+    if menuView.convert(menuView.bounds, to: view).contains(point) { return false }
     return true
   }
 }
@@ -5701,30 +6665,20 @@ private final class ChatHomePreviewActionMenuView: UIView {
   private let stackView = UIStackView()
   private let row: ChatHomeListRow
   private let isDark: Bool
-  private var displayScale: CGFloat {
-    let scale = window?.windowScene?.screen.scale ?? traitCollection.displayScale
-    return scale > 0 ? scale : 3
-  }
+
+  var rowCount: Int { stackView.arrangedSubviews.count }
 
   init(row: ChatHomeListRow, isDark: Bool) {
     self.row = row
     self.isDark = isDark
-
-    if #available(iOS 26.0, *) {
-      let glass = UIGlassEffect()
-      glass.isInteractive = true
-      self.glassView = UIVisualEffectView(effect: glass)
-    } else {
-      let style: UIBlurEffect.Style = isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
-      self.glassView = UIVisualEffectView(effect: UIBlurEffect(style: style))
-    }
-    self.glassView.layer.cornerRadius = 18
-    self.glassView.clipsToBounds = true
-    self.glassView.layer.cornerCurve = .continuous
-    // Near-black wash in dark mode so glass doesn't read gray.
-    if isDark {
-      self.glassView.backgroundColor = UIColor.black.withAlphaComponent(0.28)
-    }
+    // Use the exact liquid-glass construction as the working message-cell menu.
+    // Keep Home borderless so the attached edge reads as one continuous surface.
+    self.glassView = makeChatContextLiquidGlassView(
+      style: isDark ? .systemMaterialDark : .systemMaterial,
+      cornerRadius: 24,
+      capsuleCorners: false,
+      interactive: false
+    )
     super.init(frame: .zero)
     setup()
   }
@@ -5736,8 +6690,9 @@ private final class ChatHomePreviewActionMenuView: UIView {
   private func setup() {
     clipsToBounds = false
     glassView.translatesAutoresizingMaskIntoConstraints = false
-    glassView.layer.borderColor = UIColor.white.withAlphaComponent(isDark ? 0.14 : 0.18).cgColor
-    glassView.layer.borderWidth = 1.0 / displayScale
+    // Material and corner shape provide the edge; an explicit outline makes the
+    // attached menu read as a separate popover.
+    glassView.layer.borderWidth = 0
     addSubview(glassView)
 
     stackView.axis = .vertical
@@ -5752,15 +6707,12 @@ private final class ChatHomePreviewActionMenuView: UIView {
       glassView.bottomAnchor.constraint(equalTo: bottomAnchor),
       stackView.leadingAnchor.constraint(equalTo: glassView.contentView.leadingAnchor),
       stackView.trailingAnchor.constraint(equalTo: glassView.contentView.trailingAnchor),
-      stackView.topAnchor.constraint(equalTo: glassView.contentView.topAnchor, constant: 8),
-      stackView.bottomAnchor.constraint(equalTo: glassView.contentView.bottomAnchor, constant: -8),
+      stackView.topAnchor.constraint(equalTo: glassView.contentView.topAnchor, constant: 6),
+      stackView.bottomAnchor.constraint(equalTo: glassView.contentView.bottomAnchor, constant: -6),
     ])
 
     let actions = actionItems()
-    for (index, item) in actions.enumerated() {
-      if index > 0 {
-        stackView.addArrangedSubview(separatorView())
-      }
+    for item in actions {
       let rowView = ChatHomePreviewActionRow(item: item, isDark: isDark)
       rowView.addTarget(self, action: #selector(handleRowTap(_:)), for: .touchUpInside)
       stackView.addArrangedSubview(rowView)
@@ -5803,25 +6755,6 @@ private final class ChatHomePreviewActionMenuView: UIView {
     return items
   }
 
-  private func separatorView() -> UIView {
-    let container = UIView()
-    container.translatesAutoresizingMaskIntoConstraints = false
-    let line = UIView()
-    line.translatesAutoresizingMaskIntoConstraints = false
-    line.backgroundColor = UIColor.label.withAlphaComponent(isDark ? 0.13 : 0.10)
-    container.addSubview(line)
-    let height = container.heightAnchor.constraint(equalToConstant: 1.0 / displayScale)
-    height.priority = .defaultHigh
-    NSLayoutConstraint.activate([
-      height,
-      line.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 54),
-      line.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
-      line.topAnchor.constraint(equalTo: container.topAnchor),
-      line.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-    ])
-    return container
-  }
-
   @objc private func handleRowTap(_ sender: ChatHomePreviewActionRow) {
     delegate?.homePreviewActionMenu(self, didSelect: sender.item.action)
   }
@@ -5847,7 +6780,7 @@ private final class ChatHomePreviewActionRow: UIControl {
     let textColor: UIColor = item.isDestructive ? .systemRed : (isDark ? .white : .label)
     iconView.image = UIImage(
       systemName: item.iconName,
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)
     )
     iconView.tintColor = textColor
     iconView.contentMode = .scaleAspectFit
@@ -5855,22 +6788,22 @@ private final class ChatHomePreviewActionRow: UIControl {
     addSubview(iconView)
 
     titleLabel.text = item.title
-    titleLabel.font = .systemFont(ofSize: 16.5, weight: .regular)
+    titleLabel.font = .systemFont(ofSize: 15.5, weight: .regular)
     titleLabel.textColor = textColor
     titleLabel.lineBreakMode = .byTruncatingTail
     titleLabel.translatesAutoresizingMaskIntoConstraints = false
     addSubview(titleLabel)
 
-    let height = heightAnchor.constraint(equalToConstant: 40)
+    let height = heightAnchor.constraint(equalToConstant: 36)
     height.priority = .defaultHigh
     NSLayoutConstraint.activate([
       height,
-      iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+      iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
       iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-      iconView.widthAnchor.constraint(equalToConstant: 21),
-      iconView.heightAnchor.constraint(equalToConstant: 21),
-      titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 12),
-      titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+      iconView.widthAnchor.constraint(equalToConstant: 20),
+      iconView.heightAnchor.constraint(equalToConstant: 20),
+      titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10),
+      titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
       titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
     ])
   }
@@ -5895,8 +6828,47 @@ private final class ChatHomeMiniPreviewController: UIViewController {
   private let isDark: Bool
   private var didInitialScrollToBottom = false
   private var openedChatChannel = false
+  private var pendingEngineRefresh: DispatchWorkItem?
 
-  init(row: ChatHomeListRow, isDark: Bool) {
+  var chatId: String { row.chatId }
+
+  private static func hexString(from color: UIColor) -> String {
+    var r: CGFloat = 0
+    var g: CGFloat = 0
+    var b: CGFloat = 0
+    var a: CGFloat = 0
+    color.getRed(&r, green: &g, blue: &b, alpha: &a)
+    return String(
+      format: "#%02X%02X%02X",
+      Int(round(max(0, min(1, r)) * 255)),
+      Int(round(max(0, min(1, g)) * 255)),
+      Int(round(max(0, min(1, b)) * 255))
+    )
+  }
+
+  /// Runs the expensive ChatMainView first layout during the hold, before the
+  /// overlay is presented, and rests the list on its latest message. The size
+  /// comes from the same metrics the overlay uses, so presentation only
+  /// confirms frames instead of doing layout work. The view is parked hidden
+  /// at the back of the window: the list only materializes cells like a real
+  /// chat open when it is window-attached — a detached layout came up blank.
+  func prewarmLayout(targetSize: CGSize, attachingTo window: UIWindow?) {
+    guard targetSize.width > 1, targetSize.height > 1 else { return }
+    view.frame = CGRect(origin: .zero, size: targetSize)
+    if let window, view.window == nil {
+      view.isHidden = true
+      window.insertSubview(view, at: 0)
+    }
+    view.layoutIfNeeded()
+    mainView.layoutIfNeeded()
+    mainView.scrollToBottom(animated: false)
+  }
+
+  func snapToLatest() {
+    mainView.scrollToBottom(animated: false)
+  }
+
+  init(row: ChatHomeListRow, isDark: Bool, avatarGradientColors: (UIColor, UIColor)? = nil) {
     self.row = row
     self.isDark = isDark
     let blurStyle: UIBlurEffect.Style = isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight
@@ -5905,6 +6877,12 @@ private final class ChatHomeMiniPreviewController: UIViewController {
 
     view.backgroundColor = .clear
     view.clipsToBounds = true
+    // A VC root view autoresizes with its superview by DEFAULT. Inside the
+    // overlay the container's bounds are spring-animated for the clip-reveal;
+    // without clearing this, the whole conversation (collection view included)
+    // was resized along the spring — the "inner content scales" bug and the
+    // UICollectionViewFlowLayout invalid-size warnings.
+    view.autoresizingMask = []
 
     backdropView.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(backdropView)
@@ -5921,9 +6899,9 @@ private final class ChatHomeMiniPreviewController: UIViewController {
       mainView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
     ])
 
-    backdropView.layer.cornerRadius = 20
-    view.layer.cornerRadius = 20
-    mainView.layer.cornerRadius = 20
+    backdropView.layer.cornerRadius = 22
+    view.layer.cornerRadius = 22
+    mainView.layer.cornerRadius = 22
     if #available(iOS 13.0, *) {
       backdropView.layer.cornerCurve = .continuous
       view.layer.cornerCurve = .continuous
@@ -5932,7 +6910,8 @@ private final class ChatHomeMiniPreviewController: UIViewController {
     backdropView.clipsToBounds = true
     mainView.clipsToBounds = true
     mainView.setExternalNavigationHeaderEnabled(false)
-    mainView.setPreviewHeaderCenterOnly(true)
+    mainView.setPreviewHeaderCenterOnly(false)
+    mainView.setPreviewHeaderCompactLeading(true)
     mainView.setAppearance(Self.previewAppearance(isDark: isDark))
     mainView.surfaceId = "home_preview_\(row.chatId)"
     mainView.setEngineSurfaceId(mainView.surfaceId)
@@ -5943,17 +6922,32 @@ private final class ChatHomeMiniPreviewController: UIViewController {
     ) {
       mainView.setEngineMyUserId(myUserId)
     }
+    if row.isSavedMessages {
+      // Saved Messages uses the bookmark avatar; without the mode the preview
+      // header showed a bare initials tile (or nothing at all).
+      mainView.setHeaderMode("savedmessages")
+    }
     mainView.setHeaderTitle(row.title)
     mainView.setHeaderSubtitle(Self.headerSubtitle(for: row))
     mainView.setProfileName(row.title)
     mainView.setProfileHandle(Self.profileHandle(for: row))
     mainView.setAvatarUri(row.avatarUri)
-    mainView.setAvatarGradientColors(
-      startLight: row.avatarGradientStartLight,
-      endLight: row.avatarGradientEndLight,
-      startDark: row.avatarGradientStartDark,
-      endDark: row.avatarGradientEndDark
-    )
+    if let avatarGradientColors {
+      // The card's header avatar must be the exact fallback the home row
+      // showed (home resolves via ChatProfileAppearanceStore, not the row's
+      // stored hex gradient) — otherwise the morph visibly recolors it.
+      let start = Self.hexString(from: avatarGradientColors.0)
+      let end = Self.hexString(from: avatarGradientColors.1)
+      mainView.setAvatarGradientColors(
+        startLight: start, endLight: end, startDark: start, endDark: end)
+    } else {
+      mainView.setAvatarGradientColors(
+        startLight: row.avatarGradientStartLight,
+        endLight: row.avatarGradientEndLight,
+        startDark: row.avatarGradientStartDark,
+        endDark: row.avatarGradientEndDark
+      )
+    }
     mainView.setIsOnline(Self.isOnline(for: row))
     mainView.setIsChatMuted(row.muted)
     mainView.setIsGroupOrChannel(row.isGroup)
@@ -5988,6 +6982,7 @@ private final class ChatHomeMiniPreviewController: UIViewController {
   }
 
   deinit {
+    pendingEngineRefresh?.cancel()
     NotificationCenter.default.removeObserver(
       self,
       name: ChatEngine.didChangeNotification,
@@ -6047,10 +7042,25 @@ private final class ChatHomeMiniPreviewController: UIViewController {
       mainView.setProfileHandle(Self.profileHandle(for: row))
     case "chatRowsReloaded", "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted",
       "chatMessageChanged", "messageStatusChanged":
-      refreshPreviewRows()
+      scheduleEngineRowsRefresh()
     default:
       break
     }
+  }
+
+  /// Live chats (group agent streams) fire engine changes in bursts; a full
+  /// setRows per event re-parses/re-measures agent cells and janks the open
+  /// animation. Coalesce refreshes, and never re-render a detached preview.
+  private func scheduleEngineRowsRefresh() {
+    guard pendingEngineRefresh == nil else { return }
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.pendingEngineRefresh = nil
+      guard self.viewIfLoaded?.window != nil else { return }
+      self.refreshPreviewRows()
+    }
+    pendingEngineRefresh = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
   }
 
   private static func preferredContentSize() -> CGSize {

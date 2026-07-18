@@ -234,8 +234,11 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
 
     let longPress = UILongPressGestureRecognizer(
       target: self, action: #selector(handleLongPress(_:)))
-    // Telegram-like cadence: fast enough for real-time feel without accidental triggers.
-    longPress.minimumPressDuration = 0.19
+    // Home-card parity: the sink clock starts almost at touch-down so the hold
+    // reads as immediate. The easeIn sink keeps its first beats visually
+    // silent, so short taps still see nothing (and the commit block re-checks
+    // movement/scroll before opening).
+    longPress.minimumPressDuration = 0.10
     longPress.allowableMovement = 10.0
     // The hold detector must never hold up touch delivery to the swipe pan: a
     // swipe (movement) and a hold (stationary) are two independent detections.
@@ -612,17 +615,33 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
         "longPress began point=\(NSCoder.string(for: point)) index=\(indexPath.item) cellTransform=\(NSCoder.string(for: cell.transform))"
       )
 
-      // Home-list style: subtle quick press pulse before menu open.
+      // The sink itself is silent — with the 0.10s trigger every slow tap and
+      // scroll start reaches .began, so a tick here fires constantly and stacks
+      // with the commit impact as a double beat. One decisive medium impact at
+      // commit (when the menus actually morph out) is the whole grammar.
       cell.contentView.transform = .identity
-      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
       cell.setContextMenuHeld(true, animated: true, strategy: "scaleCell")
 
-      // The scale down animation takes 0.14s. We wait exactly that long so the cell
-      // reaches its scaled state smoothly, then synchronously pop open the menu.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self, weak cell] in
+      // The sink takes 0.28s. Commit exactly when it lands so the expansion
+      // continues directly from the depressed state — no rest beat between.
+      let holdStartPoint = point
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self, weak cell] in
         guard let self = self else { return }
         guard gesture.state == .began || gesture.state == .changed else {
           self.holdDebugLog("longPress delayed cancel state=\(gesture.state.rawValue)")
+          cell?.setContextMenuHeld(false, animated: true, strategy: "scaleCell")
+          return
+        }
+        // With the earlier trigger, a slow scroll can reach here — never open
+        // the menu for a finger that is actually dragging.
+        let currentPoint = gesture.location(in: self.collectionView)
+        let moved = hypot(
+          currentPoint.x - holdStartPoint.x, currentPoint.y - holdStartPoint.y)
+        if moved > 12 || self.collectionView.isDragging
+          || self.collectionView.panGestureRecognizer.state == .began
+          || self.collectionView.panGestureRecognizer.state == .changed
+        {
+          self.holdDebugLog("longPress delayed cancel moved=\(moved)")
           cell?.setContextMenuHeld(false, animated: true, strategy: "scaleCell")
           return
         }
@@ -631,6 +650,7 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
           return
         }
         self.holdDebugLog("longPress delayed open state=\(gesture.state.rawValue)")
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         self.openContextMenu(at: point)
 
         if self.customContextMenuOverlay == nil {

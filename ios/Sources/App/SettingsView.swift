@@ -10,6 +10,8 @@ private enum SettingsRoute: String, Identifiable {
   case profile
   case qr
   case privacy
+  case notifications
+  case devices
   case secretKey
   case appearance
   case mediaCache
@@ -19,6 +21,7 @@ private enum SettingsRoute: String, Identifiable {
 
 private enum SettingsModal: String, Identifiable {
   case connectionManager
+  case switchAccount
 
   var id: String { rawValue }
 }
@@ -27,6 +30,7 @@ struct SettingsView: View {
   @Environment(\.colorScheme) private var colorScheme
   @EnvironmentObject private var coordinator: AppShellCoordinator
   @StateObject private var profileController = AppProfileController.shared
+  @StateObject private var productionStore = SettingsProductionStore.shared
 
   @AppStorage("vibe.settings.notificationsEnabled") private var notificationsEnabled = true
   @AppStorage(AppThemePlateController.storageKey) private var themePlateRaw =
@@ -98,27 +102,38 @@ struct SettingsView: View {
   private var sections: [SettingsNativeSection] {
     [
       SettingsNativeSection(
-        title: "ACCOUNT",
+        title: "ACCOUNTS",
         rows: [
           SettingsNativeRow(
+            id: "switch-account",
+            icon: "person.2.fill",
+            label: "Switch or Add Account",
+            detailText: "Current",
+            toggleValue: false,
+            kind: .link,
+            iconColor: UIColor(red: 0 / 255, green: 122 / 255, blue: 255 / 255, alpha: 1),
+            divider: true,
+            destructive: false
+          ),
+          SettingsNativeRow(
             id: "edit-profile",
-            icon: "person",
+            icon: "person.crop.circle.fill",
             label: "Edit Profile",
             detailText: nil,
             toggleValue: false,
             kind: .link,
-            iconColor: .clear,
+            iconColor: UIColor(red: 88 / 255, green: 86 / 255, blue: 214 / 255, alpha: 1),
             divider: true,
             destructive: false
           ),
           SettingsNativeRow(
             id: "saved-messages",
-            icon: "bookmark",
+            icon: "bookmark.fill",
             label: "Saved Messages",
             detailText: nil,
             toggleValue: false,
             kind: .link,
-            iconColor: .clear,
+            iconColor: UIColor(red: 52 / 255, green: 199 / 255, blue: 89 / 255, alpha: 1),
             divider: true,
             destructive: false
           ),
@@ -129,7 +144,7 @@ struct SettingsView: View {
             detailText: "Show",
             toggleValue: false,
             kind: .link,
-            iconColor: .clear,
+            iconColor: UIColor(red: 0 / 255, green: 199 / 255, blue: 190 / 255, alpha: 1),
             divider: true,
             destructive: false
           ),
@@ -140,53 +155,59 @@ struct SettingsView: View {
             detailText: connectionModeTitle,
             toggleValue: false,
             kind: .link,
-            iconColor: .clear,
+            iconColor: UIColor(red: 255 / 255, green: 149 / 255, blue: 0 / 255, alpha: 1),
             divider: false,
             destructive: false
           ),
         ]
       ),
       SettingsNativeSection(
-        title: "PRIVACY & SECURITY",
+        title: "SETTINGS",
         rows: [
           SettingsNativeRow(
+            id: "notifications",
+            icon: "bell.fill",
+            label: "Notifications and Sounds",
+            detailText: notificationsEnabled && systemNotificationsAuthorized ? "On" : "Off",
+            toggleValue: false,
+            kind: .link,
+            iconColor: UIColor.systemRed,
+            divider: true,
+            destructive: false
+          ),
+          SettingsNativeRow(
             id: "privacy",
-            icon: "lock.shield",
+            icon: "lock.shield.fill",
             label: "Privacy",
             detailText: "Manage",
             toggleValue: false,
             kind: .link,
-            iconColor: .clear,
+            iconColor: UIColor(red: 0 / 255, green: 122 / 255, blue: 255 / 255, alpha: 1),
+            divider: true,
+            destructive: false
+          ),
+          SettingsNativeRow(
+            id: "devices",
+            icon: "desktopcomputer",
+            label: "Devices",
+            detailText: "Sessions",
+            toggleValue: false,
+            kind: .link,
+            iconColor: UIColor.systemTeal,
             divider: true,
             destructive: false
           ),
           SettingsNativeRow(
             id: "secret-key",
-            icon: "key",
+            icon: "key.fill",
             label: "Secret Key",
             detailText: nil,
             toggleValue: false,
             kind: .link,
-            iconColor: .clear,
+            iconColor: UIColor(red: 255 / 255, green: 204 / 255, blue: 0 / 255, alpha: 1),
             divider: false,
             destructive: false
           ),
-        ]
-      ),
-      SettingsNativeSection(
-        title: "NOTIFICATIONS",
-        rows: [
-          SettingsNativeRow(
-            id: "push-notifications",
-            icon: "bell",
-            label: "Push Notifications",
-            detailText: nil,
-            toggleValue: notificationsEnabled && systemNotificationsAuthorized,
-            kind: .toggle,
-            iconColor: .clear,
-            divider: false,
-            destructive: false
-          )
         ]
       ),
       SettingsNativeSection(
@@ -199,7 +220,7 @@ struct SettingsView: View {
             detailText: appearanceSummary,
             toggleValue: false,
             kind: .link,
-            iconColor: .clear,
+            iconColor: UIColor(red: 175 / 255, green: 82 / 255, blue: 222 / 255, alpha: 1),
             divider: false,
             destructive: false
           )
@@ -215,7 +236,7 @@ struct SettingsView: View {
             detailText: "Manage",
             toggleValue: false,
             kind: .link,
-            iconColor: .clear,
+            iconColor: UIColor(red: 90 / 255, green: 200 / 255, blue: 250 / 255, alpha: 1),
             divider: false,
             destructive: false
           )
@@ -298,6 +319,7 @@ struct SettingsView: View {
       AppUITrace.notice("SettingsView task profile load start")
       AppUIStallWatchdog.shared.updateContext("SettingsView profile load")
       await profileController.loadIfNeeded()
+      await productionStore.load()
       AppUITrace.notice(
         "SettingsView task profile load done hasProfile=\(profileController.profile != nil)"
       )
@@ -310,6 +332,19 @@ struct SettingsView: View {
             activeModal = nil
           })
         }
+      case .switchAccount:
+        NavigationStack {
+          AccountSwitchSheetView(
+            profile: currentProfile,
+            onDismiss: {
+              activeModal = nil
+            },
+            onContinue: {
+              activeModal = nil
+              AppRootControllerFactory.signOut()
+            }
+          )
+        }
       }
     }
     .navigationDestination(item: $activeRoute) { route in
@@ -319,7 +354,18 @@ struct SettingsView: View {
       case .qr:
         UserQRSettingsDetailView(profile: currentProfile)
       case .privacy:
-        PrivacySettingsDetailView(profileController: profileController)
+        PrivacySettingsDetailView(
+          profileController: profileController,
+          productionStore: productionStore
+        )
+      case .notifications:
+        NotificationSettingsDetailView(
+          store: productionStore,
+          systemAuthorized: systemNotificationsAuthorized,
+          onAuthorizationRefresh: refreshSystemNotificationStatus
+        )
+      case .devices:
+        DevicesSettingsDetailView(store: productionStore)
       case .secretKey:
         SecretKeySettingsDetailView()
       case .appearance:
@@ -331,9 +377,16 @@ struct SettingsView: View {
   }
 
   private var appearanceSummary: String {
-    let appearance = AppAppearanceController.currentOption.title
-    let plate = AppThemePlateController.currentOption.title
-    return "\(appearance) • \(plate)"
+    let draft = ChatAppearanceDraftStore.current
+    let modeTitle =
+      AppAppearanceOption(rawValue: draft.mode)?.title
+      ?? draft.mode.capitalized
+    if let themeId = draft.themeId,
+      let plate = AppThemePlateOption(rawValue: themeId)
+    {
+      return "\(modeTitle) • \(plate.title)"
+    }
+    return "\(modeTitle) • Custom"
   }
 
   private var connectionModeTitle: String {
@@ -353,6 +406,8 @@ struct SettingsView: View {
     AppUITrace.notice("SettingsView rowPress id=\(rowID)")
     AppUIStallWatchdog.shared.updateContext("SettingsView rowPress id=\(rowID)")
     switch rowID {
+    case "switch-account":
+      activeModal = .switchAccount
     case "edit-profile":
       activeRoute = .profile
     case "saved-messages":
@@ -363,6 +418,10 @@ struct SettingsView: View {
       activeModal = .connectionManager
     case "privacy":
       activeRoute = .privacy
+    case "notifications":
+      activeRoute = .notifications
+    case "devices":
+      activeRoute = .devices
     case "secret-key":
       activeRoute = .secretKey
     case "appearance":
@@ -425,6 +484,180 @@ struct SettingsView: View {
   }
 }
 
+private struct AccountSwitchSheetView: View {
+  @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
+
+  let profile: AppUserProfile
+  let onDismiss: () -> Void
+  let onContinue: () -> Void
+
+  private var palette: AppThemePalette {
+    AppThemePalette.resolve(for: colorScheme)
+  }
+
+  private var subtitle: String {
+    if let phone = profile.phoneNumber?.nilIfBlank {
+      return "\(phone) • @\(profile.username)"
+    }
+    return "@\(profile.username)"
+  }
+
+  var body: some View {
+    ZStack {
+      palette.background.ignoresSafeArea()
+
+      VStack(spacing: 22) {
+        VStack(spacing: 12) {
+          SettingsAccountAvatar(profile: profile)
+
+          VStack(spacing: 3) {
+            Text(profile.displayName)
+              .font(.system(size: 24, weight: .semibold))
+              .foregroundStyle(palette.text)
+              .lineLimit(1)
+
+            Text(subtitle)
+              .font(.system(size: 15, weight: .regular))
+              .foregroundStyle(palette.secondaryText)
+              .lineLimit(1)
+          }
+        }
+        .padding(.top, 18)
+
+        VStack(spacing: 0) {
+          AccountSwitchActionRow(
+            icon: "checkmark.circle.fill",
+            iconColor: Color(uiColor: UIColor(red: 52 / 255, green: 199 / 255, blue: 89 / 255, alpha: 1)),
+            title: profile.displayName,
+            subtitle: "Signed in now",
+            trailing: "Active",
+            palette: palette
+          ) {}
+
+          Divider()
+            .overlay(palette.secondaryText.opacity(0.12))
+            .padding(.leading, 64)
+
+          AccountSwitchActionRow(
+            icon: "plus.circle.fill",
+            iconColor: Color(uiColor: UIColor(red: 0 / 255, green: 122 / 255, blue: 255 / 255, alpha: 1)),
+            title: "Add or Switch Account",
+            subtitle: "Continue to Vibe sign in",
+            trailing: nil,
+            palette: palette,
+            action: onContinue
+          )
+        }
+        .background(
+          RoundedRectangle(cornerRadius: 28, style: .continuous)
+            .fill(.ultraThinMaterial)
+            .overlay(
+              RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(palette.secondaryText.opacity(colorScheme == .dark ? 0.12 : 0.08), lineWidth: 1)
+            )
+        )
+
+        Text("Vibe keeps this pass scoped to the current account session. To use another account on this device, continue to sign in with that account.")
+          .font(.system(size: 14, weight: .regular))
+          .foregroundStyle(palette.secondaryText)
+          .multilineTextAlignment(.center)
+          .padding(.horizontal, 10)
+
+        Spacer(minLength: 0)
+      }
+      .padding(.horizontal, 16)
+    }
+    .navigationTitle("Accounts")
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbar {
+      ToolbarItem(placement: .cancellationAction) {
+        Button("Done") {
+          onDismiss()
+          dismiss()
+        }
+      }
+    }
+  }
+}
+
+private struct SettingsAccountAvatar: View {
+  let profile: AppUserProfile
+
+  var body: some View {
+    ZStack {
+      Circle()
+        .fill(
+          LinearGradient(
+            colors: [
+              Color(uiColor: UIColor(red: 0 / 255, green: 122 / 255, blue: 255 / 255, alpha: 1)),
+              Color(uiColor: UIColor(red: 175 / 255, green: 82 / 255, blue: 222 / 255, alpha: 1)),
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          )
+        )
+
+      Text(String(profile.displayName.prefix(1)).uppercased())
+        .font(.system(size: 34, weight: .semibold))
+        .foregroundStyle(.white)
+    }
+    .frame(width: 82, height: 82)
+  }
+}
+
+private struct AccountSwitchActionRow: View {
+  let icon: String
+  let iconColor: Color
+  let title: String
+  let subtitle: String
+  let trailing: String?
+  let palette: AppThemePalette
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      HStack(spacing: 14) {
+        ZStack {
+          RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(iconColor)
+          Image(systemName: icon)
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(.white)
+        }
+        .frame(width: 36, height: 36)
+
+        VStack(alignment: .leading, spacing: 2) {
+          Text(title)
+            .font(.system(size: 17, weight: .regular))
+            .foregroundStyle(palette.text)
+            .lineLimit(1)
+          Text(subtitle)
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(palette.secondaryText)
+            .lineLimit(1)
+        }
+
+        Spacer(minLength: 12)
+
+        if let trailing {
+          Text(trailing)
+            .font(.system(size: 15, weight: .regular))
+            .foregroundStyle(palette.secondaryText)
+        } else {
+          Image(systemName: "chevron.right")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(palette.secondaryText.opacity(0.55))
+        }
+      }
+      .contentShape(Rectangle())
+      .padding(.horizontal, 16)
+      .frame(height: 64)
+    }
+    .buttonStyle(.plain)
+  }
+}
+
 private enum PrivacyRoute: Hashable, Identifiable {
   case blockedUsers
   case autoDelete
@@ -469,6 +702,7 @@ private enum PrivacyRoute: Hashable, Identifiable {
 private struct PrivacySettingsDetailView: View {
   @Environment(\.colorScheme) private var colorScheme
   @ObservedObject var profileController: AppProfileController
+  @ObservedObject var productionStore: SettingsProductionStore
 
   @AppStorage("vibe.settings.biometricsEnabled") private var biometricsEnabled = false
   @AppStorage(AppThemePlateController.storageKey) private var themePlateRaw =
@@ -523,28 +757,6 @@ private struct PrivacySettingsDetailView: View {
             destructive: false
           ),
           SettingsNativeRow(
-            id: "two-step-verification",
-            icon: "lock.fill",
-            label: "Two-Step Verification",
-            detailText: "Off",
-            toggleValue: false,
-            kind: .link,
-            iconColor: UIColor.systemOrange,
-            divider: true,
-            destructive: false
-          ),
-          SettingsNativeRow(
-            id: "passkeys",
-            icon: "key.fill",
-            label: "Passkeys",
-            detailText: "Off",
-            toggleValue: false,
-            kind: .link,
-            iconColor: UIColor.systemIndigo,
-            divider: true,
-            destructive: false
-          ),
-          SettingsNativeRow(
             id: "auto-delete",
             icon: "clock.fill",
             label: "Auto-Delete Messages",
@@ -560,27 +772,27 @@ private struct PrivacySettingsDetailView: View {
       SettingsNativeSection(
         title: "PRIVACY",
         rows: [
-          makeChoiceRow(id: "phone-number", label: "Phone Number", value: profile.privacyPhoneNumber),
+          makeChoiceRow(id: "phone-number", label: "Phone Number", value: productionStore.privacy.phoneNumber),
           makeChoiceRow(id: "last-seen", label: "Last Seen & Online", value: profile.privacyLastSeen),
           makeChoiceRow(
             id: "profile-photos",
             label: "Profile Photos",
-            value: profile.privacyProfilePhotos
+            value: productionStore.privacy.profilePhotos
           ),
-          makeChoiceRow(id: "bio", label: "Bio", value: profile.privacyBio),
-          makeChoiceRow(id: "gifts", label: "Gifts", value: profile.privacyGifts),
-          makeChoiceRow(id: "birthday", label: "Birthday", value: profile.privacyBirthday),
-          makeChoiceRow(id: "saved-music", label: "Saved Music", value: profile.privacySavedMusic),
+          makeChoiceRow(id: "bio", label: "Bio", value: productionStore.privacy.bio),
+          makeChoiceRow(id: "gifts", label: "Gifts", value: productionStore.privacy.gifts),
+          makeChoiceRow(id: "birthday", label: "Birthday", value: productionStore.privacy.birthday),
+          makeChoiceRow(id: "saved-music", label: "Saved Music", value: productionStore.privacy.savedMusic),
           makeChoiceRow(
             id: "forwarded-messages",
             label: "Forwarded Messages",
-            value: profile.privacyForward
+            value: productionStore.privacy.forwardedMessages
           ),
           SettingsNativeRow(
             id: "calls",
             icon: "phone.fill",
             label: "Calls",
-            detailText: profile.privacyCalls.title,
+            detailText: productionStore.privacy.calls.title,
             toggleValue: false,
             kind: .link,
             iconColor: UIColor.systemGreen,
@@ -642,9 +854,11 @@ private struct PrivacySettingsDetailView: View {
       case .phoneNumber:
         PrivacyChoiceDetailView(
           title: "Phone Number",
-          currentChoice: profile.privacyPhoneNumber
+          currentChoice: productionStore.privacy.phoneNumber
         ) { choice in
-          try await profileController.updateFields(["privacyPhoneNumber": choice.rawValue])
+          var next = productionStore.privacy
+          next.phoneNumber = choice
+          try await productionStore.updatePrivacy(next)
         }
       case .lastSeen:
         PrivacyChoiceDetailView(
@@ -660,40 +874,54 @@ private struct PrivacySettingsDetailView: View {
       case .profilePhotos:
         PrivacyChoiceDetailView(
           title: "Profile Photos",
-          currentChoice: profile.privacyProfilePhotos
+          currentChoice: productionStore.privacy.profilePhotos
         ) { choice in
-          try await profileController.updateFields(["privacyProfilePhotos": choice.rawValue])
+          var next = productionStore.privacy
+          next.profilePhotos = choice
+          try await productionStore.updatePrivacy(next)
         }
       case .bio:
-        PrivacyChoiceDetailView(title: "Bio", currentChoice: profile.privacyBio) { choice in
-          try await profileController.updateFields(["privacyBio": choice.rawValue])
+        PrivacyChoiceDetailView(title: "Bio", currentChoice: productionStore.privacy.bio) { choice in
+          var next = productionStore.privacy
+          next.bio = choice
+          try await productionStore.updatePrivacy(next)
         }
       case .gifts:
-        PrivacyChoiceDetailView(title: "Gifts", currentChoice: profile.privacyGifts) { choice in
-          try await profileController.updateFields(["privacyGifts": choice.rawValue])
+        PrivacyChoiceDetailView(title: "Gifts", currentChoice: productionStore.privacy.gifts) { choice in
+          var next = productionStore.privacy
+          next.gifts = choice
+          try await productionStore.updatePrivacy(next)
         }
       case .birthday:
-        PrivacyChoiceDetailView(title: "Birthday", currentChoice: profile.privacyBirthday) {
+        PrivacyChoiceDetailView(title: "Birthday", currentChoice: productionStore.privacy.birthday) {
           choice in
-          try await profileController.updateFields(["privacyBirthday": choice.rawValue])
+          var next = productionStore.privacy
+          next.birthday = choice
+          try await productionStore.updatePrivacy(next)
         }
       case .savedMusic:
         PrivacyChoiceDetailView(
           title: "Saved Music",
-          currentChoice: profile.privacySavedMusic
+          currentChoice: productionStore.privacy.savedMusic
         ) { choice in
-          try await profileController.updateFields(["privacySavedMusic": choice.rawValue])
+          var next = productionStore.privacy
+          next.savedMusic = choice
+          try await productionStore.updatePrivacy(next)
         }
       case .forwardedMessages:
         PrivacyChoiceDetailView(
           title: "Forwarded Messages",
-          currentChoice: profile.privacyForward
+          currentChoice: productionStore.privacy.forwardedMessages
         ) { choice in
-          try await profileController.updateFields(["privacyForward": choice.rawValue])
+          var next = productionStore.privacy
+          next.forwardedMessages = choice
+          try await productionStore.updatePrivacy(next)
         }
       case .calls:
-        PrivacyChoiceDetailView(title: "Calls", currentChoice: profile.privacyCalls) { choice in
-          try await profileController.updateFields(["privacyCalls": choice.rawValue])
+        PrivacyChoiceDetailView(title: "Calls", currentChoice: productionStore.privacy.calls) { choice in
+          var next = productionStore.privacy
+          next.calls = choice
+          try await productionStore.updatePrivacy(next)
         }
       }
     }
@@ -722,8 +950,6 @@ private struct PrivacySettingsDetailView: View {
       Task {
         await toggleBiometrics()
       }
-    case "two-step-verification", "passkeys":
-      alertMessage = "This control is not wired into the standalone app yet."
     case "auto-delete":
       route = .autoDelete
     case "phone-number":
@@ -866,6 +1092,237 @@ private struct PrivacyChoiceDetailView: View {
   }
 }
 
+private struct NotificationSettingsDetailView: View {
+  @ObservedObject var store: SettingsProductionStore
+  let systemAuthorized: Bool
+  let onAuthorizationRefresh: () -> Void
+
+  @State private var saveError: String?
+
+  var body: some View {
+    List {
+      if !systemAuthorized {
+        Section {
+          Button("Enable Notifications in iOS Settings") {
+            guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+            UIApplication.shared.open(url)
+          }
+        } footer: {
+          Text("Vibe cannot deliver alerts until notifications are allowed in iOS Settings.")
+        }
+      }
+
+      Section("MESSAGE NOTIFICATIONS") {
+        categoryRow("Private Chats", keyPath: \.privateChats)
+        categoryRow("Group Chats", keyPath: \.groupChats)
+        categoryRow("Channels", keyPath: \.channels)
+        categoryRow("Stories", keyPath: \.stories)
+        categoryRow("Reactions", keyPath: \.reactions)
+      }
+
+      Section("IN-APP NOTIFICATIONS") {
+        preferenceToggle("Sounds", keyPath: \.inAppSounds)
+        preferenceToggle("Vibrate", keyPath: \.inAppVibrate)
+        preferenceToggle("Preview", keyPath: \.inAppPreview)
+        preferenceToggle("Names on Lock Screen", keyPath: \.namesOnLockScreen)
+      }
+
+      if let message = saveError ?? store.errorMessage {
+        Section {
+          Text(message).foregroundStyle(.red)
+        }
+      }
+    }
+    .disabled(store.isSaving)
+    .listStyle(.insetGrouped)
+    .navigationTitle("Notifications")
+    .navigationBarTitleDisplayMode(.inline)
+    .onAppear(perform: onAuthorizationRefresh)
+  }
+
+  private func categoryRow(
+    _ title: String,
+    keyPath: WritableKeyPath<SettingsNotificationPreferences, SettingsNotificationCategory>
+  ) -> some View {
+    let category = store.notifications[keyPath: keyPath]
+    return NavigationLink {
+      NotificationCategoryDetailView(title: title, store: store, keyPath: keyPath)
+    } label: {
+      HStack {
+        Text(title)
+        Spacer()
+        Text(category.enabled ? "On" : "Off")
+          .foregroundStyle(.secondary)
+      }
+    }
+  }
+
+  private func preferenceToggle(
+    _ title: String,
+    keyPath: WritableKeyPath<SettingsNotificationPreferences, Bool>
+  ) -> some View {
+    Toggle(title, isOn: Binding(
+      get: { store.notifications[keyPath: keyPath] },
+      set: { value in
+        Task {
+          var next = store.notifications
+          next[keyPath: keyPath] = value
+          do { try await store.updateNotifications(next) }
+          catch { saveError = error.localizedDescription }
+        }
+      }
+    ))
+  }
+}
+
+private struct NotificationCategoryDetailView: View {
+  let title: String
+  @ObservedObject var store: SettingsProductionStore
+  let keyPath: WritableKeyPath<SettingsNotificationPreferences, SettingsNotificationCategory>
+
+  @State private var saveError: String?
+
+  var body: some View {
+    List {
+      Section {
+        categoryToggle("Notifications", keyPath: \.enabled)
+      }
+      Section("ALERT CONTENT") {
+        categoryToggle("Message Preview", keyPath: \.preview)
+        categoryToggle("Sound", keyPath: \.sound)
+      }
+      if let saveError {
+        Section { Text(saveError).foregroundStyle(.red) }
+      }
+    }
+    .disabled(store.isSaving)
+    .navigationTitle(title)
+    .navigationBarTitleDisplayMode(.inline)
+  }
+
+  private func categoryToggle(
+    _ title: String,
+    keyPath categoryKeyPath: WritableKeyPath<SettingsNotificationCategory, Bool>
+  ) -> some View {
+    Toggle(title, isOn: Binding(
+      get: { store.notifications[keyPath: keyPath][keyPath: categoryKeyPath] },
+      set: { value in
+        Task {
+          var next = store.notifications
+          next[keyPath: keyPath][keyPath: categoryKeyPath] = value
+          do { try await store.updateNotifications(next) }
+          catch { saveError = error.localizedDescription }
+        }
+      }
+    ))
+  }
+}
+
+private struct DevicesSettingsDetailView: View {
+  @ObservedObject var store: SettingsProductionStore
+  @State private var pendingRevocation: SettingsDeviceSession?
+  @State private var revokeError: String?
+
+  private var otherSessions: [SettingsDeviceSession] {
+    store.sessions.filter { !$0.isCurrent }
+  }
+
+  var body: some View {
+    List {
+      if store.isLoading && store.sessions.isEmpty {
+        Section { HStack { Spacer(); ProgressView(); Spacer() } }
+      }
+
+      if let current = store.currentSession {
+        Section("THIS DEVICE") { sessionRow(current) }
+      }
+
+      Section("ACTIVE SESSIONS") {
+        if otherSessions.isEmpty {
+          Text("No other active sessions")
+            .foregroundStyle(.secondary)
+        } else {
+          ForEach(otherSessions) { session in
+            Button { pendingRevocation = session } label: { sessionRow(session) }
+              .buttonStyle(.plain)
+          }
+        }
+      }
+
+      Section {
+        Text("If you do not recognize a session, revoke it immediately and review your account security.")
+          .font(.footnote)
+          .foregroundStyle(.secondary)
+      }
+
+      if let message = revokeError ?? store.errorMessage {
+        Section { Text(message).foregroundStyle(.red) }
+      }
+    }
+    .listStyle(.insetGrouped)
+    .navigationTitle("Devices")
+    .navigationBarTitleDisplayMode(.inline)
+    .refreshable { await store.load() }
+    .confirmationDialog(
+      "Revoke this session?",
+      isPresented: Binding(
+        get: { pendingRevocation != nil },
+        set: { if !$0 { pendingRevocation = nil } }
+      ),
+      titleVisibility: .visible
+    ) {
+      Button("Revoke Session", role: .destructive) {
+        guard let session = pendingRevocation else { return }
+        pendingRevocation = nil
+        Task {
+          do { try await store.revokeSession(id: session.id) }
+          catch { revokeError = error.localizedDescription }
+        }
+      }
+      Button("Cancel", role: .cancel) { pendingRevocation = nil }
+    } message: {
+      Text(pendingRevocation.map { "\($0.name) will be signed out of Vibe." } ?? "")
+    }
+  }
+
+  private func sessionRow(_ session: SettingsDeviceSession) -> some View {
+    HStack(spacing: 13) {
+      Image(systemName: deviceSymbol(for: session.platform))
+        .font(.system(size: 20, weight: .medium))
+        .foregroundStyle(.white)
+        .frame(width: 38, height: 38)
+        .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+      VStack(alignment: .leading, spacing: 3) {
+        HStack {
+          Text(session.name).font(.body.weight(.medium))
+          if session.isCurrent {
+            Text("Current")
+              .font(.caption2.weight(.semibold))
+              .foregroundStyle(.green)
+          }
+        }
+        Text("\(session.platform) · \(session.lastSeenDescription)")
+          .font(.footnote)
+          .foregroundStyle(.secondary)
+      }
+      Spacer()
+      if !session.isCurrent {
+        Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+      }
+    }
+    .padding(.vertical, 3)
+    .accessibilityElement(children: .combine)
+  }
+
+  private func deviceSymbol(for platform: String) -> String {
+    let value = platform.lowercased()
+    if value.contains("ios") || value.contains("iphone") { return "iphone" }
+    if value.contains("mac") { return "laptopcomputer" }
+    if value.contains("web") { return "globe" }
+    return "desktopcomputer"
+  }
+}
+
 private enum AppAutoDeleteOption: CaseIterable, Identifiable {
   case off
   case oneHour
@@ -985,112 +1442,101 @@ private struct AutoDeleteSettingsDetailView: View {
 }
 
 private struct AppearanceSettingsDetailView: View {
-  @Environment(\.colorScheme) private var colorScheme
-  @AppStorage(AppAppearanceController.storageKey) private var appearanceRaw =
-    AppAppearanceOption.system.rawValue
-  @AppStorage(AppThemePlateController.storageKey) private var plateRaw =
-    AppThemePlateOption.glacier.rawValue
+  var body: some View {
+    // Full Appearance product: hub + inner pages (themes, color editor, corners…).
+    AppearanceHubView()
+  }
+}
+
+private struct AppearanceDevicePreview: View {
+  let appearance: AppAppearanceOption
+  let plate: AppThemePlateOption
+
+  @Environment(\.colorScheme) private var systemColorScheme
+
+  private var previewScheme: ColorScheme {
+    switch appearance {
+    case .light: return .light
+    case .dark: return .dark
+    case .system: return systemColorScheme
+    }
+  }
 
   private var palette: AppThemePalette {
-    AppThemePalette.resolve(for: colorScheme)
-  }
-
-  private var selectedAppearance: Binding<AppAppearanceOption> {
-    Binding(
-      get: { AppAppearanceOption(rawValue: appearanceRaw) ?? .system },
-      set: { nextValue in
-        appearanceRaw = nextValue.rawValue
-        AppAppearanceController.setOption(nextValue)
-      }
-    )
-  }
-
-  private var selectedPlate: Binding<AppThemePlateOption> {
-    Binding(
-      get: { AppThemePlateOption(rawValue: plateRaw) ?? .glacier },
-      set: { nextValue in
-        plateRaw = nextValue.rawValue
-        AppThemePlateController.setOption(nextValue)
-      }
-    )
+    AppThemePalette.resolve(for: previewScheme, plate: plate)
   }
 
   var body: some View {
-    ScrollView(showsIndicators: false) {
-      VStack(spacing: 24) {
-        VStack(alignment: .leading, spacing: 10) {
-          Text("MODE")
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(palette.secondaryText.opacity(0.72))
-            .padding(.horizontal, 16)
+    VStack(spacing: 10) {
+      ZStack {
+        RoundedRectangle(cornerRadius: 32, style: .continuous)
+          .fill(Color.black)
+          .frame(width: 178, height: 318)
 
-          VStack(spacing: 0) {
-            ForEach(AppAppearanceOption.allCases) { option in
-              Button {
-                selectedAppearance.wrappedValue = option
-              } label: {
-                HStack {
-                  Text(option.title)
-                    .foregroundStyle(palette.text)
-                  Spacer()
-                  if option == selectedAppearance.wrappedValue {
-                    Image(systemName: "checkmark")
-                      .font(.system(size: 14, weight: .bold))
-                      .foregroundStyle(palette.accent)
-                  }
-                }
-                .padding(.horizontal, 18)
-                .frame(height: 56)
-              }
-              .buttonStyle(.plain)
+        RoundedRectangle(cornerRadius: 27, style: .continuous)
+          .fill(palette.background)
+          .frame(width: 168, height: 308)
+          .overlay {
+            VStack(spacing: 0) {
+              Capsule()
+                .fill(Color.black)
+                .frame(width: 58, height: 17)
+                .padding(.top, 7)
 
-              if option != AppAppearanceOption.allCases.last {
-                Divider()
-                  .padding(.leading, 18)
+              HStack {
+                Circle().fill(palette.accent).frame(width: 24, height: 24)
+                Text("Vibe")
+                  .font(.system(size: 10, weight: .semibold))
+                  .foregroundStyle(palette.text)
+                Spacer()
+                Image(systemName: "ellipsis")
+                  .font(.system(size: 9, weight: .bold))
+                  .foregroundStyle(palette.secondaryText)
               }
+              .padding(.horizontal, 13)
+              .padding(.top, 12)
+
+              VStack(spacing: 8) {
+                previewBubble("Your appearance updates", mine: false)
+                previewBubble("across Vibe instantly.", mine: true)
+              }
+              .frame(maxHeight: .infinity)
+              .padding(.horizontal, 12)
+
+              HStack(spacing: 7) {
+                Image(systemName: "plus.circle.fill")
+                Text("Message")
+                Spacer()
+                Image(systemName: "mic.fill")
+              }
+              .font(.system(size: 9))
+              .foregroundStyle(palette.secondaryText)
+              .padding(.horizontal, 12)
+              .frame(height: 32)
+              .background(palette.card)
             }
+            .clipShape(RoundedRectangle(cornerRadius: 27, style: .continuous))
           }
-          .background(
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
-              .fill(palette.card)
-          )
-        }
-
-        VStack(alignment: .leading, spacing: 12) {
-          Text("COLOR PLATE")
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(palette.secondaryText.opacity(0.72))
-            .padding(.horizontal, 16)
-
-          LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-            ForEach(AppThemePlateOption.allCases) { option in
-              Button {
-                selectedPlate.wrappedValue = option
-              } label: {
-                ThemePlateCard(
-                  option: option,
-                  isSelected: option == selectedPlate.wrappedValue,
-                  colorScheme: colorScheme
-                )
-              }
-              .buttonStyle(.plain)
-            }
-          }
-          .padding(.horizontal, 2)
-        }
-
-        Text("Color plates tune chat wallpaper, bubbles, and native accents.")
-          .font(.system(size: 13))
-          .foregroundStyle(palette.secondaryText)
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(.horizontal, 16)
       }
-      .padding(.horizontal, 16)
-      .padding(.vertical, 18)
+
+      Text("Live preview · \(appearance.title) · \(plate.title)")
+        .font(.system(size: 13, weight: .medium))
+        .foregroundStyle(palette.secondaryText)
     }
-    .background(palette.background.ignoresSafeArea())
-    .navigationTitle("Appearance")
-    .navigationBarTitleDisplayMode(.inline)
+    .frame(maxWidth: .infinity)
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel("Appearance preview, \(appearance.title), \(plate.title)")
+  }
+
+  private func previewBubble(_ text: String, mine: Bool) -> some View {
+    Text(text)
+      .font(.system(size: 9, weight: .medium))
+      .foregroundStyle(mine ? Color.white : palette.text)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 7)
+      .background(mine ? palette.accent : palette.card)
+      .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+      .frame(maxWidth: .infinity, alignment: mine ? .trailing : .leading)
   }
 }
 
@@ -1450,6 +1896,9 @@ private struct ProfileSettingsDetailView: View {
             .font(.system(size: 17))
             .foregroundStyle(palette.text)
           Spacer()
+          Circle()
+            .fill(ChatAppearanceDraftStore.current.accentColor)
+            .frame(width: 18, height: 18)
           Image(systemName: "chevron.right")
             .font(.system(size: 13, weight: .semibold))
             .foregroundStyle(palette.secondaryText.opacity(0.55))

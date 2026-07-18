@@ -133,6 +133,9 @@ struct ChatAppearanceDraft: Equatable, Codable {
   var accent: String = "#2F9E93"
   /// Normalized 0…1. Points via `messageCornerRadiusPoints(normalized:)`.
   var messageCornerRadius: Double = 0.62
+  /// Optional for backward-compatible decoding. nil resolves to the reference tail.
+  /// 0 = compact/straight, 1 = the default Telegram-reference cubic.
+  var messageTailCurvature: Double? = nil
   var textScale: Double = 1.0
   var animationsEnabled: Bool = true
 
@@ -152,6 +155,7 @@ struct ChatAppearanceDraft: Equatable, Codable {
 
   /// Default stored point radius on `ChatListAppearance` (== mapping at ~0.636).
   static let defaultMessageCornerRadiusPoints: CGFloat = 18
+  static let defaultMessageTailCurvature: CGFloat = 1.0
 
   // MARK: Dictionary bridge (persistence / Settings)
 
@@ -222,6 +226,11 @@ struct ChatAppearanceDraft: Equatable, Codable {
         draft.messageCornerRadius = (clampedPt - 4.0) / 22.0
       }
     }
+    if let curvature = (raw["messageTailCurvature"] as? NSNumber)?.doubleValue
+      ?? raw["messageTailCurvature"] as? Double
+    {
+      draft.messageTailCurvature = max(0.0, min(1.0, curvature))
+    }
     if let scale = (raw["textScale"] as? NSNumber)?.doubleValue ?? raw["textScale"] as? Double {
       draft.textScale = scale
     }
@@ -252,6 +261,9 @@ struct ChatAppearanceDraft: Equatable, Codable {
     }
     if let wallpaperPatternMaskKey {
       dict["wallpaperPatternMaskKey"] = wallpaperPatternMaskKey
+    }
+    if let messageTailCurvature {
+      dict["messageTailCurvature"] = max(0.0, min(1.0, messageTailCurvature))
     }
     return dict
   }
@@ -454,6 +466,8 @@ struct ChatListAppearance {
   let accent: UIColor
   /// Bubble corner radius in points. Default 18 (== mapping at normalized ~0.636).
   let messageCornerRadius: CGFloat
+  /// Integrated tail interpolation. 0 = compact/straight, 1 = reference cubic.
+  let messageTailCurvature: CGFloat
   /// Optional second wallpaper gradient pair blended on scroll. Empty = no scroll blend.
   let wallpaperScrollGradient: [UIColor]
 
@@ -484,6 +498,7 @@ struct ChatListAppearance {
     insertionAnimationMode: Int,
     accent: UIColor = ChatListAppearance.brandAccentFallback,
     messageCornerRadius: CGFloat = 18,
+    messageTailCurvature: CGFloat = ChatAppearanceDraft.defaultMessageTailCurvature,
     wallpaperScrollGradient: [UIColor] = []
   ) {
     self.backgroundMode = backgroundMode
@@ -506,6 +521,7 @@ struct ChatListAppearance {
     self.insertionAnimationMode = insertionAnimationMode
     self.accent = accent
     self.messageCornerRadius = messageCornerRadius
+    self.messageTailCurvature = max(0.0, min(1.0, messageTailCurvature))
     self.wallpaperScrollGradient = wallpaperScrollGradient
   }
 
@@ -545,6 +561,7 @@ struct ChatListAppearance {
     insertionAnimationMode: 2,
     accent: brandAccentFallback,
     messageCornerRadius: ChatAppearanceDraft.defaultMessageCornerRadiusPoints,
+    messageTailCurvature: ChatAppearanceDraft.defaultMessageTailCurvature,
     wallpaperScrollGradient: []
   )
 
@@ -609,6 +626,17 @@ struct ChatListAppearance {
       raw["messageCornerRadius"],
       fallback: fallback.messageCornerRadius
     )
+    let messageTailCurvature = CGFloat(
+      max(
+        0.0,
+        min(
+          1.0,
+          (raw["messageTailCurvature"] as? NSNumber)?.doubleValue
+            ?? raw["messageTailCurvature"] as? Double
+            ?? Double(fallback.messageTailCurvature)
+        )
+      )
+    )
     let wallpaperScrollGradient: [UIColor] = {
       guard let strings = raw["wallpaperScrollGradient"] as? [String] else { return [] }
       return strings.compactMap(parseColor)
@@ -640,6 +668,7 @@ struct ChatListAppearance {
         ?? fallback.insertionAnimationMode,
       accent: accent,
       messageCornerRadius: messageCornerRadius,
+      messageTailCurvature: messageTailCurvature,
       wallpaperScrollGradient: wallpaperScrollGradient
     )
   }
@@ -695,6 +724,16 @@ struct ChatListAppearance {
     let messageCornerRadius = ChatAppearanceDraft.messageCornerRadiusPoints(
       normalized: draft.messageCornerRadius
     )
+    let messageTailCurvature = CGFloat(
+      max(
+        0.0,
+        min(
+          1.0,
+          draft.messageTailCurvature
+            ?? Double(ChatAppearanceDraft.defaultMessageTailCurvature)
+        )
+      )
+    )
 
     let backgroundMode: String = {
       switch draft.wallpaperKind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -740,6 +779,7 @@ struct ChatListAppearance {
       insertionAnimationMode: draft.animationsEnabled ? 2 : 0,
       accent: accent,
       messageCornerRadius: messageCornerRadius,
+      messageTailCurvature: messageTailCurvature,
       wallpaperScrollGradient: wallpaperScrollGradient
     )
   }
@@ -775,6 +815,7 @@ struct ChatListAppearance {
       colorKey(dayBorderColor),
       colorKey(accent),
       String(format: "%.4f", messageCornerRadius),
+      String(format: "%.4f", messageTailCurvature),
     ].joined(separator: "|")
   }
 
@@ -1088,6 +1129,17 @@ private func nativePresetAppearance(
     raw["messageCornerRadius"],
     fallback: fallback.messageCornerRadius
   )
+  let messageTailCurvature = CGFloat(
+    max(
+      0.0,
+      min(
+        1.0,
+        (raw["messageTailCurvature"] as? NSNumber)?.doubleValue
+          ?? raw["messageTailCurvature"] as? Double
+          ?? Double(fallback.messageTailCurvature)
+      )
+    )
+  )
   let wallpaperScrollGradient: [UIColor] = {
     guard let strings = raw["wallpaperScrollGradient"] as? [String] else { return [] }
     return strings.compactMap(parseColor)
@@ -1122,6 +1174,7 @@ private func nativePresetAppearance(
     insertionAnimationMode: insertionAnimationMode,
     accent: accent,
     messageCornerRadius: messageCornerRadius,
+    messageTailCurvature: messageTailCurvature,
     wallpaperScrollGradient: wallpaperScrollGradient
   )
 }

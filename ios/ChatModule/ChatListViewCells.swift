@@ -762,11 +762,17 @@ final class BubbleBackgroundView: UIView {
       bottomLeft: shape.borderBottomLeftRadius,
       tailOnRight: integratedTailSide
     )
-    // The tail path extends past the horizontal bounds, so bounded-content layers
-    // (gradient, wallpaper sample, blur) must paint wider than the view; the view-level
-    // bubbleMaskLayer clips everything back to the bubble+tail silhouette. CAShapeLayers
-    // (mask + fill) render their full path regardless of bounds, so they stay at bounds.
-    let paintRect = bounds.insetBy(dx: -(bubbleTailOverhang + 2.0), dy: 0.0)
+    // The tail path extends past the trailing (+ slightly below) bounds, so
+    // bounded-content layers (gradient, wallpaper sample, blur) must paint larger
+    // than the view; the view-level bubbleMaskLayer clips back to the silhouette.
+    // CAShapeLayers (mask + fill) render their full path regardless of bounds.
+    let hPad = bubbleTailOverhang + 2.0
+    let paintRect = CGRect(
+      x: bounds.minX - hPad,
+      y: bounds.minY,
+      width: bounds.width + 2.0 * hPad,
+      height: bounds.height + bubbleTailBottomOverhang + 1.0
+    )
     wallpaperLayer.frame = paintRect
     blurView.frame = paintRect
     bubbleMaskLayer.frame = bounds
@@ -809,8 +815,15 @@ final class BubbleBackgroundView: UIView {
     wallpaperLayer.contents = wallpaperSnapshot
     // wallpaperLayer paints wider than bounds (tail overhang — see applyShapePath), so the
     // sample rect must widen by the same amount to stay registered with the backdrop.
+    let hPad = bubbleTailOverhang + 2.0
+    let sampleRect = CGRect(
+      x: wallpaperSampleRect.minX - hPad,
+      y: wallpaperSampleRect.minY,
+      width: wallpaperSampleRect.width + 2.0 * hPad,
+      height: wallpaperSampleRect.height + bubbleTailBottomOverhang + 1.0
+    )
     wallpaperLayer.contentsRect = normalizedWallpaperSampleRect(
-      wallpaperSampleRect.insetBy(dx: -(bubbleTailOverhang + 2.0), dy: 0.0),
+      sampleRect,
       containerSize: wallpaperContainerSize
     )
   }
@@ -840,7 +853,12 @@ final class BubbleBackgroundView: UIView {
         : 1.0
     )
     blurView.isHidden = hidden
-    blurView.effect = UIBlurEffect(style: isMe ? .systemThinMaterialDark : .systemMaterialDark)
+    // Material style follows chat theme dark/light (not always-dark).
+    let material: UIBlurEffect.Style =
+      appearance.isDark
+      ? (isMe ? .systemThinMaterialDark : .systemMaterialDark)
+      : (isMe ? .systemThinMaterialLight : .systemMaterialLight)
+    blurView.effect = UIBlurEffect(style: material)
     // Them plate is near-opaque and theme-stable — same fill with or without wallpaper
     // snapshot so configure→bindWallpaper never flashes #252936 → #181C26.
     // Me still uses a light material wash only when there is no wallpaper sample.
@@ -942,7 +960,7 @@ final class BubbleBackgroundView: UIView {
 
   /// Bubble outline, optionally with the Telegram-style tail hook drawn INTO the path.
   /// `tailOnRight`: nil = no tail; true = tail at bottom-right (me); false = bottom-left
-  /// (them). The tail is spliced into that side's bottom corner arc and extends up to
+  /// (them). The tail replaces that side's bottom corner contour and extends up to
   /// ~`bubbleTailOverhang`pt beyond `rect` horizontally — callers' paint layers must cover
   /// that overhang (see `applyShapePath`). Drawing the tail as part of the ONE body path is
   /// what guarantees tail and body share the exact same fill/gradient/blur/wallpaper plate:
@@ -958,6 +976,9 @@ final class BubbleBackgroundView: UIView {
     let tr = min(max(0.0, topRight), min(width, height) * 0.5)
     let br = min(max(0.0, bottomRight), min(width, height) * 0.5)
     let bl = min(max(0.0, bottomLeft), min(width, height) * 0.5)
+    // Tail proportions follow the cell's primary corner, not the intentionally tight
+    // grouped corner on the tail side (e.g. the appearance preview's 0.35× corner).
+    let tailRadius = max(tl, tr, br, bl)
 
     let path = UIBezierPath()
     path.move(to: CGPoint(x: tl, y: 0.0))
@@ -966,7 +987,9 @@ final class BubbleBackgroundView: UIView {
       withCenter: CGPoint(x: width - tr, y: tr), radius: tr, startAngle: 3 * .pi / 2, endAngle: 0.0,
       clockwise: true)
     if tailOnRight == true {
-      addAndroidTail(onRight: true, to: path, width: width, height: height, radius: br)
+      addTelegramReferenceTail(
+        onRight: true, to: path, width: width, height: height, radius: tailRadius,
+        curvature: appearance.messageTailCurvature)
     } else {
       path.addLine(to: CGPoint(x: width, y: height - br))
       path.addArc(
@@ -974,7 +997,9 @@ final class BubbleBackgroundView: UIView {
         endAngle: .pi / 2, clockwise: true)
     }
     if tailOnRight == false {
-      addAndroidTail(onRight: false, to: path, width: width, height: height, radius: bl)
+      addTelegramReferenceTail(
+        onRight: false, to: path, width: width, height: height, radius: tailRadius,
+        curvature: appearance.messageTailCurvature)
     } else {
       path.addLine(to: CGPoint(x: bl, y: height))
       path.addArc(
@@ -989,12 +1014,149 @@ final class BubbleBackgroundView: UIView {
     return path
   }
 
-  private func addAndroidTail(
+  /// One normalized source for the outgoing/incoming tail. At curvature 1 the three
+  /// cubics are the screenshot's right-edge→tip→notch→bottom contour, normalized to an
+  /// 18pt primary corner. Lower values interpolate toward a compact straight-segment
+  /// tail without ever creating a separate layer or a zero-area path.
+  private struct TelegramReferenceTailGeometry {
+    let outerStart: CGPoint
+    let outerControl1: CGPoint
+    let outerControl2: CGPoint
+    let tip: CGPoint
+    let innerControl1: CGPoint
+    let innerControl2: CGPoint
+    let notch: CGPoint
+    let cornerControl1: CGPoint
+    let cornerControl2: CGPoint
+    let bottomJoin: CGPoint
+
+    static func resolved(
+      width: CGFloat, height: CGFloat, radius: CGFloat, curvature: CGFloat, onRight: Bool
+    ) -> TelegramReferenceTailGeometry {
+      let scale = max(0.0, radius / 18.0)
+      let originX = onRight ? width : 0.0
+      let t = max(0.0, min(1.0, curvature))
+
+      let referenceOuterStart = CGPoint(x: 0.0967, y: -7.9401)
+      let referenceOuterControl1 = CGPoint(x: 0.0967, y: -4.6557)
+      let referenceOuterControl2 = CGPoint(x: 4.4885, y: -2.5490)
+      let referenceTip = CGPoint(x: 5.3793, y: 0.0061)
+      let referenceInnerControl1 = CGPoint(x: 0.6122, y: 0.6143)
+      let referenceInnerControl2 = CGPoint(x: -3.9233, y: -0.5402)
+      let referenceNotch = CGPoint(x: -7.0522, y: -3.8821)
+      let referenceCornerControl1 = CGPoint(x: -9.0308, y: -1.5103)
+      let referenceCornerControl2 = CGPoint(x: -12.1883, y: 0.0061)
+      let referenceBottomJoin = CGPoint(x: -14.7700, y: 0.0061)
+
+      // The straight endpoint stays intentionally non-degenerate. It is 58% of the
+      // reference footprint, with cubic controls on each chord, so the slider reduces
+      // both the hook's bend and its visual thickness while preserving a crisp tail.
+      let compactScale: CGFloat = 0.58
+      func compact(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x * compactScale, y: point.y * compactScale)
+      }
+      let straightOuterStart = compact(referenceOuterStart)
+      let straightTip = compact(referenceTip)
+      let straightNotch = compact(referenceNotch)
+      let straightBottomJoin = compact(referenceBottomJoin)
+      func chordPoint(_ start: CGPoint, _ end: CGPoint, _ fraction: CGFloat) -> CGPoint {
+        CGPoint(
+          x: start.x + (end.x - start.x) * fraction,
+          y: start.y + (end.y - start.y) * fraction
+        )
+      }
+      func adjustable(_ straight: CGPoint, _ reference: CGPoint) -> CGPoint {
+        // Preserve the validated reference coordinates byte-for-byte at the default.
+        guard t < 0.999_999 else { return reference }
+        return CGPoint(
+          x: straight.x + (reference.x - straight.x) * t,
+          y: straight.y + (reference.y - straight.y) * t
+        )
+      }
+      func transformed(_ point: CGPoint) -> CGPoint {
+        CGPoint(
+          x: originX + (onRight ? point.x : -point.x) * scale,
+          y: height + point.y * scale
+        )
+      }
+      return TelegramReferenceTailGeometry(
+        outerStart: transformed(adjustable(straightOuterStart, referenceOuterStart)),
+        outerControl1: transformed(
+          adjustable(chordPoint(straightOuterStart, straightTip, 1.0 / 3.0), referenceOuterControl1)
+        ),
+        outerControl2: transformed(
+          adjustable(chordPoint(straightOuterStart, straightTip, 2.0 / 3.0), referenceOuterControl2)
+        ),
+        tip: transformed(adjustable(straightTip, referenceTip)),
+        innerControl1: transformed(
+          adjustable(chordPoint(straightTip, straightNotch, 1.0 / 3.0), referenceInnerControl1)
+        ),
+        innerControl2: transformed(
+          adjustable(chordPoint(straightTip, straightNotch, 2.0 / 3.0), referenceInnerControl2)
+        ),
+        notch: transformed(adjustable(straightNotch, referenceNotch)),
+        cornerControl1: transformed(
+          adjustable(
+            chordPoint(straightNotch, straightBottomJoin, 1.0 / 3.0),
+            referenceCornerControl1)
+        ),
+        cornerControl2: transformed(
+          adjustable(
+            chordPoint(straightNotch, straightBottomJoin, 2.0 / 3.0),
+            referenceCornerControl2)
+        ),
+        bottomJoin: transformed(adjustable(straightBottomJoin, referenceBottomJoin))
+      )
+    }
+  }
+
+  private func appendTelegramReferenceTailCurves(
+    onRight: Bool,
+    geometry: TelegramReferenceTailGeometry,
+    to path: UIBezierPath
+  ) {
+    if onRight {
+      path.addCurve(
+        to: geometry.tip,
+        controlPoint1: geometry.outerControl1,
+        controlPoint2: geometry.outerControl2
+      )
+      path.addCurve(
+        to: geometry.notch,
+        controlPoint1: geometry.innerControl1,
+        controlPoint2: geometry.innerControl2
+      )
+      path.addCurve(
+        to: geometry.bottomJoin,
+        controlPoint1: geometry.cornerControl1,
+        controlPoint2: geometry.cornerControl2
+      )
+    } else {
+      path.addCurve(
+        to: geometry.notch,
+        controlPoint1: geometry.cornerControl2,
+        controlPoint2: geometry.cornerControl1
+      )
+      path.addCurve(
+        to: geometry.tip,
+        controlPoint1: geometry.innerControl2,
+        controlPoint2: geometry.innerControl1
+      )
+      path.addCurve(
+        to: geometry.outerStart,
+        controlPoint1: geometry.outerControl2,
+        controlPoint2: geometry.outerControl1
+      )
+    }
+  }
+
+  private func addTelegramReferenceTail(
     onRight: Bool,
     to path: UIBezierPath,
     width: CGFloat,
     height: CGFloat,
-    radius: CGFloat
+    radius: CGFloat,
+    curvature: CGFloat
   ) {
     guard radius > 0.5 else {
       if onRight {
@@ -1005,76 +1167,15 @@ final class BubbleBackgroundView: UIView {
       return
     }
 
-    // Android's visible tail is a clipped 29x29 two-quad glyph rotated 24 degrees and
-    // placed under the bubble. These points are that contour after clipping/rotation,
-    // spliced into the 18pt corner arc so the body corner still hides the tail stem.
-    let s = min(1.0, radius / 18.0)
-    let outerJoin = CGPoint(x: -0.3375 * s, y: -14.5308 * s)
-    let outerControl = CGPoint(x: 1.4197 * s, y: -9.2324 * s)
-    let tip = CGPoint(x: 7.7725 * s, y: -5.1111 * s)
-    let innerControl = CGPoint(x: 3.5312 * s, y: -3.1501 * s)
-    let innerJoin = CGPoint(x: -4.3952 * s, y: -6.2140 * s)
+    let geometry = TelegramReferenceTailGeometry.resolved(
+      width: width, height: height, radius: radius, curvature: curvature, onRight: onRight)
 
     if onRight {
-      let center = CGPoint(x: width - radius, y: height - radius)
-      let outerPoint = CGPoint(x: width + outerJoin.x, y: height + outerJoin.y)
-      let innerPoint = CGPoint(x: width + innerJoin.x, y: height + innerJoin.y)
-      let outerAngle = atan2(outerPoint.y - center.y, outerPoint.x - center.x)
-      let innerAngle = atan2(innerPoint.y - center.y, innerPoint.x - center.x)
-
-      path.addLine(to: CGPoint(x: width, y: height - radius))
-      path.addArc(
-        withCenter: center,
-        radius: radius,
-        startAngle: 0.0,
-        endAngle: outerAngle,
-        clockwise: true
-      )
-      path.addQuadCurve(
-        to: CGPoint(x: width + tip.x, y: height + tip.y),
-        controlPoint: CGPoint(x: width + outerControl.x, y: height + outerControl.y)
-      )
-      path.addQuadCurve(
-        to: innerPoint,
-        controlPoint: CGPoint(x: width + innerControl.x, y: height + innerControl.y)
-      )
-      path.addArc(
-        withCenter: center,
-        radius: radius,
-        startAngle: innerAngle,
-        endAngle: .pi / 2.0,
-        clockwise: true
-      )
+      path.addLine(to: geometry.outerStart)
+      appendTelegramReferenceTailCurves(onRight: true, geometry: geometry, to: path)
     } else {
-      let center = CGPoint(x: radius, y: height - radius)
-      let innerPoint = CGPoint(x: -innerJoin.x, y: height + innerJoin.y)
-      let outerPoint = CGPoint(x: -outerJoin.x, y: height + outerJoin.y)
-      let innerAngle = atan2(innerPoint.y - center.y, innerPoint.x - center.x)
-      let outerAngle = atan2(outerPoint.y - center.y, outerPoint.x - center.x)
-
-      path.addLine(to: CGPoint(x: radius, y: height))
-      path.addArc(
-        withCenter: center,
-        radius: radius,
-        startAngle: .pi / 2.0,
-        endAngle: innerAngle,
-        clockwise: true
-      )
-      path.addQuadCurve(
-        to: CGPoint(x: -tip.x, y: height + tip.y),
-        controlPoint: CGPoint(x: -innerControl.x, y: height + innerControl.y)
-      )
-      path.addQuadCurve(
-        to: outerPoint,
-        controlPoint: CGPoint(x: -outerControl.x, y: height + outerControl.y)
-      )
-      path.addArc(
-        withCenter: center,
-        radius: radius,
-        startAngle: outerAngle,
-        endAngle: .pi,
-        clockwise: true
-      )
+      path.addLine(to: geometry.bottomJoin)
+      appendTelegramReferenceTailCurves(onRight: false, geometry: geometry, to: path)
       path.addLine(to: CGPoint(x: 0.0, y: tlSafeTop(radius: radius, height: height)))
     }
   }
@@ -1101,77 +1202,47 @@ final class BubbleBackgroundView: UIView {
     )
   }
 
-  /// The region the integrated tail ADDS on top of the plain rounded-rect body:
-  /// bounded by the bottom corner arc on the inside and the tail's two quad
-  /// curves on the outside. The joins sit ON the corner arc (see
-  /// addAndroidTail), so with-tail silhouette = plain silhouette ∪ this lobe,
-  /// exactly. The send morph snapshots the lobe separately from the plate so
-  /// the width/height morph can never stretch the tail. nil when this bubble
-  /// draws no integrated tail.
+  /// Snapshot mask around the three-cubic tail contour. The send morph captures this
+  /// small lobe separately from the rounded plate so width/height interpolation can
+  /// never stretch the tail. nil when this bubble draws no integrated tail.
   func integratedTailLobePath() -> UIBezierPath? {
     guard let onRight = integratedTailSide, bounds.width > 1.0, bounds.height > 1.0 else {
       return nil
     }
     let width = max(1.0, bounds.width)
     let height = max(1.0, bounds.height)
-    let rawRadius = onRight ? shape.borderBottomRightRadius : shape.borderBottomLeftRadius
-    let radius = min(max(0.0, rawRadius), min(width, height) * 0.5)
+    let radiusLimit = min(width, height) * 0.5
+    let radius = [
+      shape.borderTopLeftRadius, shape.borderTopRightRadius,
+      shape.borderBottomLeftRadius, shape.borderBottomRightRadius,
+    ].map { min(max(0.0, $0), radiusLimit) }.max() ?? 0.0
     guard radius > 0.5 else { return nil }
 
-    // Same Android-derived contour constants as addAndroidTail.
-    let s = min(1.0, radius / 18.0)
-    let outerJoin = CGPoint(x: -0.3375 * s, y: -14.5308 * s)
-    let outerControl = CGPoint(x: 1.4197 * s, y: -9.2324 * s)
-    let tip = CGPoint(x: 7.7725 * s, y: -5.1111 * s)
-    let innerControl = CGPoint(x: 3.5312 * s, y: -3.1501 * s)
-    let innerJoin = CGPoint(x: -4.3952 * s, y: -6.2140 * s)
+    let geometry = TelegramReferenceTailGeometry.resolved(
+      width: width, height: height, radius: radius,
+      curvature: appearance.messageTailCurvature, onRight: onRight)
 
     let path = UIBezierPath()
     if onRight {
-      let center = CGPoint(x: width - radius, y: height - radius)
-      let outerPoint = CGPoint(x: width + outerJoin.x, y: height + outerJoin.y)
-      let innerPoint = CGPoint(x: width + innerJoin.x, y: height + innerJoin.y)
-      let outerAngle = atan2(outerPoint.y - center.y, outerPoint.x - center.x)
-      let innerAngle = atan2(innerPoint.y - center.y, innerPoint.x - center.x)
-      path.move(to: outerPoint)
-      path.addQuadCurve(
-        to: CGPoint(x: width + tip.x, y: height + tip.y),
-        controlPoint: CGPoint(x: width + outerControl.x, y: height + outerControl.y)
-      )
-      path.addQuadCurve(
-        to: innerPoint,
-        controlPoint: CGPoint(x: width + innerControl.x, y: height + innerControl.y)
-      )
-      path.addArc(
-        withCenter: center, radius: radius, startAngle: innerAngle, endAngle: outerAngle,
-        clockwise: false)
+      path.move(to: geometry.outerStart)
+      appendTelegramReferenceTailCurves(onRight: true, geometry: geometry, to: path)
     } else {
-      let center = CGPoint(x: radius, y: height - radius)
-      let innerPoint = CGPoint(x: -innerJoin.x, y: height + innerJoin.y)
-      let outerPoint = CGPoint(x: -outerJoin.x, y: height + outerJoin.y)
-      let innerAngle = atan2(innerPoint.y - center.y, innerPoint.x - center.x)
-      let outerAngle = atan2(outerPoint.y - center.y, outerPoint.x - center.x)
-      path.move(to: innerPoint)
-      path.addQuadCurve(
-        to: CGPoint(x: -tip.x, y: height + tip.y),
-        controlPoint: CGPoint(x: -innerControl.x, y: height + innerControl.y)
-      )
-      path.addQuadCurve(
-        to: outerPoint,
-        controlPoint: CGPoint(x: -outerControl.x, y: height + outerControl.y)
-      )
-      path.addArc(
-        withCenter: center, radius: radius, startAngle: outerAngle, endAngle: innerAngle,
-        clockwise: false)
+      path.move(to: geometry.bottomJoin)
+      appendTelegramReferenceTailCurves(onRight: false, geometry: geometry, to: path)
     }
+    // The lobe snapshot may overlap the tail-suppressed rounded plate; it only needs
+    // to cover the reference tail's added pixels. A direct close keeps this mask on the
+    // exact cubic contour without reintroducing a mismatched synthetic corner arc.
     path.close()
     return path
   }
 }
 
-/// How far the integrated bubble tail extends beyond the bubble body's edge
-/// (Android-derived tip reaches 7.7725pt out at full scale).
+/// Paint/capture reserve for the integrated tail at the maximum supported 26pt corner.
+/// The reference cubic reaches 5.38pt at radius 18 and 7.77pt at radius 26.
 let bubbleTailOverhang: CGFloat = 7.8
+/// The fitted curve is tangent to the plate bottom (maximum dip ≈ 0.161pt at radius 18).
+let bubbleTailBottomOverhang: CGFloat = 0.5
 
 private let bubbleMessageFont = UIFont.systemFont(ofSize: 16)
 private let bubbleMetaFont = UIFont.systemFont(ofSize: 10, weight: .medium)
@@ -10573,7 +10644,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private func applyContextMenuHoldIfNeeded(animated: Bool, strategy: String) {
     let scale: CGFloat =
       strategy == "scaleCell"
-      ? (isContextMenuHeld ? 0.965 : 1.0)
+      ? (isContextMenuHeld ? 0.95 : 1.0)
       : (isContextMenuHeld ? 0.95 : 1.0)
     var targetTransform: CGAffineTransform = .identity
     var cellTransform: CGAffineTransform = .identity
@@ -10637,10 +10708,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         }
       }
       if isContextMenuHeld {
+        // Slow real-time sink (matches the home-card hold): easeIn keeps the
+        // first beats visually silent so the press reads as a gradual grab,
+        // never a pop to a settled scale.
         UIView.animate(
-          withDuration: 0.14,
+          withDuration: 0.28,
           delay: 0,
-          options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut],
+          options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseIn],
           animations: {
             applyChanges()
           },
@@ -10725,6 +10799,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       captureRect.origin.x -= overhang
       captureRect.size.width += overhang
     }
+    // Tip sits slightly below the plate (reference-extracted path).
+    captureRect.size.height += ceil(bubbleTailBottomOverhang + 1.0)
     return captureRect
   }
 
@@ -10945,7 +11021,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     guard captureRect.width > 1.0, captureRect.height > 1.0 else {
       return nil
     }
-    // The lobe overhangs the cell's trailing edge (tail tip ≈ bubble.maxX + 8pt,
+    // The lobe overhangs the cell's trailing edge (5.3pt at radius 18; up to 7.7pt),
     // past contentView.bounds) and drawHierarchy clips at the canvas bounds —
     // rendering from contentView shipped a raster with the tail's outer hook
     // MISSING, so the morph flew a visibly clipped tail that "completed" only
@@ -11038,7 +11114,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     // captureRect is in contentView coordinates; the raster is drawn from
     // `canvas` — drawHierarchy CLIPS at the canvas view's bounds, and the
-    // integrated tail overhangs the cell's trailing edge by ~8pt, so the tail
+    // integrated tail overhangs the cell's trailing edge by up to ~7.7pt, so the tail
     // snapshot must render from a wider ancestor (see transitionTailSnapshotView)
     // or the raster ships with the tail's outer hook cut off.
     let canvas = canvasView ?? contentView
@@ -11341,7 +11417,11 @@ final class BubbleTailView: UIView {
         ? (isMe ? appearance.outgoingWallpaperSampleOpacity : appearance.incomingWallpaperSampleOpacity)
         : 1.0
     )
-    blurView.effect = UIBlurEffect(style: isMe ? .systemThinMaterialDark : .systemMaterialDark)
+    let material: UIBlurEffect.Style =
+      appearance.isDark
+      ? (isMe ? .systemThinMaterialDark : .systemMaterialDark)
+      : (isMe ? .systemThinMaterialLight : .systemMaterialLight)
+    blurView.effect = UIBlurEffect(style: material)
     // Same as body: them plate is stable with/without wallpaper (no solid→plate flash).
     let materialAlpha: CGFloat
     if hasWallpaperBackdrop {

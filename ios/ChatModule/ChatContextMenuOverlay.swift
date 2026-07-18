@@ -12,7 +12,7 @@ public protocol ChatContextMenuOverlayDelegate: AnyObject {
 
 /// Creates a UIVisualEffectView that uses real UIGlassEffect on iOS 26+,
 /// and falls back to UIBlurEffect on older iOS versions.
-private func makeLiquidGlassView(
+func makeChatContextLiquidGlassView(
   style: UIBlurEffect.Style = .systemMaterial,
   cornerRadius: CGFloat,
   capsuleCorners: Bool = false,
@@ -74,8 +74,6 @@ public final class ChatContextMenuOverlay: UIView {
   private let contextMenu: ContextMenuView
 
   private var isDismissing = false
-  private var reactionMaskLayer: CALayer?
-  private var contextMenuMaskLayer: CALayer?
   private var ignoreBackgroundTapUntil: CFTimeInterval = 0
   private var enableControlsWorkItem: DispatchWorkItem?
   private var isSelectingReaction = false
@@ -355,110 +353,69 @@ public final class ChatContextMenuOverlay: UIView {
       self.backgroundGlassView.alpha = 1
     }
 
-    // --- Bubble: start from the cell's scaled down state and expand it smoothly ---
+    // --- Bubble: continue from the cell's settled sink (0.95) — the menus
+    // morph out of that state on the SAME spring, so nothing pops.
     let startCenter = CGPoint(x: originalBubbleFrame.midX, y: originalBubbleFrame.midY)
     let endCenter = CGPoint(x: finalBubbleFrame.midX, y: finalBubbleFrame.midY)
     bubbleSnapshot.bounds = CGRect(origin: .zero, size: originalBubbleFrame.size)
     bubbleSnapshot.center = startCenter
-    bubbleSnapshot.transform = CGAffineTransform(scaleX: 0.965, y: 0.965)
+    bubbleSnapshot.transform = CGAffineTransform(scaleX: 0.95, y: 0.95)
     holdDebugLog(
       "animateIn start frame=\(NSCoder.string(for: originalBubbleFrame)) startCenter=\(NSCoder.string(for: startCenter)) endCenter=\(NSCoder.string(for: endCenter))"
     )
 
-    UIView.animate(
-      withDuration: 0.22,
-      delay: 0.0,
-      usingSpringWithDamping: 0.92,
-      initialSpringVelocity: 0,
-      options: [.allowUserInteraction, .beginFromCurrentState]
-    ) {
-      self.bubbleSnapshot.transform = .identity
-      self.bubbleSnapshot.center = endCenter
-    }
+    // Anchor X is biased toward the bubble side but never pinned to the corner:
+    // a 0/1 anchor with a small birth scale makes the far edge sweep almost the
+    // whole width — that read as the menu "entering from the side" instead of
+    // growing. A soft bias keeps the left/right identity while both edges
+    // expand outward, so the motion reads as scale-up, not lateral entry.
+    let pickerAnchorX: CGFloat = isRightAligned ? 0.65 : 0.35
+    let menuAnchorX: CGFloat = isRightAligned ? 0.6 : 0.4
 
-    // --- Reaction picker: directional clip reveal (left/right based on bubble side) ---
+    // --- Reaction picker: bottom edge pinned just above the bubble, growing
+    // upward/outward; the directional cue comes from the emoji cascade.
     reactionPicker.frame = pickerFinalFrame
-    setAnchorPoint(CGPoint(x: isRightAligned ? 1.0 : 0.0, y: 0.5), for: reactionPicker)
+    setAnchorPoint(CGPoint(x: pickerAnchorX, y: 1.0), for: reactionPicker)
+    let pickerFinalCenter = reactionPicker.center
+    reactionPicker.center = CGPoint(
+      x: pickerFinalCenter.x,
+      y: originalBubbleFrame.minY - 8
+    )
+    reactionPicker.transform = CGAffineTransform(scaleX: 0.35, y: 0.35)
     reactionPicker.alpha = 0
-    reactionPicker.transform =
-      CGAffineTransform(translationX: isRightAligned ? 8 : -8, y: 0)
-      .scaledBy(x: 0.92, y: 0.92)
 
-    let pickerMask = CALayer()
-    pickerMask.backgroundColor = UIColor.black.cgColor
-    pickerMask.frame = CGRect(
-      x: isRightAligned ? pickerFinalFrame.width : 0,
-      y: 0,
-      width: 0,
-      height: pickerFinalFrame.height
-    )
-    reactionPicker.layer.mask = pickerMask
-    reactionMaskLayer = pickerMask
-
-    let revealDelay: TimeInterval = 0.0
-    let revealDuration: TimeInterval = 0.42
-    UIView.animate(
-      withDuration: 0.2,
-      delay: revealDelay,
-      options: [.curveEaseOut, .beginFromCurrentState]
-    ) {
-      self.reactionPicker.alpha = 1
-    }
-    UIView.animate(
-      withDuration: revealDuration,
-      delay: revealDelay,
-      usingSpringWithDamping: 0.82,
-      initialSpringVelocity: 0.0,
-      options: [.beginFromCurrentState, .curveEaseOut]
-    ) {
-      self.reactionPicker.alpha = 1
-      self.reactionPicker.transform = .identity
-    }
-    CATransaction.begin()
-    CATransaction.setAnimationDuration(revealDuration)
-    CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
-    pickerMask.frame = CGRect(
-      x: 0,
-      y: 0,
-      width: pickerFinalFrame.width,
-      height: pickerFinalFrame.height
-    )
-    CATransaction.commit()
-
-    // --- Context menu: height reveal (no pop-in scale) ---
+    // --- Context menu: top edge pinned under the bubble, scaling up in place
+    // as it pours downward — no horizontal travel.
     contextMenu.frame = menuFinalFrame
-    setAnchorPoint(CGPoint(x: isRightAligned ? 1.0 : 0.0, y: 0.0), for: contextMenu)
-    contextMenu.transform = CGAffineTransform(translationX: 0, y: -4).scaledBy(x: 0.92, y: 0.92)
+    setAnchorPoint(CGPoint(x: menuAnchorX, y: 0.0), for: contextMenu)
+    let menuFinalCenter = contextMenu.center
+    contextMenu.center = CGPoint(
+      x: menuFinalCenter.x,
+      y: originalBubbleFrame.maxY + 4
+    )
+    contextMenu.transform = CGAffineTransform(scaleX: 0.4, y: 0.4)
     contextMenu.alpha = 0
 
-    let menuMask = CALayer()
-    menuMask.backgroundColor = UIColor.black.cgColor
-    menuMask.frame = CGRect(x: 0, y: 0, width: menuFinalFrame.width, height: 0)
-    contextMenu.layer.mask = menuMask
-    contextMenuMaskLayer = menuMask
-
-    UIView.animate(
-      withDuration: 0.2,
-      delay: revealDelay,
-      options: [.curveEaseOut, .beginFromCurrentState]
-    ) {
+    // Alpha resolves quickly so the entire remaining flight is pure geometry —
+    // a small-scale birth with a bouncy spring reads as a morph, never a fade.
+    let fadeAnimator = UIViewPropertyAnimator(duration: 0.12, curve: .easeOut) {
+      self.reactionPicker.alpha = 1
       self.contextMenu.alpha = 1
     }
-    UIView.animate(
-      withDuration: revealDuration,
-      delay: revealDelay,
-      usingSpringWithDamping: 0.82,
-      initialSpringVelocity: 0.0,
-      options: [.beginFromCurrentState, .curveEaseOut]
-    ) {
-      self.contextMenu.alpha = 1
+    // One under-damped spring drives bubble, picker, and menu together: both
+    // menus grow out of the bubble's edges with a visible expansion overshoot.
+    let springAnimator = UIViewPropertyAnimator(duration: 0.38, dampingRatio: 0.78) {
+      self.bubbleSnapshot.transform = .identity
+      self.bubbleSnapshot.center = endCenter
+      self.reactionPicker.transform = .identity
+      self.reactionPicker.center = pickerFinalCenter
       self.contextMenu.transform = .identity
+      self.contextMenu.center = menuFinalCenter
     }
-    CATransaction.begin()
-    CATransaction.setAnimationDuration(revealDuration)
-    CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
-    menuMask.frame = CGRect(x: 0, y: 0, width: menuFinalFrame.width, height: menuFinalFrame.height)
-    CATransaction.commit()
+    fadeAnimator.startAnimation()
+    springAnimator.startAnimation()
+    // Emoji tiles cascade in from the anchored side while the pill grows.
+    reactionPicker.animateIconsIn(fromTrailing: isRightAligned)
   }
 
   func animateOut(reason: String = "unknown", completion: (() -> Void)? = nil) {
@@ -473,30 +430,31 @@ public final class ChatContextMenuOverlay: UIView {
     contextMenu.isUserInteractionEnabled = false
     holdDebugLog("animateOut start reason=\(reason)")
 
+    // Inverse of the open morph: menus collapse back toward their bubble-edge
+    // anchors while the bubble returns to its row slot.
     UIView.animate(
-      withDuration: 0.20, delay: 0, options: [.curveEaseOut, .beginFromCurrentState]
+      withDuration: 0.18, delay: 0, options: [.curveEaseIn, .beginFromCurrentState]
     ) {
       self.backgroundGlassView.alpha = 0
       self.reactionPicker.alpha = 0
       self.contextMenu.alpha = 0
-      // Snap bubble back to original position smoothly
       self.bubbleSnapshot.transform = .identity
       self.bubbleSnapshot.bounds = CGRect(origin: .zero, size: self.originalBubbleFrame.size)
       self.bubbleSnapshot.center = CGPoint(
         x: self.originalBubbleFrame.midX,
         y: self.originalBubbleFrame.midY
       )
-      self.contextMenu.transform = CGAffineTransform(translationX: 0, y: -2).scaledBy(
-        x: 0.95, y: 0.95)
-      self.reactionPicker.transform = CGAffineTransform(
-        translationX: self.bubbleIsMe ? 6 : -6,
-        y: 0
-      ).scaledBy(x: 0.95, y: 0.95)
+      self.contextMenu.transform = CGAffineTransform(scaleX: 0.4, y: 0.4)
+      self.contextMenu.center = CGPoint(
+        x: self.contextMenu.center.x,
+        y: self.originalBubbleFrame.maxY + 4
+      )
+      self.reactionPicker.transform = CGAffineTransform(scaleX: 0.35, y: 0.35)
+      self.reactionPicker.center = CGPoint(
+        x: self.reactionPicker.center.x,
+        y: self.originalBubbleFrame.minY - 8
+      )
     } completion: { _ in
-      self.reactionPicker.layer.mask = nil
-      self.contextMenu.layer.mask = nil
-      self.reactionMaskLayer = nil
-      self.contextMenuMaskLayer = nil
       self.removeFromSuperview()
       self.delegate?.contextMenuDidDismiss(overlay: self)
       completion?()
@@ -720,6 +678,26 @@ final class ReactionPickerView: UIView {
     setNeedsLayout()
   }
 
+  /// Emoji tiles cascade in from the pill's anchored side while it morph-grows:
+  /// each springs up from a small scale, staggered in the growth direction.
+  func animateIconsIn(fromTrailing: Bool) {
+    let buttons = fromTrailing ? Array(stack.arrangedSubviews.reversed()) : stack.arrangedSubviews
+    for (index, button) in buttons.enumerated() {
+      button.alpha = 0
+      button.transform = CGAffineTransform(scaleX: 0.2, y: 0.2)
+      UIView.animate(
+        withDuration: 0.34,
+        delay: 0.05 + 0.04 * Double(index),
+        usingSpringWithDamping: 0.68,
+        initialSpringVelocity: 0,
+        options: [.beginFromCurrentState, .allowUserInteraction]
+      ) {
+        button.alpha = 1
+        button.transform = .identity
+      }
+    }
+  }
+
   @objc private func didTapEmoji(_ sender: UIButton) {
     guard let emoji = sender.title(for: .normal) else { return }
     // Spring bounce on tap
@@ -807,7 +785,7 @@ final class ContextMenuView: UIView {
       )
     }
     self.actions = resolvedActions
-    self.glassView = makeLiquidGlassView(
+    self.glassView = makeChatContextLiquidGlassView(
       style: appearance.isDark ? .systemMaterialDark : .systemMaterial,
       cornerRadius: 24,
       capsuleCorners: false

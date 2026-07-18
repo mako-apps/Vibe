@@ -7896,6 +7896,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func applyResolvedAppearance(_ next: ChatListAppearance) {
     let visualChanged = appearance.visualKey != next.visualKey
     appearance = next
+    // Lock list chrome materials to chat theme dark/light (not ambient system style).
+    overrideUserInterfaceStyle = next.isDark ? .dark : .light
+    collectionView.overrideUserInterfaceStyle = next.isDark ? .dark : .light
     inputBar?.applyAppearance(next)
     applyScrollingDatePillAppearance(next)
     if cachedHistoryPullIndicatorInstalled {
@@ -8547,7 +8550,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self?.handleResolvedMediaSize(messageId: messageId, mediaURL: mediaURL, size: size)
     }
     cell.onMediaGridTileTap = { [weak self] row, tileIndex, sourceView in
-      self?.presentNativeImageOpen(for: row, gridIndex: tileIndex, sourceView: sourceView)
+      guard let self else { return }
+      // Cell-internal tile taps have no failure dependency on the context-menu
+      // long press, so a hold on an image fired this on finger-lift and opened
+      // the editor over the menu.
+      guard self.customContextMenuOverlay == nil else { return }
+      self.presentNativeImageOpen(for: row, gridIndex: tileIndex, sourceView: sourceView)
     }
     cell.onRetryMessageTap = { [weak self] row in
       self?.retryOutgoingMessage(row: row, source: "inline_retry")
@@ -15959,6 +15967,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     gridIndex: Int,
     sourceView: UIView?
   ) {
+    // Never open the editor while the message context menu is up (or opening):
+    // the image hold must yield the menu, not both surfaces stacked.
+    guard customContextMenuOverlay == nil else { return }
     guard let presenter = topPresentingViewController() else { return }
     let cell = collectionView.visibleCells.compactMap { $0 as? ChatListCell }
       .first { $0.row?.messageId == row.messageId || $0.row?.key == row.key }
