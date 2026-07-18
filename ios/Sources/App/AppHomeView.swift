@@ -4052,12 +4052,12 @@ private final class SearchFlightContainerView: UIView {
   }
 }
 
-/// THE one search capsule. It lives in the table header when idle and is
-/// REPARENTED into a window-level container and flown to the nav band on
-/// focus — the same UIView travels, so there is no native→ghost handoff and
-/// nothing inside the input can ever jump. Inner layout is AutoLayout (it
-/// animates under UIViewPropertyAnimator frame changes); the capsule itself is
-/// frame-positioned so reparenting never tears down constraints.
+/// The SOLID in-list search capsule. It never leaves the table header and is
+/// part of the LIST SURFACE: on focus it fades/lifts out together with the
+/// cells (one shared value) while the glass ghost (HomeSearchGhostInputView)
+/// crossfades in mid-run as its replacement — the Telegram two-view grammar.
+/// The crossfade IS the handoff, so tiny inner-metric differences can never
+/// read as a jump.
 private final class HomeSearchCapsuleView: UIView {
   static let fieldHeight: CGFloat = 44
 
@@ -4065,7 +4065,6 @@ private final class HomeSearchCapsuleView: UIView {
   let textField = UITextField()
   let placeholderLabel = UILabel()
   private let fillView = UIView()
-  private var glassView: UIVisualEffectView?
   var onTextChanged: ((String) -> Void)?
 
   override init(frame: CGRect) {
@@ -4076,23 +4075,6 @@ private final class HomeSearchCapsuleView: UIView {
 
     fillView.translatesAutoresizingMaskIntoConstraints = false
     addSubview(fillView)
-
-    if #available(iOS 26.0, *) {
-      // Docked look only — alpha stays 0 through the flight (Liquid Glass
-      // crossfading mid-spring costs frames) and fades in after settle.
-      let glass = UIVisualEffectView(effect: UIGlassEffect())
-      glass.translatesAutoresizingMaskIntoConstraints = false
-      glass.alpha = 0
-      glass.isUserInteractionEnabled = false
-      addSubview(glass)
-      NSLayoutConstraint.activate([
-        glass.leadingAnchor.constraint(equalTo: leadingAnchor),
-        glass.trailingAnchor.constraint(equalTo: trailingAnchor),
-        glass.topAnchor.constraint(equalTo: topAnchor),
-        glass.bottomAnchor.constraint(equalTo: bottomAnchor),
-      ])
-      glassView = glass
-    }
 
     iconView.translatesAutoresizingMaskIntoConstraints = false
     iconView.image = UIImage(systemName: "magnifyingglass")
@@ -4158,23 +4140,105 @@ private final class HomeSearchCapsuleView: UIView {
     placeholderLabel.isHidden = !(textField.text ?? "").isEmpty
   }
 
-  func setGlass(
-    _ on: Bool, animated: Bool = true, duration: TimeInterval = 0.15,
-    delay: TimeInterval = 0
-  ) {
-    guard let glassView else { return }
-    let apply = {
-      glassView.alpha = on ? 1 : 0
-      self.fillView.alpha = on ? 0 : 1
-    }
-    if animated {
-      UIView.animate(
-        withDuration: duration, delay: delay,
-        options: [.beginFromCurrentState, .curveEaseInOut],
-        animations: apply)
+  @objc private func textChanged() {
+    placeholderLabel.isHidden = !(textField.text ?? "").isEmpty
+    onTextChanged?(textField.text ?? "")
+  }
+}
+
+/// The GLASS focused-search input — the ghost that appears mid-flight and
+/// docks in the nav band. Built exactly like ChatPinnedBannerView (the
+/// reference for glass done right): ONE `UIGlassEffect` owns the shell via a
+/// UIVisualEffectView, ALL content lives inside its `contentView` (never as
+/// siblings above the glass, never an opaque fill underneath). It is glass
+/// from birth — no solid→glass morph on a single element.
+private final class HomeSearchGhostInputView: UIView {
+  let textField = UITextField()
+  private let blurView = UIVisualEffectView(effect: nil)
+  private let iconView = UIImageView()
+  private let placeholderLabel = UILabel()
+  var onTextChanged: ((String) -> Void)?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    backgroundColor = .clear
+
+    blurView.frame = bounds
+    blurView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    blurView.layer.cornerCurve = .continuous
+    blurView.layer.cornerRadius = HomeSearchCapsuleView.fieldHeight / 2
+    blurView.clipsToBounds = true
+    blurView.contentView.backgroundColor = .clear
+    addSubview(blurView)
+
+    let content = blurView.contentView
+
+    iconView.translatesAutoresizingMaskIntoConstraints = false
+    iconView.image = UIImage(systemName: "magnifyingglass")
+    iconView.contentMode = .scaleAspectFit
+    iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
+      pointSize: 15, weight: .medium)
+    content.addSubview(iconView)
+
+    textField.translatesAutoresizingMaskIntoConstraints = false
+    textField.font = .systemFont(ofSize: 17, weight: .regular)
+    textField.autocorrectionType = .no
+    textField.autocapitalizationType = .none
+    textField.returnKeyType = .search
+    textField.clearButtonMode = .whileEditing
+    textField.addTarget(self, action: #selector(textChanged), for: .editingChanged)
+    content.addSubview(textField)
+
+    placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
+    placeholderLabel.text = "Search"
+    placeholderLabel.font = .systemFont(ofSize: 17, weight: .regular)
+    placeholderLabel.isUserInteractionEnabled = false
+    content.addSubview(placeholderLabel)
+
+    NSLayoutConstraint.activate([
+      iconView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+      iconView.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+      iconView.widthAnchor.constraint(equalToConstant: 18),
+      iconView.heightAnchor.constraint(equalToConstant: 18),
+
+      textField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+      textField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+      textField.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+
+      placeholderLabel.leadingAnchor.constraint(equalTo: textField.leadingAnchor),
+      placeholderLabel.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+    ])
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  func applyPalette(isDark: Bool) {
+    // One glass shell only — never nest another effect or opaque fill under it
+    // (ChatPinnedBannerView rule; a fill underneath was the "wrong glass
+    // water" / elements-behind-the-glass look).
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect(style: .regular)
+      glass.isInteractive = true
+      blurView.effect = glass
+      blurView.contentView.backgroundColor = .clear
     } else {
-      apply()
+      blurView.effect = UIBlurEffect(style: .systemThinMaterial)
+      blurView.contentView.backgroundColor =
+        (isDark ? UIColor.white : UIColor.black)
+        .withAlphaComponent(isDark ? 0.10 : 0.06)
     }
+    let secondary =
+      isDark ? UIColor.white.withAlphaComponent(0.55) : UIColor.secondaryLabel
+    iconView.tintColor = secondary
+    placeholderLabel.textColor = secondary
+    textField.textColor = isDark ? .white : .label
+  }
+
+  func syncText(_ text: String) {
+    if textField.text != text { textField.text = text }
+    placeholderLabel.isHidden = !(textField.text ?? "").isEmpty
   }
 
   @objc private func textChanged() {
@@ -4226,19 +4290,7 @@ private final class ChatHomeInListSearchHeader: UIView {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    // Only place the capsule while it is actually home — never fight the
-    // window-level flight for its frame.
-    if capsuleView.superview === self {
-      capsuleView.frame = capsuleSlotFrame
-    }
-  }
-
-  /// Land the capsule back onto its slot after a flight.
-  func attach(_ capsule: HomeSearchCapsuleView) {
-    addSubview(capsule)
-    capsule.frame = capsuleSlotFrame
-    capsule.textField.isUserInteractionEnabled = false
-    bringSubviewToFront(hitButton)
+    capsuleView.frame = capsuleSlotFrame
   }
 
   func apply(
@@ -4640,6 +4692,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   /// Window-level layer the capsule flies in (above the SwiftUI results sheet,
   /// which lives inside the SwiftUI hierarchy below the window's top).
   private var searchFlightContainer: UIView?
+  private var searchGhost: HomeSearchGhostInputView?
   private var searchCloseButton: UIButton?
   private var searchReturnAnimator: UIViewPropertyAnimator?
 
@@ -4706,11 +4759,6 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       header.onFocusChange = { [weak self] focused in
         self?.isSearchFocusedBinding?.wrappedValue = focused
       }
-      // The capsule's UITextField is the ONE live input — its edits flow into
-      // the SwiftUI query binding that drives the results sheet.
-      header.capsuleView.onTextChanged = { [weak self] text in
-        self?.searchTextBinding?.wrappedValue = text
-      }
       searchHeader = header
     }
     let width = tableView.bounds.width > 0 ? tableView.bounds.width : view.bounds.width
@@ -4722,6 +4770,9 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       recentRows: recentRows,
       animated: animated
     )
+    // External query changes (sheet "Clear", close-time reset) reach the ghost
+    // too; while the user types in the ghost this is an equal-text no-op.
+    searchGhost?.syncText(searchTextBinding?.wrappedValue ?? "")
     header.layoutIfNeeded()
     let targetHeight = header.preferredHeight
     header.frame = CGRect(x: 0, y: 0, width: width, height: targetHeight)
@@ -4741,15 +4792,19 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     presentedSearchRetract = retracting
 
     let changes = {
-      // Only chat rows yield to the focused surface: they lift and fade in the
-      // same upward direction the field travels. The navigation header never
-      // moves (it fades in place via setNavigationBarFaded).
+      // The LIST SURFACE is one thing: cells AND the in-list capsule (the
+      // whole tableHeaderView) lift and fade together on one shared value.
+      // The glass ghost crossfades in/out mid-run as the input's replacement.
       for cell in self.tableView.visibleCells {
         cell.alpha = focused ? 0.0 : 1.0
         cell.transform = focused
           ? CGAffineTransform(translationX: 0, y: -10)
           : .identity
       }
+      self.searchHeader?.alpha = focused ? 0.0 : 1.0
+      self.searchHeader?.transform = focused
+        ? CGAffineTransform(translationX: 0, y: -10)
+        : .identity
     }
     guard animated else {
       changes()
@@ -4783,13 +4838,14 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     cellAnimator.startAnimation()
   }
 
-  // MARK: Search capsule flight (pure UIKit/Core Animation)
+  // MARK: Search ghost flight (pure UIKit/Core Animation)
   //
-  // The in-list capsule ITSELF is reparented into a window-level container and
-  // flown to the nav band. One view, two poses — no ghost, no handoff, nothing
-  // inside the input can jump, and the CA spring keeps rendering even when the
-  // keyboard stalls the main thread (the stall is deliberately requested only
-  // AFTER the animation is committed to the render server).
+  // Telegram's two-view grammar: the in-list capsule is part of the LIST
+  // SURFACE (it fades/lifts out with the cells on one shared spring), while a
+  // separate ALWAYS-GLASS ghost input flies slot→dock, crossfading in mid-run
+  // as the replacement. The crossfade is the handoff — no frame-exact swap
+  // exists to jump. CA animations keep rendering when the keyboard stalls the
+  // main thread (keyboard work is requested only AFTER the springs commit).
 
   private func searchDockFrame(in window: UIWindow, narrowed: Bool) -> CGRect {
     let top = window.safeAreaInsets.top + 2
@@ -4852,22 +4908,37 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     isSearchFocusedBinding?.wrappedValue = false
   }
 
+  private func ensureSearchGhost(in container: UIView) -> HomeSearchGhostInputView {
+    if let existing = searchGhost, existing.superview === container {
+      return existing
+    }
+    searchGhost?.removeFromSuperview()
+    let ghost = HomeSearchGhostInputView()
+    // The ghost's UITextField is the ONE live input — its edits flow into the
+    // SwiftUI query binding that drives the results sheet.
+    ghost.onTextChanged = { [weak self] text in
+      self?.searchTextBinding?.wrappedValue = text
+    }
+    container.addSubview(ghost)
+    searchGhost = ghost
+    return ghost
+  }
+
   private func beginSearchFlightOpen() {
     guard let header = searchHeader, let window = view.window else { return }
-    let capsule = header.capsuleView
     searchReturnAnimator?.stopAnimation(true)
     searchReturnAnimator = nil
 
     let container = ensureSearchFlightContainer(in: window)
-    let start =
-      capsule.superview === container
-      ? capsule.frame
-      : header.convert(capsule.frame, to: window)
     container.isHidden = false
     window.bringSubviewToFront(container)
-    container.addSubview(capsule)
-    capsule.frame = start
-    capsule.textField.isUserInteractionEnabled = true
+
+    let ghost = ensureSearchGhost(in: container)
+    ghost.applyPalette(isDark: isDark)
+    ghost.syncText(searchTextBinding?.wrappedValue ?? "")
+    ghost.frame = header.convert(header.capsuleSlotFrame, to: window)
+    ghost.alpha = 0
+    ghost.layoutIfNeeded()
 
     let close = ensureSearchCloseButton(in: container)
     let dock = searchDockFrame(in: window, narrowed: true)
@@ -4878,92 +4949,99 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       height: HomeSearchChrome.closeSize)
     close.alpha = 1
 
-    SearchMorphProfiler.mark("capsule flight begin")
+    SearchMorphProfiler.mark("ghost flight begin")
     let spring = UISpringTimingParameters(
       mass: 1, stiffness: 438, damping: 37.7, initialVelocity: .zero)
     let animator = UIViewPropertyAnimator(duration: 0, timingParameters: spring)
     animator.addAnimations {
-      capsule.frame = dock
-      capsule.layoutIfNeeded()
+      ghost.frame = dock
+      ghost.layoutIfNeeded()
       close.frame.origin.x =
         window.bounds.width - 16 - HomeSearchChrome.closeSize
     }
     animator.startAnimation()
 
-    // Glass crossfades in MIDWAY through the flight: the solid fill fades out
-    // as the glass fades in under the shared inner content — reads as the
-    // tapped solid input crossfading into a glass input while traveling, with
-    // no waiting-at-the-dock latency. The glass layer was created at init, so
-    // nothing is allocated mid-spring.
-    capsule.setGlass(true, duration: 0.20, delay: 0.10)
+    // The ghost APPEARS MID-RUN, crossfading with the in-list capsule that is
+    // fading out as part of the list surface — the crossfade is the handoff.
+    UIView.animate(
+      withDuration: 0.16, delay: 0.06,
+      options: [.beginFromCurrentState, .curveEaseInOut]
+    ) {
+      ghost.alpha = 1
+    }
 
     // Keyboard AFTER the flight is committed to the render server — its ~90ms
     // main-thread stall can then no longer freeze the spring's first frames.
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
       guard let self, self.presentedSearchFocus else { return }
       SearchMorphProfiler.mark("focus request")
-      self.searchHeader?.capsuleView.textField.becomeFirstResponder()
+      self.searchGhost?.textField.becomeFirstResponder()
     }
   }
 
   private func beginSearchCloseRetract() {
-    guard let window = view.window, let header = searchHeader else { return }
-    let capsule = header.capsuleView
-    guard capsule.superview === searchFlightContainer else { return }
-    capsule.setGlass(false, duration: 0.12)
+    guard let window = view.window,
+      let ghost = searchGhost,
+      ghost.superview === searchFlightContainer
+    else { return }
     let full = searchDockFrame(in: window, narrowed: false)
     let close = searchCloseButton
     let animator = UIViewPropertyAnimator(duration: 0.12, curve: .easeOut) {
-      capsule.frame = full
-      capsule.layoutIfNeeded()
+      ghost.frame = full
+      ghost.layoutIfNeeded()
       close?.frame.origin.x = window.bounds.width
     }
     animator.startAnimation()
     // Resign AFTER this commit — dismissal stalls ~40ms on the main thread.
     DispatchQueue.main.async {
       SearchMorphProfiler.mark("keyboard dismiss request")
-      capsule.textField.resignFirstResponder()
+      ghost.textField.resignFirstResponder()
     }
   }
 
   private func beginSearchFlightReturn() {
-    guard let window = view.window, let header = searchHeader else { return }
-    let capsule = header.capsuleView
-    guard capsule.superview === searchFlightContainer else { return }
+    guard let window = view.window, let header = searchHeader,
+      let ghost = searchGhost,
+      ghost.superview === searchFlightContainer
+    else { return }
     let target = header.convert(header.capsuleSlotFrame, to: window)
     let spring = UISpringTimingParameters(
       mass: 1, stiffness: 503, damping: 41.3, initialVelocity: .zero)
     let animator = UIViewPropertyAnimator(duration: 0, timingParameters: spring)
     animator.addAnimations {
-      capsule.frame = target
-      capsule.layoutIfNeeded()
+      ghost.frame = target
+      ghost.layoutIfNeeded()
     }
     animator.addCompletion { [weak self] _ in
-      SearchMorphProfiler.mark("capsule reattached")
+      SearchMorphProfiler.mark("ghost settled")
       self?.settleSearchFlight(focused: false)
     }
     searchReturnAnimator = animator
     animator.startAnimation()
+    // The ghost dies MID-RUN while the in-list capsule fades back in with the
+    // list surface — the reverse crossfade. Both ride the same spring, so the
+    // list can never lead the input.
+    UIView.animate(
+      withDuration: 0.16, delay: 0.04,
+      options: [.beginFromCurrentState, .curveEaseInOut]
+    ) {
+      ghost.alpha = 0
+    }
   }
 
   private func settleSearchFlight(focused: Bool) {
-    guard let header = searchHeader else { return }
-    let capsule = header.capsuleView
     if focused {
       guard let window = view.window else { return }
-      if capsule.superview !== searchFlightContainer {
-        let container = ensureSearchFlightContainer(in: window)
-        container.isHidden = false
-        container.addSubview(capsule)
-        capsule.textField.isUserInteractionEnabled = true
-      }
-      capsule.frame = searchDockFrame(in: window, narrowed: true)
+      let container = ensureSearchFlightContainer(in: window)
+      container.isHidden = false
+      let ghost = ensureSearchGhost(in: container)
+      ghost.applyPalette(isDark: isDark)
+      ghost.syncText(searchTextBinding?.wrappedValue ?? "")
+      ghost.frame = searchDockFrame(in: window, narrowed: true)
+      ghost.alpha = 1
     } else {
       searchReturnAnimator = nil
-      if capsule.superview !== header {
-        header.attach(capsule)
-      }
-      capsule.setGlass(false, animated: false)
+      searchGhost?.alpha = 0
       searchFlightContainer?.isHidden = true
       searchCloseButton?.alpha = 0
     }

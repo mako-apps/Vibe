@@ -1,5 +1,22 @@
 defmodule Vibe.AI.AgentEventRuntime do
-  @moduledoc false
+  @moduledoc """
+  Event-inbox runtime for provider agent events, including progressive
+  `message.stream` delivery.
+
+  ## `message.stream` (provider streaming)
+
+  Providers POST full-accumulated text frames to the existing events ingress
+  with `eventType: "message.stream"`. Frames are applied as progressive edits
+  on a single chat message (`metadata["streaming"] = true` until `done`).
+
+  Stream state (`streamId → %{message_id, last_seq, done}`) is held in an
+  **ETS table owned by this module** (`:vibe_agent_event_streams`). State is
+  **node-local** — acceptable for single-instance deploy; multi-node would need
+  shared storage.
+
+  Throttle expectation: providers SHOULD send **≤ 4 frames/sec**. Frames with
+  `seq` ≤ last-seen are ignored (idempotent full-text frames).
+  """
 
   import Ecto.Query, warn: false
   import Plug.Crypto, only: [secure_compare: 2]
@@ -17,35 +34,439 @@ defmodule Vibe.AI.AgentEventRuntime do
   alias Vibe.Agents
   alias Vibe.Chat
   alias Vibe.Chat.AgentMessageCrypto
+  alias Vibe.Chat.Message
   alias Vibe.Notifications
+  alias Vibe.ProviderContent
   alias Vibe.Repo
+  alias Vibe.RepoRLS
 
   @safe_action_types ~w[post_message post_checklist request_confirmation set_thread_status]
   @high_priority_keywords ~w[failed failure blocked fraud urgent escalated chargeback liquidation stop_loss]
   @batch_summary_event_line_limit 12
+  @stream_table :vibe_agent_event_streams
+  @stream_event_type "message.stream"
 
   def ingest(%Agent{} = agent, params, opts \\ []) when is_map(params) do
     secret = Keyword.get(opts, :secret)
+    event_type = normalize_string(params["eventType"] || params["event_type"])
 
     Logger.info(
       "[InboxBanner] ingest agent_id=#{inspect(agent.id)} " <>
         "raw_approval_rules_event_inbox=#{inspect(get_in(agent.approval_rules || %{}, ["event_inbox"]))} " <>
-        "params_event_type=#{inspect(Map.get(params, "eventType") || Map.get(params, :eventType))}"
+        "params_event_type=#{inspect(event_type)}"
     )
 
-    with {:ok, integration} <- resolve_integration(agent, params, secret),
-         {:ok, normalized} <- normalize_event(agent, integration, params),
-         :ok <- ensure_destination_chat(agent, normalized.destination_chat_id),
-         {:ok, result} <- persist_event(agent, integration, normalized) do
-      Logger.info(
-        "[InboxBanner] ingest result agent_id=#{inspect(agent.id)} " <>
-          "decision=#{inspect(Map.get(result, :decision))} " <>
-          "messagePosted=#{inspect(Map.get(result, :messagePosted))} " <>
-          "status=#{inspect(Map.get(result, :status))}"
-      )
+    with {:ok, integration} <- resolve_integration(agent, params, secret) do
+      if event_type == @stream_event_type do
+        handle_message_stream(agent, integration, params)
+      else
+        with {:ok, normalized} <- normalize_event(agent, integration, params),
+             :ok <- ensure_destination_chat(agent, normalized.destination_chat_id),
+             {:ok, result} <- persist_event(agent, integration, normalized) do
+          Logger.info(
+            "[InboxBanner] ingest result agent_id=#{inspect(agent.id)} " <>
+              "decision=#{inspect(Map.get(result, :decision))} " <>
+              "messagePosted=#{inspect(Map.get(result, :messagePosted))} " <>
+              "status=#{inspect(Map.get(result, :status))}"
+          )
 
-      {:ok, result}
+          {:ok, result}
+        end
+      end
     end
+  end
+
+  # ── message.stream pure helpers (public for unit tests; no DB) ─────────────
+
+  @doc """
+  Normalize a `message.stream` params map into a frame struct.
+
+  Returns `{:ok, frame}` or `{:error, reason}` where reason is one of
+  `:missing_stream_id` or `:missing_seq`. Destination may be nil here and
+  filled from agent/integration defaults by the runtime.
+  """
+  def normalize_stream_params(params) when is_map(params) do
+    stream_id = normalize_string(params["streamId"] || params["stream_id"])
+    seq = normalize_integer(params["seq"])
+    # Full accumulated text (never a delta). Empty string allowed mid-stream.
+    text = normalize_rich_text(params["text"] || params["message"]) || ""
+
+    # Prefer raw content envelope; controller may also attach validated providerContent.
+    content =
+      cond do
+        is_map(params["content"]) -> params["content"]
+        is_map(params["providerContent"]) -> params["providerContent"]
+        true -> nil
+      end
+
+    done = normalize_boolean(params["done"]) == true
+
+    destination_chat_id =
+      normalize_string(params["destinationChatId"] || params["destination_chat_id"])
+
+    cond do
+      is_nil(stream_id) ->
+        {:error, :missing_stream_id}
+
+      is_nil(seq) ->
+        {:error, :missing_seq}
+
+      true ->
+        {:ok,
+         %{
+           stream_id: stream_id,
+           seq: seq,
+           text: text,
+           content: content,
+           done: done,
+           destination_chat_id: destination_chat_id
+         }}
+    end
+  end
+
+  def normalize_stream_params(_), do: {:error, :missing_stream_id}
+
+  @doc """
+  Pure stream-frame state machine.
+
+  `state` is `nil` (unknown stream) or `%{message_id, last_seq, done}`.
+  `frame` is a normalized stream frame from `normalize_stream_params/1`.
+
+  Returns one of:
+  - `{:ignore, reason}` — stale seq or stream already done
+  - `{:create, next_state, frame}` — first non-done frame
+  - `{:update, next_state, frame}` — later non-done frame
+  - `{:finalize, next_state, frame}` — done frame for existing stream
+  - `{:create_finalize, next_state, frame}` — done-only (unknown streamId)
+  """
+  def stream_frame_decision(nil, %{seq: seq, done: false} = frame) when is_integer(seq) do
+    {:create, %{message_id: nil, last_seq: seq, done: false}, frame}
+  end
+
+  def stream_frame_decision(nil, %{seq: seq, done: true} = frame) when is_integer(seq) do
+    {:create_finalize, %{message_id: nil, last_seq: seq, done: true}, frame}
+  end
+
+  def stream_frame_decision(%{done: true}, _frame) do
+    {:ignore, :stream_done}
+  end
+
+  def stream_frame_decision(%{last_seq: last_seq}, %{seq: seq})
+      when is_integer(last_seq) and is_integer(seq) and seq <= last_seq do
+    {:ignore, :stale_seq}
+  end
+
+  def stream_frame_decision(%{} = state, %{seq: seq, done: false} = frame)
+      when is_integer(seq) do
+    {:update, %{state | last_seq: seq, done: false}, frame}
+  end
+
+  def stream_frame_decision(%{} = state, %{seq: seq, done: true} = frame)
+      when is_integer(seq) do
+    {:finalize, %{state | last_seq: seq, done: true}, frame}
+  end
+
+  def stream_frame_decision(_state, _frame), do: {:ignore, :invalid_frame}
+
+  @doc """
+  Pure final-frame content handling.
+
+  On valid `content` envelope: degrade via `ProviderContent.to_message_attrs/1`
+  (envelope text wins) and return normalized content for `metadata["content"]`.
+
+  On invalid content: keep plain `text` and return
+  `{:error, {:invalid_content, reason}, text}` so the caller can finalize then
+  surface the invoke-consistent error shape.
+  """
+  def finalize_stream_content(text, nil) when is_binary(text), do: {:ok, text, nil}
+
+  def finalize_stream_content(text, content) when is_binary(text) and is_map(content) do
+    # Already-normalized envelope from controller may still re-parse cleanly.
+    case ProviderContent.parse(content) do
+      {:ok, normalized} ->
+        attrs = ProviderContent.to_message_attrs(normalized)
+        body = normalize_string(attrs["text"]) || text
+        {:ok, body, normalized}
+
+      {:error, reason} ->
+        {:error, {:invalid_content, reason}, text}
+    end
+  end
+
+  def finalize_stream_content(text, _) when is_binary(text), do: {:ok, text, nil}
+
+  def finalize_stream_content(text, content) do
+    finalize_stream_content(to_string(text || ""), content)
+  end
+
+  # ── message.stream runtime ─────────────────────────────────────────────────
+
+  defp handle_message_stream(%Agent{} = agent, integration, params) do
+    ensure_stream_table!()
+
+    with {:ok, frame0} <- normalize_stream_params(params),
+         {:ok, frame} <- resolve_stream_destination(frame0, agent, integration),
+         :ok <- ensure_destination_chat(agent, frame.destination_chat_id) do
+      key = stream_state_key(agent.id, frame.stream_id)
+      state = stream_lookup(key)
+      decision = stream_frame_decision(state, frame)
+
+      case decision do
+        {:ignore, reason} ->
+          {:ok,
+           %{
+             success: true,
+             ignored: true,
+             reason: reason,
+             streamId: frame.stream_id,
+             seq: frame.seq,
+             messageId: state && state.message_id,
+             done: frame.done
+           }}
+
+        {:create, next_state, frame} ->
+          apply_stream_create(agent, key, next_state, frame, streaming?: true)
+
+        {:update, next_state, frame} ->
+          apply_stream_update(agent, key, state, next_state, frame, finalize?: false)
+
+        {:finalize, next_state, frame} ->
+          apply_stream_update(agent, key, state, next_state, frame, finalize?: true)
+
+        {:create_finalize, next_state, frame} ->
+          apply_stream_create(agent, key, next_state, frame, streaming?: false, finalize?: true)
+      end
+    end
+  end
+
+  defp resolve_stream_destination(frame, agent, integration) do
+    dest =
+      frame.destination_chat_id ||
+        (integration && integration.default_destination_chat_id) ||
+        agent.default_destination_chat_id
+
+    case normalize_string(dest) do
+      nil -> {:error, :missing_destination_chat}
+      chat_id -> {:ok, %{frame | destination_chat_id: chat_id}}
+    end
+  end
+
+  defp apply_stream_create(agent, key, next_state, frame, opts) do
+    streaming? = Keyword.get(opts, :streaming?, true)
+    finalize? = Keyword.get(opts, :finalize?, false)
+
+    {text, content_meta, content_error} =
+      if finalize? do
+        case finalize_stream_content(frame.text, frame.content) do
+          {:ok, body, meta} -> {body, meta, nil}
+          {:error, err, body} -> {body, nil, err}
+        end
+      else
+        {frame.text, nil, nil}
+      end
+
+    metadata =
+      stream_message_metadata(agent, streaming?: streaming? and not finalize?)
+      |> maybe_put_content(content_meta)
+
+    case post_chat_message(agent, frame.destination_chat_id, text, metadata, nil) do
+      {:ok, %{message_id: message_id} = posted} ->
+        stored = %{next_state | message_id: message_id}
+        stream_put(key, stored)
+
+        result = %{
+          success: true,
+          ignored: false,
+          streamId: frame.stream_id,
+          seq: frame.seq,
+          messageId: message_id,
+          messagePosted: true,
+          done: frame.done,
+          timestamp: posted.timestamp
+        }
+
+        # Finalize-with-text then surface invoke-consistent content error.
+        if content_error, do: {:error, content_error}, else: {:ok, result}
+
+      error ->
+        error
+    end
+  end
+
+  defp apply_stream_update(agent, key, state, next_state, frame, opts) do
+    finalize? = Keyword.get(opts, :finalize?, false)
+    message_id = state.message_id
+
+    if not is_binary(message_id) do
+      {:error, :stream_message_missing}
+    else
+      {text, content_meta, content_error} =
+        if finalize? do
+          case finalize_stream_content(frame.text, frame.content) do
+            {:ok, body, meta} -> {body, meta, nil}
+            {:error, err, body} -> {body, nil, err}
+          end
+        else
+          {frame.text, nil, nil}
+        end
+
+      edited_at = System.system_time(:millisecond)
+
+      case update_stream_message(
+             agent,
+             frame.destination_chat_id,
+             message_id,
+             text,
+             streaming?: not finalize?,
+             content: content_meta,
+             edited_at: edited_at
+           ) do
+        {:ok, _message} ->
+          stream_put(key, %{next_state | message_id: message_id})
+          broadcast_stream_edited(agent, frame.destination_chat_id, message_id, text, edited_at)
+
+          result = %{
+            success: true,
+            ignored: false,
+            streamId: frame.stream_id,
+            seq: frame.seq,
+            messageId: message_id,
+            messagePosted: true,
+            done: frame.done,
+            editedAt: edited_at
+          }
+
+          if content_error, do: {:error, content_error}, else: {:ok, result}
+
+        error ->
+          error
+      end
+    end
+  end
+
+  defp stream_message_metadata(agent, opts) do
+    streaming? = Keyword.get(opts, :streaming?, false)
+
+    agent_username =
+      case agent.agent_user do
+        %{username: username} when is_binary(username) -> username
+        _ -> nil
+      end
+
+    %{
+      "isAgentMessage" => true,
+      "agentName" => agent.display_name,
+      "agentId" => agent.id,
+      "agentUserId" => agent.agent_user_id,
+      "agentUsername" => agent_username,
+      "agentHandle" => if(agent_username, do: "@#{agent_username}", else: nil),
+      "streaming" => streaming?,
+      "eventType" => @stream_event_type
+    }
+    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+    |> Map.new()
+    |> then(fn meta ->
+      if streaming?, do: meta, else: Map.delete(meta, "streaming")
+    end)
+  end
+
+  defp maybe_put_content(metadata, nil), do: metadata
+
+  defp maybe_put_content(metadata, content) when is_map(content),
+    do: Map.put(metadata, "content", content)
+
+  defp update_stream_message(agent, chat_id, message_id, text, opts) do
+    streaming? = Keyword.get(opts, :streaming?, false)
+    content = Keyword.get(opts, :content)
+    edited_at = Keyword.get(opts, :edited_at) || System.system_time(:millisecond)
+    encrypted = AgentMessageCrypto.encrypt_for_storage(text || "")
+
+    RepoRLS.with_user(agent.agent_user_id, fn ->
+      with {:ok, uuid} <- Ecto.UUID.cast(message_id),
+           %Message{} = message <-
+             Repo.one(from(m in Message, where: m.id == ^uuid and m.chat_id == ^chat_id)),
+           true <- message.from_id == agent.agent_user_id do
+        metadata =
+          (message.metadata || %{})
+          |> Map.merge(%{
+            "isAgentMessage" => true,
+            "agentName" => agent.display_name,
+            "agentId" => agent.id,
+            "agentUserId" => agent.agent_user_id
+          })
+          |> then(fn meta ->
+            if streaming? do
+              Map.put(meta, "streaming", true)
+            else
+              Map.delete(meta, "streaming")
+            end
+          end)
+          |> maybe_put_content(content)
+
+        next_ts = max(message.timestamp || 0, edited_at)
+
+        message
+        |> Message.changeset(%{
+          encrypted_content: encrypted,
+          metadata: metadata,
+          timestamp: next_ts
+        })
+        |> Repo.update()
+      else
+        :error -> {:error, :invalid_id}
+        nil -> {:error, :not_found}
+        false -> {:error, :forbidden}
+      end
+    end)
+  end
+
+  # Mirror chat_channel.ex ~555 message-edited payload, plus agent plain-text
+  # fields so clients that hydrate agent rows from plainContent keep working.
+  defp broadcast_stream_edited(agent, chat_id, message_id, plain_text, edited_at) do
+    payload = %{
+      messageId: message_id,
+      encryptedContent: plain_text || "",
+      editedAt: edited_at,
+      editedBy: agent.agent_user_id,
+      plainContent: plain_text,
+      plaintext: plain_text
+    }
+
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message-edited", payload)
+  end
+
+  defp stream_state_key(agent_id, stream_id), do: {agent_id, stream_id}
+
+  defp ensure_stream_table! do
+    case :ets.whereis(@stream_table) do
+      :undefined ->
+        try do
+          :ets.new(@stream_table, [
+            :named_table,
+            :public,
+            :set,
+            read_concurrency: true,
+            write_concurrency: true
+          ])
+        rescue
+          ArgumentError -> :ok
+        end
+
+      _tid ->
+        :ok
+    end
+  end
+
+  defp stream_lookup(key) do
+    case :ets.lookup(@stream_table, key) do
+      [{^key, state}] -> state
+      _ -> nil
+    end
+  end
+
+  defp stream_put(key, state) do
+    true = :ets.insert(@stream_table, {key, state})
+    :ok
   end
 
   def execute_approved_task(%Agent{} = agent, %AgentApprovalTask{} = task) do

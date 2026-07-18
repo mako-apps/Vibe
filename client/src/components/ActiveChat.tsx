@@ -12,10 +12,24 @@ import Haptics from '../haptics';
 import VoiceBubble from './VoiceBubble';
 import GifPicker from './GifPicker';
 import MessageBubbleTail from './MessageBubbleTail';
+import ContentParts, { getVibeContentEnvelope } from './ContentParts';
 import { Chat, Message } from '../types';
 import { formatTime, formatDuration } from '../utils';
 import PatternWallpaper from './PatternWallpaper';
 import { VIBE_APPEARANCE } from '../theme/appearance';
+
+/** Stub until host wires actions → events POST (see provider-content-contract §3.4). */
+function handleContentPartAction(actionId: string): void {
+    // TODO(provider-actions): POST { type: "action", actionId, messageId } on the
+    // existing agent events path when the host action callback contract lands.
+    console.log('[ContentParts] onAction stub', actionId);
+}
+
+/** Stub until host wires vibe.call → call.requested. */
+function handleContentPartCall(): void {
+    // TODO(provider-call): emit call.requested on events / open native call UX.
+    console.log('[ContentParts] onCall stub');
+}
 
 interface ChatInterfaceProps {
     activeChat: Chat;
@@ -253,6 +267,22 @@ const MessageRow = React.memo(({
                     })()}
 
                     {renderMessageContent(m)}
+
+                    {/* vibe.content.v1 rich parts under bubble text */}
+                    {(() => {
+                        const envelope = getVibeContentEnvelope(
+                            m as Message & { metadata?: { content?: unknown } }
+                        );
+                        if (!envelope) return null;
+                        return (
+                            <ContentParts
+                                content={envelope}
+                                accent={VIBE_APPEARANCE.accent}
+                                onAction={handleContentPartAction}
+                                onCall={handleContentPartCall}
+                            />
+                        );
+                    })()}
 
                     <div className="msg-time">
                         {formatTime(m.timestamp)}
@@ -942,6 +972,22 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                                             curvature={VIBE_APPEARANCE.messageTailCurvature}
                                         />
                                         {renderMessageContent(contextMenu.message)}
+                                        {(() => {
+                                            const envelope = getVibeContentEnvelope(
+                                                contextMenu.message as Message & {
+                                                    metadata?: { content?: unknown };
+                                                }
+                                            );
+                                            if (!envelope) return null;
+                                            return (
+                                                <ContentParts
+                                                    content={envelope}
+                                                    accent={VIBE_APPEARANCE.accent}
+                                                    onAction={handleContentPartAction}
+                                                    onCall={handleContentPartCall}
+                                                />
+                                            );
+                                        })()}
                                     </div>
                                 </motion.div>
                             </div>

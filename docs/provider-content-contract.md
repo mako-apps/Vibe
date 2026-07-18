@@ -807,6 +807,33 @@ on day one: legacy clients only ever see text + attachments.
 
 ---
 
+## 6a. Streaming messages (`message.stream`)
+
+Providers stream responses as **progressive message edits** over the existing events
+ingress — no new transport, and every current client already renders it.
+
+```json
+POST /api/agents/:identifier/events
+{
+  "eventType": "message.stream",
+  "destinationChatId": "<chat>",
+  "streamId": "<provider-unique per message>",
+  "seq": 3,
+  "text": "<FULL accumulated text so far — never a delta>",
+  "content": { "...optional vibe.content.v1 envelope on the final frame..." },
+  "done": false
+}
+```
+
+Rules: frames carry the **full accumulated text** (idempotent — lost or reordered
+frames are harmless; `seq` <= last-seen is ignored). The first frame creates the
+message with `metadata.streaming = true`; later frames edit it in place; `done: true`
+finalizes, removes the streaming flag, and (when a `content` envelope is present)
+validates it and attaches `metadata.content` with the envelope text lanes winning.
+Send at most ~4 frames/second. A `done`-only frame for an unknown `streamId` is
+treated as create-and-finalize. The agent card advertises this via
+`capabilities.streaming: true`.
+
 ## 7. Coverage map
 
 Proof that the contract can express the research union checklist

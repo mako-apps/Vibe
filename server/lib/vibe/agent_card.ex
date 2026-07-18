@@ -37,7 +37,7 @@ defmodule Vibe.AgentCard do
       },
       "version" => "1",
       "capabilities" => %{
-        "streaming" => false,
+        "streaming" => true,
         "pushNotifications" => true,
         "events" => agent.event_types_enabled || [],
         "contentContract" => Vibe.ProviderContent.capabilities(),

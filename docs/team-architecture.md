@@ -136,11 +136,17 @@ codex exec --json \
 # grok
 ~/.grok/bin/grok \
   --prompt-file <brief> \
-  --permission-mode acceptEdits \
+  --always-approve \
+  --max-turns 80 \
   --output-format plain \
   --cwd <repo>
 
-# agy — accept-edits / skip-permissions equivalent; UI/low-risk briefs only
+# agy — UI/low-risk briefs only
+~/.local/bin/agy \
+  -p "Read and execute the brief at <brief path>. Work from <repo>." \
+  --mode accept-edits \
+  --dangerously-skip-permissions \
+  --print-timeout 30m
 ```
 
 ## Reliability properties
