@@ -843,6 +843,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let h: Double
     let v: String
     let sig: String
+    /// Per-field short hashes of the content signature (agent-turn rows only, else
+    /// nil), so a `reason=sig` miss can diff element-wise and NAME the field that
+    /// flipped between measure-time and reopen instead of guessing. Optional →
+    /// old on-disk entries decode fine.
+    let f: [String]?
   }
   private var persistedHeightsByKey: [String: PersistedHeightEntry] = [:]
   /// Per-open cap on `height-promote MISS` diagnostics (reset at heights restore).
@@ -4577,7 +4582,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         if entry.v != contentVersion { reasons.append("v[\(entry.v)→\(contentVersion)]") }
         if entry.s != Self.bubbleStateSignature(state) { reasons.append("state") }
-        if entry.sig != chatListRowContentSignature(row) { reasons.append("sig") }
+        if entry.sig != chatListRowContentSignature(row) {
+          // Name the field(s) that flipped, so the sig can be corrected surgically
+          // (drop a height-inert flipper; keep a height-relevant one) instead of
+          // removing fields by guesswork. Needs the fingerprint the write side
+          // stored (agent rows only).
+          if let persistedFields = entry.f {
+            let flipped = chatListRowSignatureFlippedFieldNames(row, against: persistedFields)
+            reasons.append(
+              flipped.isEmpty ? "sig" : "sig[\(flipped.joined(separator: ","))]")
+          } else {
+            reasons.append("sig")
+          }
+        }
         NSLog(
           "[ChatOpen] height-promote MISS key=%@ reason=%@",
           String(row.key.suffix(14)), reasons.joined(separator: "+"))
@@ -4646,7 +4663,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           s: Self.bubbleStateSignature(cached.state),
           h: Double(cached.height),
           v: cached.contentVersion,
-          sig: chatListRowContentSignature(cached.row))
+          sig: chatListRowContentSignature(cached.row),
+          // Fingerprint agent-turn rows only (the ones that thrash reason=sig).
+          f: bubbleUsesAgentTurnContent(cached.row)
+            ? chatListRowSignatureFieldHashes(cached.row) : nil)
       }
       for (key, cached) in messageEntries { admit(key, cached) }
       for (key, cached) in agentEntries { admit(key, cached) }

@@ -1394,40 +1394,87 @@ private func chatListStableHashHex(_ string: String) -> String {
 /// so a disk-persisted measured height may be reused across launches. Complex value
 /// fields go through `String(describing:)`, which is deterministic for the value
 /// types ChatListRow stores; a mismatch is always safe (the row is just re-measured).
-func chatListRowContentSignature(_ row: ChatListRow) -> String {
-  let joined = [
-    String(describing: row.kind), row.key, row.label, row.text, row.timestamp,
-    String(row.isMe), String(describing: row.status), String(row.isEdited),
-    String(row.isPinned), String(describing: row.messageId),
-    String(describing: row.reactionEmoji),
+/// Single source of truth for the height-validity signature: `(fieldName, value)`
+/// per component. `chatListRowContentSignature` hashes the values; the persisted-
+/// height miss diagnostic diffs the values field-by-field to NAME the one that
+/// flipped between measure-time and reopen (a wrong guess at the culprit removes a
+/// height-relevant field and makes the jump worse — so we identify, never guess).
+func chatListRowSignatureFields(_ row: ChatListRow) -> [(name: String, value: String)] {
+  return [
+    ("kind", String(describing: row.kind)), ("key", row.key), ("label", row.label),
+    ("text", row.text), ("timestamp", row.timestamp), ("isMe", String(row.isMe)),
+    ("status", String(describing: row.status)), ("isEdited", String(row.isEdited)),
+    ("isPinned", String(row.isPinned)), ("messageId", String(describing: row.messageId)),
+    ("reactionEmoji", String(describing: row.reactionEmoji)),
     // Keep in sync with chatListRowContentEqual: reply fields are render-inert and
     // pipeline-unstable on agent rows — a stable placeholder keeps persisted heights
     // valid across the nil↔value flips (was: 8 reason=sig promote misses per open).
-    row.isAgentMessage ? "-" : String(describing: row.replyToId),
-    row.isAgentMessage ? "-" : String(describing: row.replyPreviewTitle),
-    row.isAgentMessage ? "-" : String(describing: row.replyPreviewText),
-    row.messageType, String(describing: row.mediaUrl), String(describing: row.localMediaUrl),
-    String(describing: row.mediaKey), String(describing: row.fileName),
-    String(describing: row.duration), String(row.isVideoNote),
-    String(describing: row.waveform), String(describing: row.uploadProgress),
-    String(describing: row.fileSize), String(describing: row.shape),
-    String(describing: row.stickerId), String(describing: row.stickerPackId),
-    String(describing: row.stickerBundleFileName), String(row.isAgentMessage),
-    String(describing: row.agentName), String(describing: row.agentId),
-    String(describing: row.agentUserId), String(describing: row.agentUsername),
-    String(describing: row.plainContent), String(row.isStreamingText),
-    String(describing: row.agentProgressNodes), String(describing: row.agentActionSourceId),
-    String(describing: row.agentActionSourceText), String(describing: row.agentRegeneratePrompt),
-    String(describing: row.agentCard), String(describing: row.agentRuntime),
-    String(describing: row.agentMsgKind), String(describing: row.agentActionEnc),
-    String(describing: row.agentActionsEnc), String(describing: row.relatedMessageIds),
-    String(describing: row.relatedMessagesTitle), String(describing: row.relatedMessagesSubtitle),
-    String(row.isEventNotification), String(row.isEventInboxSummary),
-    String(describing: row.eventType), String(describing: row.eventPriority),
-    String(describing: row.eventThreadId), String(describing: row.eventInboxRole),
-    String(row.hiddenFromTranscript), String(row.isDeliveryFailed), String(row.isAgentError),
-  ].joined(separator: "\u{1F}")
+    ("replyToId", row.isAgentMessage ? "-" : String(describing: row.replyToId)),
+    ("replyPreviewTitle", row.isAgentMessage ? "-" : String(describing: row.replyPreviewTitle)),
+    ("replyPreviewText", row.isAgentMessage ? "-" : String(describing: row.replyPreviewText)),
+    ("messageType", row.messageType), ("mediaUrl", String(describing: row.mediaUrl)),
+    ("localMediaUrl", String(describing: row.localMediaUrl)),
+    ("mediaKey", String(describing: row.mediaKey)), ("fileName", String(describing: row.fileName)),
+    ("duration", String(describing: row.duration)), ("isVideoNote", String(row.isVideoNote)),
+    ("waveform", String(describing: row.waveform)),
+    ("uploadProgress", String(describing: row.uploadProgress)),
+    ("fileSize", String(describing: row.fileSize)), ("shape", String(describing: row.shape)),
+    ("stickerId", String(describing: row.stickerId)),
+    ("stickerPackId", String(describing: row.stickerPackId)),
+    ("stickerBundleFileName", String(describing: row.stickerBundleFileName)),
+    ("isAgentMessage", String(row.isAgentMessage)),
+    ("agentName", String(describing: row.agentName)), ("agentId", String(describing: row.agentId)),
+    ("agentUserId", String(describing: row.agentUserId)),
+    ("agentUsername", String(describing: row.agentUsername)),
+    ("plainContent", String(describing: row.plainContent)),
+    ("isStreamingText", String(row.isStreamingText)),
+    ("agentProgressNodes", String(describing: row.agentProgressNodes)),
+    ("agentActionSourceId", String(describing: row.agentActionSourceId)),
+    ("agentActionSourceText", String(describing: row.agentActionSourceText)),
+    ("agentRegeneratePrompt", String(describing: row.agentRegeneratePrompt)),
+    ("agentCard", String(describing: row.agentCard)),
+    ("agentRuntime", String(describing: row.agentRuntime)),
+    ("agentMsgKind", String(describing: row.agentMsgKind)),
+    ("agentActionEnc", String(describing: row.agentActionEnc)),
+    ("agentActionsEnc", String(describing: row.agentActionsEnc)),
+    ("relatedMessageIds", String(describing: row.relatedMessageIds)),
+    ("relatedMessagesTitle", String(describing: row.relatedMessagesTitle)),
+    ("relatedMessagesSubtitle", String(describing: row.relatedMessagesSubtitle)),
+    ("isEventNotification", String(row.isEventNotification)),
+    ("isEventInboxSummary", String(row.isEventInboxSummary)),
+    ("eventType", String(describing: row.eventType)),
+    ("eventPriority", String(describing: row.eventPriority)),
+    ("eventThreadId", String(describing: row.eventThreadId)),
+    ("eventInboxRole", String(describing: row.eventInboxRole)),
+    ("hiddenFromTranscript", String(row.hiddenFromTranscript)),
+    ("isDeliveryFailed", String(row.isDeliveryFailed)), ("isAgentError", String(row.isAgentError)),
+  ]
+}
+
+func chatListRowContentSignature(_ row: ChatListRow) -> String {
+  let joined = chatListRowSignatureFields(row).map(\.value).joined(separator: "\u{1F}")
   return chatListStableHashHex(joined) + ".\(joined.utf8.count)"
+}
+
+/// Per-field short hashes of the content signature, positionally aligned with
+/// `chatListRowSignatureFields`. Persisted (agent rows only) so a `reason=sig` miss
+/// can name the flipped field.
+func chatListRowSignatureFieldHashes(_ row: ChatListRow) -> [String] {
+  chatListRowSignatureFields(row).map { chatListStableHashHex($0.value) }
+}
+
+/// Names of the signature fields whose current hash differs from the persisted one.
+func chatListRowSignatureFlippedFieldNames(
+  _ row: ChatListRow, against persisted: [String]
+) -> [String] {
+  let current = chatListRowSignatureFields(row)
+  var flipped: [String] = []
+  for (i, comp) in current.enumerated() where i < persisted.count {
+    if chatListStableHashHex(comp.value) != persisted[i] {
+      flipped.append(comp.name)
+    }
+  }
+  return flipped
 }
 
 private func progressNodeLabel(from item: [String: Any]) -> String? {
