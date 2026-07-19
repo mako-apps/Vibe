@@ -79,9 +79,9 @@ it. The essentials:
   short entry (Shipped / Learned / Open) after finishing real work.
 - **Clean up when the run settles**: fold durable learnings into docs/memory, then
   delete that run's `.vibe/team/<run>*` board and brief files.
-- Live status: the lead prints `VIBE_TEAM_STATUS {"worker":"codex","state":"running|done|failed","label":"..."}`
-  on its own stdout at every worker start/finish so the phone shows live
-  per-worker progress.
+- Live status: the lead prints `VIBE_TEAM_STATUS {"worker":"codex","state":"spawn|running|done|failed","label":"..."}`
+  on its own stdout at every worker spawn/start/finish so the phone shows a live
+  per-worker board — avatar + elapsed clock ticking from the `spawn` beat.
 
 ## Prefer commands that run without approval
 

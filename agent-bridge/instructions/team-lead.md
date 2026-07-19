@@ -158,14 +158,20 @@ every task at it and seeds it when missing.
 
 ## Live worker status (VIBE_TEAM_STATUS)
 
-Every time you start or finish a worker subprocess, print **one status marker line to
-your own stdout** (not into a file). The bridge relays these lines; the server turns
-them into the live per-worker board the user sees on the phone (avatar + "running for
-Xm"). No marker = a silent cell for the whole run.
+Every time you **spawn**, run, or finish a worker subprocess, print **one status marker
+line to your own stdout** (not into a file). The bridge relays these lines; the server
+turns them into the live per-worker board the user sees on the phone (avatar + a live
+elapsed clock, "Calling… · 0m 07s" → "editing X · 4m 12s" → "done · 4m 30s"). No marker
+= a silent cell for the whole run.
+
+Print the `spawn` line **immediately before you launch the CLI** — it stamps the
+worker's start so the phone's clock ticks from the real call moment, not from the first
+tool event:
 
 ```
-VIBE_TEAM_STATUS {"worker":"codex","state":"running","label":"server: parse tests"}
-VIBE_TEAM_STATUS {"worker":"codex","state":"done","label":"parser + 6 tests"}
+VIBE_TEAM_STATUS {"worker":"grok","state":"spawn","label":"call grok — premium UI polish"}
+VIBE_TEAM_STATUS {"worker":"grok","state":"running","label":"web: chat header"}
+VIBE_TEAM_STATUS {"worker":"grok","state":"done","label":"header + 3 files"}
 ```
 
 Use `"state":"failed"` when a worker errors or times out.
@@ -173,7 +179,8 @@ Use `"state":"failed"` when a worker errors or times out.
 **Rules:**
 
 - Exact prefix `VIBE_TEAM_STATUS ` (trailing space) + single-line valid JSON
-- One line per transition (start → `running`; exit → `done` or `failed`)
+- One line per transition (spawn → `spawn`; working → `running`; exit → `done`/`failed`)
+- Print `spawn` right before the CLI launches; `running` once it is doing real work
 - `worker` = CLI handle: `codex` / `grok` / `agy` / `claude`
 - `label` ≤ 60 chars (what the slice is doing / what it shipped)
 
@@ -253,5 +260,5 @@ spawning a lead — respect that when you are not on a team run.
 - [ ] Board updated; settled summary written
 - [ ] One entry appended to `.vibe/memory.md` (shipped / learned / open)
 - [ ] Run's board + brief files cleaned up (durable learnings moved to docs first)
-- [ ] VIBE_TEAM_STATUS printed for every worker start/finish
+- [ ] VIBE_TEAM_STATUS printed for every worker spawn/start/finish
 - [ ] No unauthorized push/deploy

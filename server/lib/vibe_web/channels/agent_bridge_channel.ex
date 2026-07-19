@@ -602,7 +602,8 @@ defmodule VibeWeb.AgentBridgeChannel do
     with [_, raw] <- Regex.run(~r/VIBE_TEAM_STATUS\s+(\{.*\})\s*$/i, line),
          {:ok, status} when is_map(status) <- Jason.decode(raw),
          worker when is_binary(worker) and worker != "" <- Map.get(status, "worker"),
-         state when state in ["running", "done", "failed"] <- Map.get(status, "state"),
+         state when state in ["spawn", "starting", "running", "done", "failed"] <-
+           Map.get(status, "state"),
          label <- Map.get(status, "label"),
          true <- is_nil(label) or is_binary(label) do
       {:ok, %{"worker" => worker, "state" => state, "label" => label}}
@@ -612,6 +613,14 @@ defmodule VibeWeb.AgentBridgeChannel do
   end
 
   def parse_team_status_line(_), do: :ignore
+
+  # `spawn` is the lead's "I'm calling this CLI now" beat — it stamps the worker's
+  # start (update_team_worker_state adds started_at for a "starting" status only when
+  # absent, so a later "running" frame never resets the elapsed clock). The phone
+  # renders it as "Calling…" + a live timer next to the worker's avatar.
+  defp team_status_patch(state, label) when state in ["spawn", "starting"] do
+    %{"status" => "starting", "last_label" => label}
+  end
 
   defp team_status_patch("running", label) do
     %{"status" => "running", "last_label" => label}

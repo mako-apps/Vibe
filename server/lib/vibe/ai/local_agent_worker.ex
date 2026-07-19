@@ -1616,7 +1616,10 @@ defmodule Vibe.AI.LocalAgentWorker do
             status = m["status"] || m[:status]
 
             cond do
-              status in ["running", "pending"] and is_nil(m["started_at"]) ->
+              # "starting" is the spawn beat — stamp the start here so the phone's
+              # live elapsed clock ticks from the real call moment, not from the
+              # first tool event. Guarded by is_nil so a later "running" never resets.
+              status in ["running", "pending", "starting"] and is_nil(m["started_at"]) ->
                 Map.put(m, "started_at", now_ms)
 
               status in ["done", "failed", "skipped"] and is_nil(m["finished_at"]) ->

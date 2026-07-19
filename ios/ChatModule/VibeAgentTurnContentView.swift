@@ -300,7 +300,10 @@ func vibeAgentTeamDisplayFeed(
       // Settled without a terminal frame (crashed run / orphaned by a server redeploy)
       // — a real stopped state, never a lingering "working…".
       if s == "stopped" || s == "cancelled" || s == "reassigned" { return "stopped" }
-      if s == "starting" || s == "pending" { return "starting…" }
+      // The spawn beat: the lead has just called this CLI but no tool event has
+      // landed yet. "Calling…" next to the worker's avatar reads as "calling grok";
+      // the row appends the live elapsed clock ("Calling… · 0m 07s").
+      if s == "starting" || s == "pending" { return "Calling…" }
       // Payload-contract barrier: a consumer held until its owner freezes the shape.
       // The server puts "waiting for <contract> from <owner>" in lastLabel; show it so
       // the user sees the barrier working (never a spinner, never hidden).
@@ -326,7 +329,12 @@ func vibeAgentTeamDisplayFeed(
         voiceDuration: nil, status: effectiveStatus, isRecording: false,
         recordingStartTime: nil, tool: nil, image: nil, itemType: "teamworker",
         sourceUrl: nil, nodeId: "teamworker:\(status.worker)",
-        subagentType: status.worker))
+        subagentType: status.worker,
+        // startedAt drives the row's live elapsed clock while running; durationMs is
+        // the frozen final time shown once the worker settles. `effectiveStatus`
+        // already coerced a stale running→stopped for a settled turn, so the row
+        // will not tick after the run ends even though startedAt is present.
+        durationMs: status.durationMs, startedAtMs: status.startedAt))
   }
 
   // Mid-run the body stays empty (intro rides the feed); settled turns show the lead's

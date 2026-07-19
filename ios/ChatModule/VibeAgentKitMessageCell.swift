@@ -1168,12 +1168,25 @@ private final class VibeAgentKitTeamWorkerRowView: UIView {
   private let chevron = UIImageView()
   var onTap: (() -> Void)?
 
+  // Live elapsed clock. `runningStartedAtMs` is the server-stamped start (epoch ms),
+  // non-nil only while a live worker should tick; the 1Hz timer re-renders the status
+  // label ("editing X · 4m 12s") without any stream frame. `terminated` latches a
+  // settled worker so a late out-of-order "running" frame can't restart the clock.
+  private var elapsedTimer: Timer?
+  private var runningStartedAtMs: Int64?
+  private var baseStatusText: String = ""
+  private var statusTextAttributes: [NSAttributedString.Key: Any] = [:]
+  private var terminated = false
+  private var latchedStartedAtMs: Int64?
+
   override init(frame: CGRect) {
     super.init(frame: frame)
     setup()
   }
 
   required init?(coder: NSCoder) { return nil }
+
+  deinit { elapsedTimer?.invalidate() }
 
   private func setup() {
     backgroundColor = .clear
@@ -1277,12 +1290,27 @@ private final class VibeAgentKitTeamWorkerRowView: UIView {
       ? rawStatus
       : done ? "done" : failed ? "failed" : s == "skipped" ? "skipped"
         : running ? "working…" : "stopped"
-    statusLabel.attributedText = NSAttributedString(
-      string: statusText,
-      attributes: [
-        .font: UIFont.systemFont(ofSize: 12.5, weight: .regular),
-        .foregroundColor: vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.78),
-      ])
+
+    // Live elapsed clock — tick from the server-stamped spawn moment while running.
+    // Terminal latch: once done/failed, never re-arm on a late frame; a genuinely new
+    // run (different startedAt) for the same reused row clears the latch.
+    if done || failed {
+      terminated = true
+    } else if running, item.startedAtMs != latchedStartedAtMs {
+      terminated = false
+      latchedStartedAtMs = item.startedAtMs
+    }
+    runningStartedAtMs = (running && !terminated) ? item.startedAtMs : nil
+
+    baseStatusText = statusText
+    // Tabular figures so the ticking seconds never jitter the single-line row width
+    // (no re-measure): only the text updates, height is fixed.
+    statusTextAttributes = [
+      .font: UIFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .regular),
+      .foregroundColor: vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.78),
+    ]
+    renderStatusText()
+    updateElapsedTimerState()
     // Shimmer only while genuinely working (running AND with a real live status).
     // A blank "starting" with no progress, a barrier "waiting" row, or a terminal
     // row is static — the shimmer must mean "actively working", nothing else.
@@ -1311,6 +1339,57 @@ private final class VibeAgentKitTeamWorkerRowView: UIView {
   override func layoutSubviews() {
     super.layoutSubviews()
     if isShimmering { statusShimmerMask.frame = statusLabel.bounds }
+  }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    // A windowless row (offscreen sizing template, or a reused cell scrolled away)
+    // must never tick — that was the prewarm-timer leak class. Re-arms on return.
+    updateElapsedTimerState()
+  }
+
+  // Re-render the status label as base text + live elapsed suffix. Recomputed from the
+  // absolute start each tick (never an incrementing counter), so it self-corrects after
+  // the app is backgrounded and clamps a device/server clock skew to ≥ 0.
+  private func renderStatusText() {
+    var text = baseStatusText
+    if let started = runningStartedAtMs {
+      let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+      let suffix = Self.liveElapsed(Int(max(0, nowMs - started)))
+      text = baseStatusText.isEmpty ? suffix : "\(baseStatusText) · \(suffix)"
+    }
+    statusLabel.attributedText = NSAttributedString(string: text, attributes: statusTextAttributes)
+    if isShimmering { statusShimmerMask.frame = statusLabel.bounds }
+  }
+
+  private func updateElapsedTimerState() {
+    let shouldTick = runningStartedAtMs != nil && window != nil
+    if shouldTick {
+      guard elapsedTimer == nil else { return }  // never stack across stream frames
+      let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+        self?.renderStatusText()
+      }
+      timer.tolerance = 0.2
+      // .common so the clock keeps ticking while the chat list is being scrolled.
+      RunLoop.main.add(timer, forMode: .common)
+      elapsedTimer = timer
+    } else if let timer = elapsedTimer {
+      timer.invalidate()
+      elapsedTimer = nil
+    }
+  }
+
+  // Always shows seconds under an hour so the clock visibly ticks every second, and
+  // stays in the "Xm Ys" family the settled row uses ("done · 4m 30s").
+  static func liveElapsed(_ ms: Int) -> String {
+    let total = max(0, ms / 1000)
+    if total < 60 { return "\(total)s" }
+    let m = total / 60
+    let sec = total % 60
+    if m < 60 { return String(format: "%dm %02ds", m, sec) }
+    let h = m / 60
+    let rm = m % 60
+    return String(format: "%dh %02dm", h, rm)
   }
 
   private func startStatusShimmer() {

@@ -20,6 +20,18 @@ defmodule VibeWeb.AgentBridgeChannelTest do
              )
   end
 
+  test "parses the spawn / starting beat that stamps the worker start" do
+    assert {:ok, %{"worker" => "grok", "state" => "spawn", "label" => "call grok — UI"}} =
+             AgentBridgeChannel.parse_team_status_line(
+               ~s(VIBE_TEAM_STATUS {"worker":"grok","state":"spawn","label":"call grok — UI"})
+             )
+
+    assert {:ok, %{"worker" => "codex", "state" => "starting", "label" => nil}} =
+             AgentBridgeChannel.parse_team_status_line(
+               ~s(VIBE_TEAM_STATUS {"worker":"codex","state":"starting"})
+             )
+  end
+
   test "parses an optional label as nil" do
     assert {:ok, %{"worker" => "agy", "state" => "running", "label" => nil}} =
              AgentBridgeChannel.parse_team_status_line(
