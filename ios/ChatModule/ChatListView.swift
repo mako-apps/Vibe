@@ -806,6 +806,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var reopenSnapshotOverlay: UIImageView?
   private var seedLoadingIndicator: UIActivityIndicatorView?
   private var seedSpinnerGraceWorkItem: DispatchWorkItem?
+  /// A cold-launched agent DM opens intentionally clean (the transcript cache is purged
+  /// at launch, and auto-mounting a past session was removed for dropping an unrelated
+  /// transcript in late). So on an empty 1:1 agent DM we surface ONE obvious tap to the
+  /// History sheet — past work is a tap away without the fresh view ever being replaced.
+  private var bridgeEmptyHistoryPromptView: UIView?
+  private var bridgeEmptyHistoryPromptShowWork: DispatchWorkItem?
   /// Marks the one rows application initiated by the cached-history reveal path. That
   /// update is a strict prefix insert and must not run through the generic new-message
   /// finalize/scroll behavior while the user's finger owns the list.
@@ -1682,6 +1688,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     tallToggleOverlay.isUserInteractionEnabled = true
     addSubview(tallToggleOverlay)
 
+    setupBridgeEmptyHistoryPrompt()
+
     collectionView.backgroundColor = .clear
     collectionView.clipsToBounds = false
     collectionView.alwaysBounceVertical = true
@@ -2137,7 +2145,106 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     UIView.animate(
       withDuration: 0.15, delay: 0, options: [.beginFromCurrentState],
       animations: { overlay.alpha = 0 },
-      completion: { _ in overlay.removeFromSuperview() })
+      completion: { [weak self] _ in
+        overlay.removeFromSuperview()
+        // The snapshot gated the empty-DM prompt; re-evaluate now that it's gone.
+        self?.updateBridgeEmptyHistoryPromptVisibility()
+      })
+  }
+
+  private func setupBridgeEmptyHistoryPrompt() {
+    let container = UIView()
+    container.translatesAutoresizingMaskIntoConstraints = false
+    container.isHidden = true
+    addSubview(container)
+    NSLayoutConstraint.activate([
+      container.centerXAnchor.constraint(equalTo: centerXAnchor),
+      container.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -24),
+      container.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 32),
+      container.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -32),
+    ])
+
+    let hint = UILabel()
+    hint.text = "Pick up a past conversation"
+    hint.font = .systemFont(ofSize: 14.0, weight: .regular)
+    hint.textColor = .secondaryLabel
+    hint.textAlignment = .center
+    hint.numberOfLines = 2
+
+    var config = UIButton.Configuration.gray()
+    config.cornerStyle = .capsule
+    config.buttonSize = .large
+    config.image = UIImage(systemName: "clock.arrow.circlepath")
+    config.imagePadding = 8.0
+    config.title = "Recent sessions"
+    config.baseForegroundColor = .label
+    let button = UIButton(
+      configuration: config,
+      primaryAction: UIAction { [weak self] _ in self?.handleEmptyHistoryPromptTapped() })
+
+    let stack = UIStackView(arrangedSubviews: [hint, button])
+    stack.axis = .vertical
+    stack.alignment = .center
+    stack.spacing = 12.0
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.topAnchor.constraint(equalTo: container.topAnchor),
+      stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+    ])
+    bridgeEmptyHistoryPromptView = container
+  }
+
+  private func handleEmptyHistoryPromptTapped() {
+    guard let provider = currentBridgeProvider, !provider.isEmpty else { return }
+    presentBridgeHistorySurface(provider: provider)
+  }
+
+  /// Show the "Recent sessions" tap only on a genuinely empty 1:1 agent DM — never over a
+  /// group, a loaded transcript, a history-session load, or the reopen snapshot.
+  private func bridgeEmptyHistoryPromptShouldShow() -> Bool {
+    currentBridgeProvider != nil
+      && !isGroupOrChannel
+      && rows.isEmpty
+      && bridgeLoadedSessionId == nil
+      && !isBridgeHistorySessionLoading()
+      && reopenSnapshotOverlay == nil
+  }
+
+  private func updateBridgeEmptyHistoryPromptVisibility() {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.updateBridgeEmptyHistoryPromptVisibility()
+      }
+      return
+    }
+    guard let prompt = bridgeEmptyHistoryPromptView else { return }
+    bridgeEmptyHistoryPromptShowWork?.cancel()
+    bridgeEmptyHistoryPromptShowWork = nil
+    guard bridgeEmptyHistoryPromptShouldShow() else {
+      if !prompt.isHidden { prompt.isHidden = true }
+      return
+    }
+    // Debounce the reveal: a warm reopen is briefly empty before its cached rows land —
+    // only show if the DM is STILL empty after a short settle, so it never flashes over
+    // a chat that is about to paint.
+    guard prompt.isHidden else {
+      bringSubviewToFront(prompt)
+      return
+    }
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, let prompt = self.bridgeEmptyHistoryPromptView,
+        self.bridgeEmptyHistoryPromptShouldShow()
+      else { return }
+      prompt.alpha = 0.0
+      prompt.isHidden = false
+      self.bringSubviewToFront(prompt)
+      UIView.animate(withDuration: 0.2) { prompt.alpha = 1.0 }
+    }
+    bridgeEmptyHistoryPromptShowWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
   }
 
   /// Telegram-style loading affordance for a deferred open with NOTHING to show — but
@@ -2502,6 +2609,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Re-paint under the new filter. Prefer engine rows so an already-ingested
     // `bridge-<sessionId>-…` transcript is not stuck behind a stale empty payload.
     reapplyRowsAfterBridgeSessionScopeChange()
+    updateBridgeEmptyHistoryPromptVisibility()
   }
 
   /// Whether a History session is currently scoped into this chat surface.
@@ -6231,6 +6339,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         ChatAudioQueueRegistry.shared.setRows(parsed, for: resolvedChatId)
         VoiceBubblePlaybackCoordinator.shared.refreshCurrentSnapshotIfNeeded(forChatId: resolvedChatId)
       }
+      self.updateBridgeEmptyHistoryPromptVisibility()
     }
 
     // Set to true (before calling finalize) by the reconfigure path when this update is
@@ -13457,6 +13566,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     inputBar?.setAgentControlMode(
       agentChatMode || currentBridgeProvider != nil || groupHasBridgeAgents())
     scheduleBridgeAgentPresenceRefresh()
+    updateBridgeEmptyHistoryPromptVisibility()
   }
 
   func setAvatarUri(_ value: String?) {
@@ -13755,6 +13865,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     presentedBridgeAgentVC?.isHistoryPicked = false
     presentedBridgeAgentVC?.setMessages([])
     if !self.sourceRowsPayload.isEmpty { self.setRows(self.sourceRowsPayload) }
+    updateBridgeEmptyHistoryPromptVisibility()
   }
 
   /// Ingest a picked history session's transcript into THIS chat (keyed
