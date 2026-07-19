@@ -7061,6 +7061,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Record SCREEN-SPACE Y (center.y - contentOffset.y) so additive
     // animations account for any scroll change finalize introduces.
     var preUpdateScreenY: [String: CGFloat] = [:]
+    // Pre-update cell heights, keyed the same as preUpdateScreenY. A cell whose
+    // height changes across the insert (e.g. the previous own-message losing its
+    // grouping tail when a newer one lands) can't ride the additive push-up as a
+    // pure translation without shearing into its neighbor — this lets the ride
+    // audit print the actual height delta, not just infer it from divergence.
+    var preUpdateScreenH: [String: CGFloat] = [:]
     var didCaptureAvatarPositions = false
     var preUpdateOffset: CGFloat = 0
     if shouldAnimateUpdate && animMode == 2 {
@@ -7071,6 +7077,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         let key = previousRows[ip.item].key
         preUpdateScreenY[key] = cell.center.y - preUpdateOffset
+        preUpdateScreenH[key] = cell.bounds.height
       }
       // Floating gutter avatars live in a screen-fixed overlay: record their
       // positions ON THE VIEW (not keyed by run id — run identity can churn across
@@ -7248,10 +7255,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if isGroupOrChannel, !deletions.isEmpty || !insertions.isEmpty {
       sweepGroupAgentCellIntegrity(reason: "postBatch")
     }
-    // [SendShift] The user reports a small list shift when sending in a group (cells
-    // carry sender names there). Log the offset/content geometry of every own-send
-    // insert so the next repro shows exactly which pass moved the list and by how much.
-    if isGroupOrChannel,
+    // [SendShift] The user reports older messages overlapping + extra gap when
+    // sending. Log the offset/content geometry of every own-send insert so the next
+    // repro shows exactly which pass moved the list and by how much. Fires for DM
+    // sends too (pending-send morph active), not just groups.
+    if isGroupOrChannel || pendingSendTransition != nil || activeSendTransition != nil,
       insertions.contains(where: { $0.item < parsed.count && parsed[$0.item].isMe })
     {
       NSLog(
@@ -7340,7 +7348,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
           if let oldScreenY = preUpdateScreenY[key] {
             let currentScreenY = cell.center.y - postOffset
-            let delta = pixelAlignedValue(oldScreenY - currentScreenY)
+            var delta = pixelAlignedValue(oldScreenY - currentScreenY)
+            // The push-up is a rigid translation of the whole stack above the
+            // insertion, so every cell's TOP edge rides the same delta. But this
+            // delta is measured from the CENTER, and a cell that changed height
+            // across the insert (the previous own-message regaining its grouping
+            // tail/timestamp footer when a newer one lands: h35→h51) moves its
+            // center by (stackPush − heightΔ/2), not the uniform stackPush. That
+            // divergence shears it out of sync with its flush neighbors — the
+            // reported "older messages overlap and get extra gap" on send
+            // ([SendShift] proved aa2f5e rode 61 vs the stack's 69 after +16h).
+            // Recompute from the top edge so it rejoins the rigid ride.
+            if let oldH = preUpdateScreenH[key],
+              abs(cell.bounds.height - oldH) > 0.5
+            {
+              let oldTop = oldScreenY - oldH / 2.0
+              let newTop = currentScreenY - cell.bounds.height / 2.0
+              delta = pixelAlignedValue(oldTop - newTop)
+            }
             cellInfos.append(
               CellAnimInfo(
                 cell: cell, key: key, indexPath: ip, delta: delta,
@@ -7405,19 +7430,31 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           }
         }
 
-        // [SendShift] per-cell ride audit for group sends: every visible cell
-        // should carry the SAME delta (pure translation). A diverging delta
-        // means that cell's height changed across the insert (it will visibly
-        // shear against its neighbors during the ride).
-        if isGroupOrChannel, hasPendingSend, !cellInfos.isEmpty {
+        // [SendShift] per-cell ride audit: every visible cell should carry the SAME
+        // delta (pure translation). A diverging delta means that cell's height
+        // changed across the insert (it will visibly shear against its neighbors
+        // during the ride — the reported "older messages overlap and get extra
+        // gap" on send). Fires for DM sends too, not just groups, so a 1:1 repro
+        // prints the numbers. Each entry: key=<delta>h<postH>(<±heightChange>) with
+        // a trailing R if the cell was reloaded across this update.
+        if hasPendingSend, !cellInfos.isEmpty {
+          let reloadedKeys = Set(
+            safeReloads.compactMap { $0.item < previousRows.count ? previousRows[$0.item].key : nil }
+          )
           let rides = cellInfos.sorted { $0.indexPath.item < $1.indexPath.item }
-            .suffix(6)
+            .suffix(8)
             .map { info -> String in
               let tag = info.isNew ? "new" : String(format: "%.0f", info.delta)
-              return "\(info.key.suffix(6))=\(tag)h\(Int(info.cell.bounds.height))"
+              let postH = info.cell.bounds.height
+              let dh = preUpdateScreenH[info.key].map { postH - $0 } ?? 0
+              let dhTag = abs(dh) > 0.5 ? String(format: "%+.0f", dh) : "0"
+              let reloadTag = reloadedKeys.contains(info.key) ? "R" : ""
+              return "\(info.key.suffix(6))=\(tag)h\(Int(postH))(\(dhTag))\(reloadTag)"
             }
             .joined(separator: " ")
-          NSLog("[SendShift] rides dur=%.2f %@", animDuration, rides)
+          NSLog(
+            "[SendShift] rides group=%@ dur=%.2f scrollΔ=%.0f %@",
+            isGroupOrChannel ? "Y" : "N", animDuration, dbgScrollDelta, rides)
         }
 
         // --- Pass 3: keep floating sender avatars glued to their run ---
