@@ -1431,6 +1431,23 @@ enum AgentPairingService {
 
   @MainActor
   private static func publishStatus(_ result: AgentBridgeStatus, source: String) {
+    // Direct-LAN link wins over a flapping cloud presence. The bridge daemon's cloud
+    // socket recycles constantly (1006/1012 + DNS blips), so the server intermittently
+    // pushes a bridge-status snapshot with connected:false. That must NOT clobber a live,
+    // AUTHENTICATED LAN link — the phone can demonstrably reach the daemon over LAN (that
+    // handshake requires the daemon up), so the cloud-offline snapshot is stale, not truth.
+    // The old last-writer-wins publish flipped the row to "bridge is down"/scan while the
+    // LAN link kept serving history ("shows scan even when we are connected"). Drop the
+    // offline snapshot and keep the LAN-connected one; coercing connected:true instead
+    // would run ChatEngine.reconcile with this snapshot's EMPTY task table and prematurely
+    // settle a still-running agent. Self-heals: when the LAN link really drops,
+    // isAuthenticated flips false, so the next cloud-offline snapshot publishes normally.
+    if !result.connected, LanBridgeService.shared.isAuthenticated {
+      AppUITrace.notice(
+        "AgentBridgeStatus source=\(source) connected=false SUPPRESSED — direct LAN link authenticated (kept last connected snapshot)"
+      )
+      return
+    }
     lastDeviceLabel = result.devices.first?.label
     lastConnected = result.connected
     lastStatusSnapshot = result
