@@ -2423,21 +2423,22 @@ private struct ChatHomeScreen: View {
   private func closeHomeSearch() {
     guard searchPresented || isHomeSearchFocused, !searchCloseRetracting else { return }
     SearchMorphProfiler.shared.begin("close")
-    // Phase 1 (native side reacts to this flag): the xmark retracts offscreen
-    // and the flying capsule re-widens + drops its glass at the dock.
+    // Phase 1 (native side reacts to this flag in THIS commit): the xmark
+    // retracts, the glass re-tints for flight, the keyboard drops — and the
+    // presentation layer launches the descent in the same apply (retract and
+    // descent are one beat; the re-widen rides the return spring). The X-tap
+    // path has already done all of it UIKit-side before this commit exists.
     searchCloseRetracting = true
-    // The X-tap path already started the return motion UIKit-side at +0.05;
-    // this SwiftUI descend commit runs in the spring's TAIL — at +0.10 its
-    // ~30ms body re-eval dropped frames right in the descent's fastest phase
-    // (max velocity ⇒ maximally visible stutter: "the input shifts, no
-    // crossfade"). In the tail the same stall is nearly invisible.
+    // By +0.18 the descent is long committed to the render server; this pose
+    // commit only restores chrome (chips/nav/tab fade back in over the moving
+    // descent) and its ~40ms body re-eval lands in the spring's tail, where
+    // a main-thread stall can't freeze anything visible.
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
       setNavigationBarFaded(false)
-      SearchMorphProfiler.mark("descend")
-      // Phase 2: the capsule flies back onto its slot (native spring) and the
-      // list surface dissolves back in. ONLY the pose flag flips here — the
-      // query/results clear is a heavy SwiftUI rebuild (results→recents) and
-      // clearing it in this commit stalled the descent's first frames.
+      SearchMorphProfiler.mark("swiftui pose commit")
+      // ONLY the pose flag flips here — the query/results clear is a heavy
+      // SwiftUI rebuild (results→recents) and clearing it in this commit
+      // stalled the descent's first frames.
       searchPresented = false
       setTabBarHidden(isEditingHome, animated: true)
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
@@ -5252,6 +5253,11 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     ghost.layoutIfNeeded()
     // Glass morphs in OVER the solid twin (same frames, stacked).
     container.bringSubviewToFront(ghost)
+    // A rapid close→reopen leaves the previous run's alpha fades pending
+    // (delayed UIView blocks are live CA animations from the moment they're
+    // scheduled) — they'd override the fresh model alphas set above.
+    twin.layer.removeAnimation(forKey: "opacity")
+    ghost.layer.removeAnimation(forKey: "opacity")
 
     let close = ensureSearchCloseButton(in: container)
     container.bringSubviewToFront(close)
@@ -5371,6 +5377,11 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     twin.layoutIfNeeded()
     container.bringSubviewToFront(ghost)
     if let close = searchCloseButton { container.bringSubviewToFront(close) }
+    // An open closed within ~0.4s still has its delayed twin-out fade pending
+    // (0.16 @ 0.24) — left alive it would fire mid-descent and fade the twin
+    // back OUT under the return's twin-in ("the input dies on the way down").
+    twin.layer.removeAnimation(forKey: "opacity")
+    ghost.layer.removeAnimation(forKey: "opacity")
 
     let spring = UISpringTimingParameters(
       mass: 1, stiffness: 322, damping: 33.0, initialVelocity: .zero)
