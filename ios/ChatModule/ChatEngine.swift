@@ -3764,16 +3764,30 @@ final class ChatEngine {
         if let replyToId { message["replyToId"] = replyToId }
         optimisticRow["message"] = message
       }
-      upsertLiveMessageRowLocked(chatId: chatId, messageId: messageId, row: optimisticRow)
+      // A message queued mid-join (chat_not_joined / missing_friend_key / no_socket)
+      // emits this optimistic row once, then REPLAYS through sendMessage on
+      // chat_joined — where the row already exists. Emit `inserted` only when the
+      // row is genuinely new; on replay downgrade to `updated` so the list does an
+      // in-place reload instead of a second insert push-up (the "shifts many times"
+      // jump). The payload carries a stable timestampMs, so the replayed row keeps
+      // its slot — no re-sort. upsertLiveMessageRowLocked returns true when new.
+      let isNewOptimisticRow = upsertLiveMessageRowLocked(
+        chatId: chatId, messageId: messageId, row: optimisticRow)
       upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "sending")
       postChangeLocked(
-        reason: "chatMessageInserted",
-        userInfo: ["chatId": chatId, "messageId": messageId, "action": "inserted"])
+        reason: isNewOptimisticRow ? "chatMessageInserted" : "chatMessageChanged",
+        userInfo: [
+          "chatId": chatId, "messageId": messageId,
+          "action": isNewOptimisticRow ? "inserted" : "updated",
+        ])
       postChangeLocked(
         reason: "messageStatusChanged",
         userInfo: ["chatId": chatId, "messageId": messageId, "status": "sending"])
       postChatDeltaLocked(
-        chatId: chatId, inserted: [messageId], updated: [], deleted: [], source: "optimistic")
+        chatId: chatId,
+        inserted: isNewOptimisticRow ? [messageId] : [],
+        updated: isNewOptimisticRow ? [] : [messageId],
+        deleted: [], source: "optimistic")
       NSLog(
         "[ChatEngine] sendMessage optimistic row emitted in %dms chatId=%@ messageId=%@",
         Int(nowMs() - optimisticStartMs), chatId, messageId)
