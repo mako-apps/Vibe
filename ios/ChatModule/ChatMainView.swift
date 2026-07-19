@@ -768,6 +768,10 @@ public final class ChatMainView: UIView,
     setNeedsLayout()
   }
 
+  func setProgressiveHeightWarmupSuppressed(_ suppressed: Bool) {
+    chatListView.suppressesProgressiveHeightWarmup = suppressed
+  }
+
   func setVoicePlayback(_ payload: [String: Any]) {
     chatListView.setVoicePlayback(payload)
   }

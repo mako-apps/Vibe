@@ -576,6 +576,8 @@ final class ChatEngine {
   private var historyLoadingChats = Set<String>()
   private var historyOlderExhaustedChats = Set<String>()
   private var historyLoadingOlderChats = Set<String>()
+  private var historyBackfillingChats = Set<String>()
+  private var historyBackfillAtMsByChat: [String: Int64] = [:]
   private var historyHasMoreByChat: [String: Bool] = [:]
   private var historyNextCursorByChat: [String: String] = [:]
   private var historyNextCursorBoundaryByChat: [String: (messageId: String, timestampMs: Int64)] =
@@ -7156,6 +7158,11 @@ final class ChatEngine {
             // freshly (re)joined after a view re-attach or background reconnect, so re-arm
             // the transcript watch instead of leaving the agent feed frozen.
             self.rearmLiveBridgeSessionLocked(chatId: chatId, trigger: "chat_joined")
+            // Rejoin backfill: pull the newest history page. Join replay only covers
+            // OUR queued sends — messages that settled while the socket was down
+            // (backgrounded phone, network blip) otherwise never reach this device
+            // until a cold history reload.
+            self.backfillNewestChatHistoryLocked(chatId: chatId, trigger: "chat_joined")
             // Announce the topic JOIN so open surfaces can re-fire loads that lost the race
             // at cold launch. During a launch-time socket flap the current-session poll and
             // the History list both refuse with `chat_not_joined` and exhaust their bounded
@@ -11269,6 +11276,170 @@ final class ChatEngine {
         historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
       }
     }
+  }
+
+  /// Rejoin/backfill: fetch the NEWEST history page and merge it in. Covers messages
+  /// that landed while the socket was down (backgrounded phone, network blip) — the
+  /// join handler replays queues but nothing re-fetched the tail, so a reopened chat
+  /// rendered the stale cached window until the user scrolled. Merge is id-keyed
+  /// (idempotent); durable agent rows retire their superseded live stream bubbles
+  /// (taskId match) so a missed settle can't leave a duplicate response cell.
+  private func backfillNewestChatHistoryLocked(chatId: String, trigger: String) {
+    guard historyRowsByChat[chatId] != nil else { return }
+    guard chatId != "saved_messages",
+      !isBuiltInAgentChatId(chatId),
+      !isVolatileBridgeAgentChatLocked(chatId: chatId),
+      !historyBackfillingChats.contains(chatId)
+    else { return }
+    let now = Int64(nowMs())
+    if let last = historyBackfillAtMsByChat[chatId], now - last < 10_000 { return }
+    guard let apiBase = apiBaseURLLocked(),
+      normalizedString(getConfigValueLocked("userId")) != nil
+    else { return }
+
+    let baseMessageUrl = apiBase.appendingPathComponent("api").appendingPathComponent("chat")
+      .appendingPathComponent(chatId).appendingPathComponent("messages")
+    var urlComponents = URLComponents(url: baseMessageUrl, resolvingAgainstBaseURL: false)
+    urlComponents?.queryItems = [
+      URLQueryItem(name: "limit", value: "\(chatOlderHistoryFetchLimit)")
+    ]
+    guard let finalUrl = urlComponents?.url else { return }
+    var request = URLRequest(url: finalUrl)
+    request.httpMethod = "GET"
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    if let token = authHeaderTokenLocked(), !token.isEmpty {
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
+    historyBackfillingChats.insert(chatId)
+    historyBackfillAtMsByChat[chatId] = now
+    NSLog(
+      "[ChatEngine] backfillNewest START chatId=%@ trigger=%@",
+      String(chatId.prefix(12)), trigger)
+
+    let session = ChatPhoenixClient.makePinnedURLSession()
+    session.dataTask(with: request) { [weak self] data, response, error in
+      guard let self else { return }
+      self.queue.async {
+        self.historyBackfillingChats.remove(chatId)
+        guard error == nil,
+          let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+          let data,
+          let object = try? JSONSerialization.jsonObject(with: data)
+        else {
+          NSLog(
+            "[ChatEngine] backfillNewest FAIL chatId=%@ trigger=%@ error=%@",
+            String(chatId.prefix(12)), trigger,
+            error?.localizedDescription
+              ?? "http_\((response as? HTTPURLResponse)?.statusCode ?? -1)")
+          return
+        }
+        let responseDict = object as? [String: Any]
+        let messagesArray: [[String: Any]]
+        if let array = object as? [[String: Any]] {
+          messagesArray = array
+        } else if let array = responseDict?["data"] as? [[String: Any]] {
+          messagesArray = array
+        } else if let array = responseDict?["messages"] as? [[String: Any]] {
+          messagesArray = array
+        } else {
+          return
+        }
+        let remoteRows = self.buildHistoryRowsLocked(chatId: chatId, rawMessages: messagesArray)
+          .filter { !self.isTransientStreamRow($0) }
+        guard !remoteRows.isEmpty else { return }
+        let (rows, delta) = self.ingestHistoryRowsLocked(chatId: chatId, remoteRows: remoteRows)
+        self.historyRowsByChat[chatId] = rows
+        _ = self.persistHistoryRowsToStoreLocked(chatId: chatId, rows: rows)
+        let retiredLiveIds = self.retireLiveRowsSupersededByDurableLocked(
+          chatId: chatId, durableRows: remoteRows)
+        let changed =
+          !delta.insertedIds.isEmpty || !delta.updatedIds.isEmpty || !delta.deletedIds.isEmpty
+          || !retiredLiveIds.isEmpty
+        NSLog(
+          "[ChatEngine] backfillNewest OK chatId=%@ trigger=%@ fetched=%d ins=%d upd=%d retiredLive=%d",
+          String(chatId.prefix(12)), trigger, remoteRows.count,
+          delta.insertedIds.count, delta.updatedIds.count, retiredLiveIds.count)
+        self.appendJournalLocked(
+          event: "native-chat-backfill-ok",
+          payload: [
+            "chatId": chatId, "trigger": trigger, "fetched": remoteRows.count,
+            "inserted": delta.insertedIds.count, "retiredLive": retiredLiveIds.count,
+          ])
+        guard changed else { return }
+        self.state["updatedAt"] = self.nowMs()
+        self.postChangeLocked(
+          reason: "chatRowsReloaded",
+          userInfo: ["chatId": chatId, "state": self.statusSnapshotLocked()])
+        self.postChatDeltaLocked(
+          chatId: chatId,
+          inserted: delta.insertedIds,
+          updated: delta.updatedIds,
+          deleted: delta.deletedIds + retiredLiveIds,
+          source: "backfill")
+      }
+    }.resume()
+  }
+
+  /// A durable agent message that carries taskId T supersedes any still-live
+  /// `stream-…`/`lan-…` bubble for the same task. The connected path retires those on
+  /// live message arrival (removeAgentStreamRowsLocked); this covers the DISCONNECTED
+  /// path, where the settle broadcast was missed and the durable copy arrives later via
+  /// backfill — without it the chat shows the response twice (live orphan + durable).
+  private func retireLiveRowsSupersededByDurableLocked(
+    chatId: String, durableRows: [[String: Any]]
+  ) -> [String] {
+    guard let perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return [] }
+    var durableMessageIdByTaskId: [String: String] = [:]
+    for row in durableRows {
+      guard let mid = messageId(fromRow: row),
+        let taskId = agentTaskIdFromRow(row), !taskId.isEmpty
+      else { continue }
+      durableMessageIdByTaskId[taskId] = mid
+    }
+    guard !durableMessageIdByTaskId.isEmpty else { return [] }
+    var removedIds: [String] = []
+    for (liveId, liveRow) in perChat {
+      guard liveId.hasPrefix("stream-") || liveId.hasPrefix("lan-") else { continue }
+      guard let liveTaskId = agentTaskIdFromRow(liveRow),
+        let durableMessageId = durableMessageIdByTaskId[liveTaskId]
+      else { continue }
+      if let slotTs = agentStreamTimestampsByChat[chatId]?[liveId] {
+        adoptAgentSettleSlotTsLocked(chatId: chatId, messageId: durableMessageId, slotTs: slotTs)
+      }
+      liveMessageRowsByChat[chatId]?.removeValue(forKey: liveId)
+      removedIds.append(liveId)
+      removeBridgeTaskTrackingLocked(chatId: chatId, taskId: liveTaskId)
+      NSLog(
+        "[ChatEngine] retireSupersededLive chatId=%@ live=%@ task=%@ durable=%@",
+        String(chatId.suffix(12)), String(liveId.suffix(20)),
+        String(liveTaskId.suffix(20)), String(durableMessageId.suffix(12)))
+    }
+    if liveMessageRowsByChat[chatId]?.isEmpty == true {
+      liveMessageRowsByChat.removeValue(forKey: chatId)
+    }
+    if !removedIds.isEmpty, var perChatTimestamps = agentStreamTimestampsByChat[chatId] {
+      for id in removedIds { perChatTimestamps.removeValue(forKey: id) }
+      if perChatTimestamps.isEmpty {
+        agentStreamTimestampsByChat.removeValue(forKey: chatId)
+      } else {
+        agentStreamTimestampsByChat[chatId] = perChatTimestamps
+      }
+    }
+    return removedIds
+  }
+
+  /// taskId as carried on both live stream rows and durable settled agent messages:
+  /// message.metadata.agentRuntime.taskId (bridge runtime) with agentTaskId fallback.
+  private func agentTaskIdFromRow(_ row: [String: Any]) -> String? {
+    guard let message = row["message"] as? [String: Any],
+      let metadata = message["metadata"] as? [String: Any]
+    else { return nil }
+    let runtime = (metadata["agentRuntime"] as? [String: Any]) ?? [:]
+    return normalizedString(
+      runtime["taskId"] ?? runtime["task_id"]
+        ?? metadata["agentTaskId"] ?? metadata["agent_task_id"])
   }
 
   private func loadOlderChatHistoryLocked(chatId: String) -> Bool {

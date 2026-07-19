@@ -766,6 +766,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// short post-presentation slices. This keeps the push free of rich-cell measurement
   /// without reintroducing a visible 16-row load/prepend every time the user scrolls up.
   private var usesProgressiveTranscriptSizing = false
+  /// Preview surfaces (home hold-preview) only ever show the resting tail; their
+  /// narrower bounds miss every cached height, so a full progressive sweep would
+  /// re-measure the whole transcript on the main thread for nothing.
+  var suppressesProgressiveHeightWarmup = false
   /// The first authoritative snapshot after a presentation seed is a reconciliation,
   /// never a live list mutation. Even if cache/server content differs, replace it in one
   /// disabled-actions reload instead of exposing insert/delete animations or offset churn.
@@ -4953,7 +4957,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     progressiveHeightWarmupWorkItem = nil
     progressiveHeightWarmupGeneration &+= 1
     let generation = progressiveHeightWarmupGeneration
-    guard usesProgressiveTranscriptSizing, rows.count > Self.largeTranscriptThreshold,
+    guard usesProgressiveTranscriptSizing, !suppressesProgressiveHeightWarmup,
+      rows.count > Self.largeTranscriptThreshold,
       window != nil, bounds.width > 1.0
     else {
       progressiveHeightWarmupKeys = []
@@ -4985,6 +4990,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard generation == progressiveHeightWarmupGeneration,
       usesProgressiveTranscriptSizing, !progressiveHeightWarmupKeys.isEmpty
     else { return }
+    // A detached list can't paint what it measures: a dismissed preview's
+    // transcript kept sweeping off-window cells for ~30s of main-thread churn.
+    // Abandon outright — a real (re)attach settles rows and reschedules fresh.
+    guard window != nil else {
+      progressiveHeightWarmupKeys = []
+      progressiveHeightWarmupWorkItem = nil
+      return
+    }
     guard !isApplyingRowsUpdate, !collectionView.isTracking, !collectionView.isDragging,
       !collectionView.isDecelerating
     else {

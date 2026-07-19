@@ -130,6 +130,7 @@ defmodule VibeWeb.AgentBridgeChannel do
     #   VIBE_TEAM_SPAWN: claude  → dispatch workers (plan rows drive their focus)
     maybe_handle_team_plan_line(line, chat_id, team_run_id, payload)
     maybe_handle_team_spawn_line(line, chat_id, team_run_id, payload, socket)
+    maybe_handle_team_status_line(line, chat_id, team_run_id, socket)
 
     # A shared chat can host multiple runs from the same provider. Scope the live
     # buffer to the durable task/team identity so progress from adjacent team runs
@@ -564,6 +565,65 @@ defmodule VibeWeb.AgentBridgeChannel do
   end
 
   defp maybe_handle_team_spawn_line(_, _, _, _, _), do: :ok
+
+  # Lead / worker-emitted VIBE_TEAM_STATUS lines update the durable worker board.
+  # `update_team_worker_state/4` adds timestamps only when they are absent, so a
+  # repeated running status never resets the worker's original start time.
+  defp maybe_handle_team_status_line(line, chat_id, team_run_id, socket)
+       when is_binary(line) and is_binary(chat_id) and is_binary(team_run_id) do
+    if bridge_owns_chat?(socket, chat_id) do
+      case parse_team_status_line(line) do
+        {:ok, %{"worker" => worker, "state" => state, "label" => label}} ->
+          LocalAgentWorker.update_team_worker_state(
+            chat_id,
+            team_run_id,
+            worker,
+            team_status_patch(state, label)
+          )
+
+        :ignore ->
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp maybe_handle_team_status_line(_, _, _, _), do: :ok
+
+  @doc """
+  Parse one `VIBE_TEAM_STATUS {json}` line emitted by a team worker.
+
+  Returns only the string-keyed fields used to update the team worker state.
+  Invalid directives are ignored so an arbitrary stdout line cannot crash the
+  bridge channel.
+  """
+  def parse_team_status_line(line) when is_binary(line) do
+    with [_, raw] <- Regex.run(~r/VIBE_TEAM_STATUS\s+(\{.*\})\s*$/i, line),
+         {:ok, status} when is_map(status) <- Jason.decode(raw),
+         worker when is_binary(worker) and worker != "" <- Map.get(status, "worker"),
+         state when state in ["running", "done", "failed"] <- Map.get(status, "state"),
+         label <- Map.get(status, "label"),
+         true <- is_nil(label) or is_binary(label) do
+      {:ok, %{"worker" => worker, "state" => state, "label" => label}}
+    else
+      _ -> :ignore
+    end
+  end
+
+  def parse_team_status_line(_), do: :ignore
+
+  defp team_status_patch("running", label) do
+    %{"status" => "running", "last_label" => label}
+  end
+
+  defp team_status_patch("done", label) do
+    %{"status" => "done", "last_label" => label}
+  end
+
+  defp team_status_patch("failed", label) do
+    %{"status" => "failed", "last_label" => label}
+  end
 
   defp stringify_map_keys(map) when is_map(map) do
     Map.new(map, fn {k, v} -> {to_string(k), v} end)

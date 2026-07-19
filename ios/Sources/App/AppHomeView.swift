@@ -1336,6 +1336,8 @@ private final class ChatsViewModel: ObservableObject {
   }
 
   private var backgroundRefreshTask: Task<Void, Never>?
+  private var inflightRefreshTask: Task<Void, Never>?
+  private var trailingRefreshRequested = false
   private var agentConversationObserver: NSObjectProtocol?
   private var realtimeMessageObserver: NSObjectProtocol?
   private var bridgeStatusObserver: NSObjectProtocol?
@@ -1441,6 +1443,7 @@ private final class ChatsViewModel: ObservableObject {
 
   deinit {
     backgroundRefreshTask?.cancel()
+    inflightRefreshTask?.cancel()
     realtimeRefreshTask?.cancel()
     if let agentConversationObserver {
       NotificationCenter.default.removeObserver(agentConversationObserver)
@@ -1725,6 +1728,26 @@ private final class ChatsViewModel: ObservableObject {
   }
 
   private func refresh(preserveRows: Bool) async {
+    if let inflightRefreshTask {
+      trailingRefreshRequested = true
+      await inflightRefreshTask.value
+      return
+    }
+
+    let task = Task { @MainActor [weak self] in
+      guard let self else { return }
+      await self.performRefresh(preserveRows: preserveRows)
+      while self.trailingRefreshRequested {
+        self.trailingRefreshRequested = false
+        await self.performRefresh(preserveRows: true)
+      }
+      self.inflightRefreshTask = nil
+    }
+    inflightRefreshTask = task
+    await task.value
+  }
+
+  private func performRefresh(preserveRows: Bool) async {
     let startedAt = ProcessInfo.processInfo.systemUptime
     AppUITrace.notice(
       "ChatsViewModel refresh start preserveRows=\(preserveRows ? "Y" : "N") currentRows=\(rows.count)"
@@ -1753,7 +1776,16 @@ private final class ChatsViewModel: ObservableObject {
     }
 
     do {
-      let fetchedRows = try await ChatHomeService.fetchChats(config: config)
+      let fetchedRows: [ChatHomeListRow]
+      do {
+        fetchedRows = try await ChatHomeService.fetchChats(config: config)
+      } catch {
+        let isCancellation = error is CancellationError
+          || (error as? URLError)?.code == .cancelled
+        guard isCancellation else { throw error }
+        AppUITrace.notice("ChatsViewModel refresh retry-after-cancel")
+        fetchedRows = try await ChatHomeService.fetchChats(config: config)
+      }
       let existingRowsByChatID = Dictionary(
         rows.map { ($0.chatId, $0) },
         uniquingKeysWith: { current, _ in current }
@@ -2374,30 +2406,46 @@ private struct ChatHomeScreen: View {
       isEditingHome = false
       selectedChatIDs.removeAll()
     }
-    // The input's flight is 100% UIKit/Core Animation now — the in-list
-    // capsule ITSELF is reparented into a window overlay and flown by the
-    // native controller (reacting to these flags). This SwiftUI commit only
-    // reveals the static results sheet, so it stays tiny.
-    isHomeSearchFocused = true
+    // Two-commit staging. THIS commit is tiny: it only flips the pose flag,
+    // and the native controller commits the input flight + list dissolve to
+    // the render server inside it. The HEAVY reveal (sheet visibility, clear
+    // background, hit gating) lands one runloop later — its ~60ms main-thread
+    // stall then runs UNDER the already-committed server-side animations,
+    // which keep playing through it. Committing motion and reveal together
+    // let the stall eat the flight's first frames every time: "the input
+    // disappears instead of traveling".
     searchPresented = true
+    DispatchQueue.main.async {
+      isHomeSearchFocused = true
+    }
   }
 
   private func closeHomeSearch() {
-    guard isHomeSearchFocused, !searchCloseRetracting else { return }
+    guard searchPresented || isHomeSearchFocused, !searchCloseRetracting else { return }
     SearchMorphProfiler.shared.begin("close")
     // Phase 1 (native side reacts to this flag): the xmark retracts offscreen
     // and the flying capsule re-widens + drops its glass at the dock.
     searchCloseRetracting = true
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
+    // The X-tap path already started the return motion UIKit-side at +0.05;
+    // this SwiftUI descend commit runs in the spring's TAIL — at +0.10 its
+    // ~30ms body re-eval dropped frames right in the descent's fastest phase
+    // (max velocity ⇒ maximally visible stutter: "the input shifts, no
+    // crossfade"). In the tail the same stall is nearly invisible.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
       setNavigationBarFaded(false)
       SearchMorphProfiler.mark("descend")
-      // Phase 2: the capsule flies back onto its slot (native spring), the
-      // sheet fades out and the home cells return. Query clears so it lands
-      // showing the empty "Search".
+      // Phase 2: the capsule flies back onto its slot (native spring) and the
+      // list surface dissolves back in. ONLY the pose flag flips here — the
+      // query/results clear is a heavy SwiftUI rebuild (results→recents) and
+      // clearing it in this commit stalled the descent's first frames.
       searchPresented = false
-      homeSearchQuery = ""
-      globalResults = []
       setTabBarHidden(isEditingHome, animated: true)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+        // Descent is committed to the render server by now — the rebuild's
+        // stall lands under an already-running CA animation, invisibly.
+        homeSearchQuery = ""
+        globalResults = []
+      }
       // Phase 3: drop the sheet gate after landing — the capsule itself is
       // reattached to the list by the flight animator's completion.
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.36) {
@@ -2415,6 +2463,11 @@ private struct ChatHomeScreen: View {
         // No SwiftUI safeAreaInset — that fought UIKit contentInset and covered cells.
         listContent
           .ignoresSafeArea(.container, edges: [.top, .bottom])
+          // The keyboard must NEVER resize this surface: it rises mid-flight
+          // and SwiftUI's avoidance would compress the table right in the
+          // spring's fast phase — a layout jump completely outside the
+          // animation ("the list is jumping, separated from the search").
+          .ignoresSafeArea(.keyboard, edges: .bottom)
           // The background goes CLEAR the instant search focuses: the results
           // sheet (identical palette background) sits BEHIND the list, so the
           // swap is pixel-invisible — and the cells fading out then REVEAL the
@@ -2442,6 +2495,9 @@ private struct ChatHomeScreen: View {
           onSelectChat: { openLocalChatRow($0) },
           onSelectPerson: { handleGlobalUserTap($0) }
         )
+        // Static sheet: the keyboard must not compress it either — its own
+        // scroll view handles content that ends up under the keyboard.
+        .ignoresSafeArea(.keyboard, edges: .bottom)
         .allowsHitTesting(isHomeSearchFocused)
         .zIndex(0)
 
@@ -2518,6 +2574,7 @@ private struct ChatHomeScreen: View {
             .tint(colorScheme == .dark ? .white : .black)
             .disabled(filteredRows.isEmpty && !isEditingHome)
             .opacity(searchPresented ? 0 : 1)
+            .animation(.easeInOut(duration: 0.22), value: searchPresented)
             .allowsHitTesting(!isHomeSearchFocused)
           }
 
@@ -2527,6 +2584,7 @@ private struct ChatHomeScreen: View {
               palette: palette
             )
             .opacity(searchPresented ? 0 : 1)
+            .animation(.easeInOut(duration: 0.22), value: searchPresented)
             .allowsHitTesting(!isHomeSearchFocused)
           }
 
@@ -2568,6 +2626,7 @@ private struct ChatHomeScreen: View {
               }
               .padding(.horizontal, 6)
               .opacity(searchPresented ? 0 : 1)
+              .animation(.easeInOut(duration: 0.22), value: searchPresented)
               .allowsHitTesting(!isHomeSearchFocused)
             }
           }
@@ -2716,14 +2775,15 @@ private struct ChatHomeScreen: View {
         // safeAreaInset / contentInset fight with the UIKit table.
         searchText: $homeSearchQuery,
         isSearchFocused: Binding(
-          // The native list keys off the animated POSE, not the mount: cells
-          // fade/lift when the field takes off, and restore when the descent
-          // starts (not at the later unmount).
-          get: { isHomeSearchFocused && searchPresented },
+          // The native list keys off the animated POSE alone (searchPresented):
+          // motion starts in the tiny pose commit, one runloop BEFORE the
+          // heavy reveal commit (isHomeSearchFocused), and restores when the
+          // descent starts (not at the later unmount).
+          get: { searchPresented },
           set: { focused in
             if focused {
               openHomeSearch()
-            } else if isHomeSearchFocused {
+            } else if searchPresented || isHomeSearchFocused {
               closeHomeSearch()
             }
           }
@@ -2732,6 +2792,7 @@ private struct ChatHomeScreen: View {
         // Close phase 1: native side retracts the xmark and re-widens the
         // (flying) capsule at the dock before the descent.
         isSearchRetracting: searchCloseRetracting,
+        searchDissolveBackground: palette.backgroundUIColor,
         recentRows: recentSearchRows,
         peopleResults: combinedPeopleResults,
         isGlobalSearching: isGlobalSearching,
@@ -3710,6 +3771,12 @@ private final class SearchMorphProfiler: NSObject {
   }
 
   func begin(_ label: String) {
+    // The tap's UIKit-turn begin and the SwiftUI commit's begin arrive ~20ms
+    // apart for the SAME run — a restart would move t0 and skew every mark
+    // and hitch timestamp after it.
+    if link != nil, self.label == label, CACurrentMediaTime() - startedAt < 1.0 {
+      return
+    }
     finish(logSummary: false)
     self.label = label
     startedAt = CACurrentMediaTime()
@@ -3769,7 +3836,9 @@ private final class SearchMorphProfiler: NSObject {
 /// Shared metrics for the search flight (the capsule itself is UIKit —
 /// HomeSearchCapsuleView — and flies in a window overlay).
 private enum HomeSearchChrome {
-  static let closeSize: CGFloat = 34
+  // Same height as the docked input — a smaller circle floated above/below
+  // the field's midline and read as misaligned chrome.
+  static let closeSize: CGFloat = HomeSearchCapsuleView.fieldHeight
 
   /// Dock Y for the focused field: centered in the nav band, just under the
   /// status bar. Derived from the key window (status inset only — the nav
@@ -3823,8 +3892,14 @@ private struct HomeTelegramSearchView: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     .ignoresSafeArea(.container, edges: .top)
     // Instant show/hide gate — flipped outside any animation. NO fades here:
-    // the sheet is static behind the list; the cells' fade is the reveal.
-    .opacity(visible ? 1 : 0)
+    // the sheet is static behind the list; the list's fade is the reveal.
+    // Hidden = 0.02, not 0: opacity 0 lets CA prune/derealize the subtree, and
+    // re-realizing it on reveal cost a ~54ms frame that froze the flight's
+    // first frames ("the input jumps to the header instead of moving"). At
+    // 0.02 the layers stay resident behind the opaque list, so the reveal is
+    // compositor-only.
+    .opacity(visible ? 1 : 0.02)
+    .allowsHitTesting(visible)
     .onChange(of: visible) { _, shown in
       SearchMorphProfiler.mark(shown ? "overlay visible" : "overlay hidden")
     }
@@ -4065,6 +4140,11 @@ private final class HomeSearchCapsuleView: UIView {
   let textField = UITextField()
   let placeholderLabel = UILabel()
   private let fillView = UIView()
+  /// Telegram's rest pose: the icon + "Search" group sits CENTERED in the
+  /// capsule; the focused (glass) input is left-aligned, and the flight's
+  /// crossfade carries the label from center to left.
+  private var centeredConstraint: NSLayoutConstraint!
+  private var leadingConstraint: NSLayoutConstraint!
   var onTextChanged: ((String) -> Void)?
 
   override init(frame: CGRect) {
@@ -4101,13 +4181,24 @@ private final class HomeSearchCapsuleView: UIView {
     placeholderLabel.isUserInteractionEnabled = false
     addSubview(placeholderLabel)
 
+    // Icon position is the single switch between the two poses: everything
+    // else (text field, placeholder) chains off it.
+    leadingConstraint = iconView.leadingAnchor.constraint(
+      equalTo: leadingAnchor, constant: 12)
+    // Center the icon+gap+"Search" GROUP: icon(18) + gap(8) + label(≈56) ≈ 82
+    // wide → icon's center sits groupWidth/2 − icon/2 ≈ 32 left of center. A
+    // fixed offset (not a layout guide) so the animated capsule width can't
+    // fight the constraint solver mid-flight.
+    centeredConstraint = iconView.centerXAnchor.constraint(
+      equalTo: centerXAnchor, constant: -32)
+    centeredConstraint.isActive = true
+
     NSLayoutConstraint.activate([
       fillView.leadingAnchor.constraint(equalTo: leadingAnchor),
       fillView.trailingAnchor.constraint(equalTo: trailingAnchor),
       fillView.topAnchor.constraint(equalTo: topAnchor),
       fillView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-      iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
       iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
       iconView.widthAnchor.constraint(equalToConstant: 18),
       iconView.heightAnchor.constraint(equalToConstant: 18),
@@ -4138,10 +4229,37 @@ private final class HomeSearchCapsuleView: UIView {
   func syncText(_ text: String) {
     if textField.text != text { textField.text = text }
     placeholderLabel.isHidden = !(textField.text ?? "").isEmpty
+    applyLayoutPose()
+  }
+
+  /// Explicit pose, so the FLIGHT can slide the label center→left inside the
+  /// animator (constraint change + layoutIfNeeded in the animation block).
+  /// Kept separate from text emptiness: mid-flight external text syncs would
+  /// otherwise snap the label back to center outside any animation.
+  private var poseCentered = true
+
+  func setLabelPose(centered: Bool) {
+    poseCentered = centered
+    applyLayoutPose()
+  }
+
+  /// Centered while empty at rest (Telegram); left-aligned once text exists
+  /// or once the flight has pinned the focused pose.
+  private func applyLayoutPose() {
+    let centered = poseCentered && (textField.text ?? "").isEmpty
+    guard centeredConstraint.isActive != centered else { return }
+    if centered {
+      leadingConstraint.isActive = false
+      centeredConstraint.isActive = true
+    } else {
+      centeredConstraint.isActive = false
+      leadingConstraint.isActive = true
+    }
   }
 
   @objc private func textChanged() {
     placeholderLabel.isHidden = !(textField.text ?? "").isEmpty
+    applyLayoutPose()
     onTextChanged?(textField.text ?? "")
   }
 }
@@ -4179,6 +4297,14 @@ private final class HomeSearchGhostInputView: UIView {
     iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
       pointSize: 15, weight: .medium)
     content.addSubview(iconView)
+    // Same two poses as the solid capsule, so twin and ghost contents are
+    // ALWAYS co-located while both slide on the flight spring — the material
+    // can then crossfade at any moment without ever showing two labels.
+    leadingConstraint = iconView.leadingAnchor.constraint(
+      equalTo: content.leadingAnchor, constant: 12)
+    centeredConstraint = iconView.centerXAnchor.constraint(
+      equalTo: content.centerXAnchor, constant: -32)
+    leadingConstraint.isActive = true
 
     textField.translatesAutoresizingMaskIntoConstraints = false
     textField.font = .systemFont(ofSize: 17, weight: .regular)
@@ -4196,7 +4322,6 @@ private final class HomeSearchGhostInputView: UIView {
     content.addSubview(placeholderLabel)
 
     NSLayoutConstraint.activate([
-      iconView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
       iconView.centerYAnchor.constraint(equalTo: content.centerYAnchor),
       iconView.widthAnchor.constraint(equalToConstant: 18),
       iconView.heightAnchor.constraint(equalToConstant: 18),
@@ -4210,25 +4335,50 @@ private final class HomeSearchGhostInputView: UIView {
     ])
   }
 
+  private var leadingConstraint: NSLayoutConstraint!
+  private var centeredConstraint: NSLayoutConstraint!
+  /// Docked rest pose is left-aligned; the flight slides it from/to the
+  /// capsule's centered pose in lockstep with the solid twin.
+  private var poseCentered = false
+
+  func setLabelPose(centered: Bool) {
+    poseCentered = centered
+    applyLayoutPose()
+  }
+
+  private func applyLayoutPose() {
+    let centered = poseCentered && (textField.text ?? "").isEmpty
+    guard centeredConstraint.isActive != centered else { return }
+    if centered {
+      leadingConstraint.isActive = false
+      centeredConstraint.isActive = true
+    } else {
+      centeredConstraint.isActive = false
+      leadingConstraint.isActive = true
+    }
+  }
+
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
   }
 
   func applyPalette(isDark: Bool) {
-    // One glass shell only — never nest another effect or opaque fill under it
+    // One glass shell only — never nest another effect or opaque fill UNDER it
     // (ChatPinnedBannerView rule; a fill underneath was the "wrong glass
-    // water" / elements-behind-the-glass look).
+    // water" / elements-behind-the-glass look). The tint lives INSIDE the
+    // contentView — sanctioned — and is required on BOTH branches: pure glass
+    // over Home's near-black background renders as nothing, which made the
+    // flying/docked input literally invisible (Telegram's field is a visibly
+    // filled gray capsule, not raw glass).
     if #available(iOS 26.0, *) {
       let glass = UIGlassEffect(style: .regular)
       glass.isInteractive = true
       blurView.effect = glass
-      blurView.contentView.backgroundColor = .clear
     } else {
       blurView.effect = UIBlurEffect(style: .systemThinMaterial)
-      blurView.contentView.backgroundColor =
-        (isDark ? UIColor.white : UIColor.black)
-        .withAlphaComponent(isDark ? 0.10 : 0.06)
     }
+    lastIsDark = isDark
+    setDockedClear(false)
     let secondary =
       isDark ? UIColor.white.withAlphaComponent(0.55) : UIColor.secondaryLabel
     iconView.tintColor = secondary
@@ -4236,9 +4386,24 @@ private final class HomeSearchGhostInputView: UIView {
     textField.textColor = isDark ? .white : .label
   }
 
+  private var lastIsDark = false
+
+  /// In flight the glass carries a visible tint (pure glass over the black
+  /// home background is invisible — the "input disappears" bug). Once DOCKED
+  /// the tint drains away: the resting input is clear glass, not a gray pill.
+  /// Callers wrap this in UIView.animate for a smooth drain/refill.
+  func setDockedClear(_ clear: Bool) {
+    blurView.contentView.backgroundColor =
+      clear
+      ? .clear
+      : (lastIsDark ? UIColor.white : UIColor.black)
+        .withAlphaComponent(lastIsDark ? 0.12 : 0.06)
+  }
+
   func syncText(_ text: String) {
     if textField.text != text { textField.text = text }
     placeholderLabel.isHidden = !(textField.text ?? "").isEmpty
+    applyLayoutPose()
   }
 
   @objc private func textChanged() {
@@ -4584,6 +4749,10 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   var isSearchOverlayVisible: Bool = false
   /// Close phase 1 — triggers the native retract (xmark out, capsule re-widen).
   var isSearchRetracting: Bool = false
+  /// Opaque list-surface color for the search morph: the table dissolves as
+  /// ONE opaque surface over the sheet (transparent cells over sheet content
+  /// read as two overlapping lists).
+  var searchDissolveBackground: UIColor? = nil
   var recentRows: [ChatHomeListRow] = []
   var peopleResults: [ContactSearchUser] = []
   var isGlobalSearching: Bool = false
@@ -4606,6 +4775,7 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
     controller.isSearchFocusedBinding = isSearchFocused
     controller.searchOverlayVisibleFlag = isSearchOverlayVisible
     controller.searchRetractingFlag = isSearchRetracting
+    controller.searchDissolveBackground = searchDissolveBackground
     controller.showsInListSearch = searchText != nil
     controller.apply(
       rows: rows,
@@ -4631,6 +4801,7 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
     uiViewController.isSearchFocusedBinding = isSearchFocused
     uiViewController.searchOverlayVisibleFlag = isSearchOverlayVisible
     uiViewController.searchRetractingFlag = isSearchRetracting
+    uiViewController.searchDissolveBackground = searchDissolveBackground
     uiViewController.showsInListSearch = searchText != nil
     uiViewController.apply(
       rows: rows,
@@ -4654,9 +4825,11 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       target: self,
       action: #selector(handlePreviewHold(_:))
     )
-    // Begin on touch-down so the press scale follows the finger for the whole
-    // recognition interval. The actual preview still commits after 0.19s.
-    recognizer.minimumPressDuration = 0
+    // A REAL hold, not touch-down: 0.12s of stillness before the gesture even
+    // begins. Quick taps and starting swipes never enter the hold path at all
+    // — no depress flash on tap, no sink under a swipe, no delayed-feeling
+    // push (touch-down tracking made every tap start the hold choreography).
+    recognizer.minimumPressDuration = 0.12
     recognizer.allowableMovement = 10
     recognizer.delaysTouchesBegan = false
     recognizer.delaysTouchesEnded = false
@@ -4675,6 +4848,12 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   fileprivate var isSearchFocusedBinding: Binding<Bool>?
   fileprivate var searchOverlayVisibleFlag = false
   fileprivate var searchRetractingFlag = false
+  fileprivate var searchDissolveBackground: UIColor?
+  /// Telegram's open grammar (verified against slow-mo captures): the OLD
+  /// surface slides up by the full slot→dock distance while fading, so the
+  /// input is visibly CARRIED to the header by the surface it lives on. A
+  /// token −10pt lift read as a static list with a teleporting input.
+  private var searchSurfaceLift: CGFloat = 72
   fileprivate var showsInListSearch = false
 
   private var rows: [ChatHomeListRow] = []
@@ -4693,7 +4872,13 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   /// which lives inside the SwiftUI hierarchy below the window's top).
   private var searchFlightContainer: UIView?
   private var searchGhost: HomeSearchGhostInputView?
+  /// Pixel-identical SOLID copy of the in-list capsule. THE flying input: it
+  /// and the glass ghost travel the SAME frames in one animator, and the
+  /// mid-run crossfade between them is purely a material swap — the input is
+  /// one continuously-moving thing that turns glass midway.
+  private var searchSolidTwin: HomeSearchCapsuleView?
   private var searchCloseButton: UIButton?
+  private var searchCloseGlassTint: UIView?
   private var searchReturnAnimator: UIViewPropertyAnimator?
 
   override var preferredStatusBarStyle: UIStatusBarStyle {
@@ -4737,6 +4922,9 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   }
 
   private func updateInListSearchHeader(animated: Bool) {
+    // Permanent opaque backing (identical to the SwiftUI background behind
+    // it) — refreshed every apply so palette flips track it.
+    tableView.backgroundColor = searchDissolveBackground ?? .clear
     // Keep the header mounted through focus transitions so removing tableHeaderView
     // cannot jump every row upward while the SwiftUI surface is morphing over it.
     // Visible cells animate independently; this header never inherits their Y shift.
@@ -4757,12 +4945,17 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       header = ChatHomeInListSearchHeader(
         frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: 56))
       header.onFocusChange = { [weak self] focused in
-        self?.isSearchFocusedBinding?.wrappedValue = focused
+        guard let self else { return }
+        if focused {
+          // UIKit-first: motion starts in this event turn, SwiftUI follows.
+          self.beginSearchOpenFromTap()
+        } else {
+          self.isSearchFocusedBinding?.wrappedValue = focused
+        }
       }
       searchHeader = header
     }
     let width = tableView.bounds.width > 0 ? tableView.bounds.width : view.bounds.width
-    header.bounds.size.width = width
     header.apply(
       text: searchTextBinding?.wrappedValue ?? "",
       isFocused: false,
@@ -4771,18 +4964,32 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       animated: animated
     )
     // External query changes (sheet "Clear", close-time reset) reach the ghost
-    // too; while the user types in the ghost this is an equal-text no-op.
+    // AND its solid twin; while the user types this is an equal-text no-op.
     searchGhost?.syncText(searchTextBinding?.wrappedValue ?? "")
-    header.layoutIfNeeded()
+    searchSolidTwin?.syncText(searchTextBinding?.wrappedValue ?? "")
+    // Geometry only when it actually changed. Every apply pass used to rewrite
+    // header.frame and re-assign tableHeaderView unconditionally — re-assigning
+    // the header forces a full row re-layout mid-flight: the ~10px instant list
+    // jump at open.
     let targetHeight = header.preferredHeight
-    header.frame = CGRect(x: 0, y: 0, width: width, height: targetHeight)
-    // Re-assign so UITableView picks up new header size without a body flash.
-    tableView.tableHeaderView = header
+    let geometryChanged =
+      abs(header.frame.width - width) > 0.5 || abs(header.frame.height - targetHeight) > 0.5
+    if tableView.tableHeaderView !== header || geometryChanged {
+      header.frame = CGRect(x: 0, y: 0, width: width, height: targetHeight)
+      header.layoutIfNeeded()
+      tableView.tableHeaderView = header
+    }
   }
 
   private func updateSearchFocusPresentation(animated: Bool) {
-    let focused = isSearchFocusedBinding?.wrappedValue == true
     let retracting = searchRetractingFlag
+    // A retracting run is never "focused". The close choreography flips
+    // searchPresented only at +0.18 — until then the raw binding still reads
+    // true, and any apply landing in that window (rows stream in constantly)
+    // would look like a fresh focus and relaunch the OPEN flight mid-descent:
+    // "the first close is fine, the next ones break".
+    let focused =
+      (isSearchFocusedBinding?.wrappedValue == true) && !retracting && !presentedSearchRetract
     let focusChanged = focused != presentedSearchFocus
     let overlayChanged = searchOverlayVisibleFlag != presentedSearchOverlay
     let retractChanged = retracting != presentedSearchRetract
@@ -4791,23 +4998,18 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     presentedSearchOverlay = searchOverlayVisibleFlag
     presentedSearchRetract = retracting
 
-    let changes = {
-      // The LIST SURFACE is one thing: cells AND the in-list capsule (the
-      // whole tableHeaderView) lift and fade together on one shared value.
-      // The glass ghost crossfades in/out mid-run as the input's replacement.
-      for cell in self.tableView.visibleCells {
-        cell.alpha = focused ? 0.0 : 1.0
-        cell.transform = focused
-          ? CGAffineTransform(translationX: 0, y: -10)
-          : .identity
-      }
-      self.searchHeader?.alpha = focused ? 0.0 : 1.0
-      self.searchHeader?.transform = focused
-        ? CGAffineTransform(translationX: 0, y: -10)
-        : .identity
-    }
+    // The list dissolves as ONE OPAQUE SURFACE: background + cells + header
+    // ride a single table-level alpha + slide. Per-cell fades left the sheet
+    // showing THROUGH the transparent cells — two overlapping lists of
+    // content ("list overlap"). An opaque surface at 50% is a clean dissolve;
+    // transparent content at 50% over other content is mush.
     guard animated else {
-      changes()
+      tableView.backgroundColor = searchDissolveBackground ?? .clear
+      tableView.alpha = focused ? 0.0 : 1.0
+      tableView.transform =
+        focused
+        ? CGAffineTransform(translationX: 0, y: -searchSurfaceLift)
+        : .identity
       settleSearchFlight(focused: focused)
       return
     }
@@ -4817,25 +5019,75 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     }
 
     guard focusChanged else { return }
+    runSearchPoseMotion(focused: focused)
+  }
+
+  /// The entire morph (input flight + list dissolve), one tiny UIKit
+  /// transaction. Reached two ways: directly from the tap/X UIKit event turn
+  /// (primary — commits BEFORE any SwiftUI work exists, so the first frames
+  /// always render), or from a SwiftUI-driven focus change (secondary
+  /// closers), where presentedSearchFocus gating keeps it from re-running.
+  private func runSearchPoseMotion(focused: Bool) {
+    tableView.backgroundColor = searchDissolveBackground ?? .clear
+    // The surface slides by the FULL slot→dock distance (Telegram's nav
+    // collapse), so the flying input is visibly carried by the surface it
+    // belongs to — same delta, same spring, one motion.
+    if focused, let header = searchHeader, let window = view.window {
+      let slot = header.convert(header.capsuleSlotFrame, to: window)
+      let dock = searchDockFrame(in: window, narrowed: true)
+      searchSurfaceLift = max(24, slot.minY - dock.minY)
+    }
+    let lift = searchSurfaceLift
     if focused {
       beginSearchFlightOpen()
     } else {
       beginSearchFlightReturn()
     }
     NSLog(
-      "[SearchMorph] native cells %@ visible=%ld",
-      focused ? "out" : "in", tableView.visibleCells.count)
-    // Cells ride the SAME spring as the capsule flight — true lockstep. A
-    // faster fixed-duration fade here finished its −10pt lift while the
-    // spring was still winding up: "the list shifts before the input moves".
+      "[SearchMorph] list surface %@ lift=%.0f", focused ? "out" : "in", lift)
     let spring = UISpringTimingParameters(
       mass: 1,
-      stiffness: focused ? 438 : 503,
-      damping: focused ? 37.7 : 41.3,
+      stiffness: focused ? 273 : 322,
+      damping: focused ? 29.7 : 33.0,
       initialVelocity: .zero)
-    let cellAnimator = UIViewPropertyAnimator(duration: 0, timingParameters: spring)
-    cellAnimator.addAnimations(changes)
-    cellAnimator.startAnimation()
+    let listAnimator = UIViewPropertyAnimator(duration: 0, timingParameters: spring)
+    listAnimator.addAnimations {
+      self.tableView.transform =
+        focused
+        ? CGAffineTransform(translationX: 0, y: -lift)
+        : .identity
+    }
+    listAnimator.startAnimation()
+    // The dissolve does NOT ride the spring: the spring's settling tail held
+    // the surface half-blended over the sheet for ~0.5s — a long two-list
+    // dwell ("list overlap"). Telegram: the slide keeps spring momentum, the
+    // fade itself is over quickly.
+    UIView.animate(
+      withDuration: focused ? 0.20 : 0.22,
+      delay: focused ? 0.0 : 0.03,
+      options: [.beginFromCurrentState, .curveEaseInOut]
+    ) {
+      self.tableView.alpha = focused ? 0.0 : 1.0
+    }
+  }
+
+  /// UIKit-first open: runs inside the tap's own event turn. The motion is
+  /// committed to the render server before SwiftUI evaluates ANYTHING, so
+  /// however heavy the Home body re-eval is (~30–60ms), it plays out under
+  /// an animation that is already running. presentedSearchFocus is pre-set
+  /// so the SwiftUI applies that follow see no focus change and cannot
+  /// restart the motion.
+  fileprivate func beginSearchOpenFromTap() {
+    guard !presentedSearchFocus else { return }
+    SearchMorphProfiler.shared.begin("open")
+    presentedSearchFocus = true
+    runSearchPoseMotion(focused: true)
+    // Binding flip on the NEXT runloop: SwiftUI may evaluate a same-turn
+    // binding write inside this very transaction, which would re-fatten the
+    // flush and eat the takeoff frames all over again.
+    DispatchQueue.main.async { [weak self] in
+      self?.isSearchFocusedBinding?.wrappedValue = true
+    }
   }
 
   // MARK: Search ghost flight (pure UIKit/Core Animation)
@@ -4882,12 +5134,13 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         glass.layer.masksToBounds = true
         glass.isUserInteractionEnabled = false
         button.insertSubview(glass, at: 0)
+        searchCloseGlassTint = glass.contentView
       } else {
         button.layer.cornerRadius = size / 2
       }
       let image = UIImage(
         systemName: "xmark",
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
       )?.withRenderingMode(.alwaysTemplate)
       button.setImage(image, for: .normal)
       button.accessibilityLabel = "Close search"
@@ -4896,6 +5149,11 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       searchCloseButton = button
     }
     if #available(iOS 26.0, *) {
+      // Raw glass over the black home background is invisible — same tint-in-
+      // contentView treatment as the ghost input, so the circle reads.
+      searchCloseGlassTint?.backgroundColor =
+        (isDark ? UIColor.white : UIColor.black)
+        .withAlphaComponent(isDark ? 0.12 : 0.06)
     } else {
       button.backgroundColor =
         isDark ? UIColor(white: 0.22, alpha: 1.0) : UIColor.tertiarySystemFill
@@ -4905,7 +5163,32 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   }
 
   @objc private func handleSearchCloseTap() {
-    isSearchFocusedBinding?.wrappedValue = false
+    // UIKit-first close, mirroring the open: retract NOW in the tap's event
+    // turn, the return motion in its own clean runloop at +0.05 (before any
+    // SwiftUI descend commit can eat its first frames), and the SwiftUI
+    // choreography (nav/tab restore, query clear, gate-off) follows behind —
+    // its heavy commits land under the already-running animation. The
+    // presented* flags are pre-set so those commits re-run nothing.
+    guard presentedSearchFocus else {
+      isSearchFocusedBinding?.wrappedValue = false
+      return
+    }
+    SearchMorphProfiler.shared.begin("close")
+    if !presentedSearchRetract {
+      presentedSearchRetract = true
+      beginSearchCloseRetract()
+    }
+    // Descent in this SAME event turn — no dwell at the dock. The re-widen
+    // rides the return spring itself (frame animates position AND width), so
+    // nothing needs to serialize ahead of the drop: Telegram's cancel
+    // un-narrows the field WHILE it descends.
+    presentedSearchFocus = false
+    runSearchPoseMotion(focused: false)
+    // Next runloop for the same reason as the open: keep THIS transaction
+    // (retract + descent) pure so its flush stays tiny.
+    DispatchQueue.main.async { [weak self] in
+      self?.isSearchFocusedBinding?.wrappedValue = false
+    }
   }
 
   private func ensureSearchGhost(in container: UIView) -> HomeSearchGhostInputView {
@@ -4924,6 +5207,18 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     return ghost
   }
 
+  private func ensureSearchSolidTwin(in container: UIView) -> HomeSearchCapsuleView {
+    if let existing = searchSolidTwin, existing.superview === container {
+      return existing
+    }
+    searchSolidTwin?.removeFromSuperview()
+    let twin = HomeSearchCapsuleView()
+    twin.isUserInteractionEnabled = false
+    container.addSubview(twin)
+    searchSolidTwin = twin
+    return twin
+  }
+
   private func beginSearchFlightOpen() {
     guard let header = searchHeader, let window = view.window else { return }
     searchReturnAnimator?.stopAnimation(true)
@@ -4933,14 +5228,33 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     container.isHidden = false
     window.bringSubviewToFront(container)
 
+    let slot = header.convert(header.capsuleSlotFrame, to: window)
+    let currentText = searchTextBinding?.wrappedValue ?? ""
+
+    // THE flying input is the solid twin — pixel-identical to the in-list
+    // capsule, swapped in over it in this same transaction (invisible). The
+    // real capsule just vanishes under it; the twin is what travels.
+    let twin = ensureSearchSolidTwin(in: container)
+    twin.applyPalette(isDark: isDark)
+    twin.syncText(currentText)
+    twin.setLabelPose(centered: true)
+    twin.frame = slot
+    twin.alpha = 1
+    twin.layoutIfNeeded()
+    header.capsuleView.alpha = 0
+
     let ghost = ensureSearchGhost(in: container)
     ghost.applyPalette(isDark: isDark)
-    ghost.syncText(searchTextBinding?.wrappedValue ?? "")
-    ghost.frame = header.convert(header.capsuleSlotFrame, to: window)
+    ghost.syncText(currentText)
+    ghost.setLabelPose(centered: true)
+    ghost.frame = slot
     ghost.alpha = 0
     ghost.layoutIfNeeded()
+    // Glass morphs in OVER the solid twin (same frames, stacked).
+    container.bringSubviewToFront(ghost)
 
     let close = ensureSearchCloseButton(in: container)
+    container.bringSubviewToFront(close)
     let dock = searchDockFrame(in: window, narrowed: true)
     close.frame = CGRect(
       x: window.bounds.width,
@@ -4951,23 +5265,50 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 
     SearchMorphProfiler.mark("ghost flight begin")
     let spring = UISpringTimingParameters(
-      mass: 1, stiffness: 438, damping: 37.7, initialVelocity: .zero)
+      mass: 1, stiffness: 273, damping: 29.7, initialVelocity: .zero)
     let animator = UIViewPropertyAnimator(duration: 0, timingParameters: spring)
     animator.addAnimations {
+      // Twin and ghost fly the SAME path in the SAME animator — they can
+      // never be at different places, so the crossfade below is purely the
+      // input's material turning glass midway. One thing moves — and its
+      // label SLIDES center→left on the same spring (Telegram: "the label
+      // and search text is flying"), instead of crossfading between two
+      // label positions, which read as one input dying and another one
+      // appearing.
+      twin.frame = dock
+      twin.setLabelPose(centered: false)
+      twin.layoutIfNeeded()
       ghost.frame = dock
+      ghost.setLabelPose(centered: false)
       ghost.layoutIfNeeded()
       close.frame.origin.x =
         window.bounds.width - 16 - HomeSearchChrome.closeSize
     }
     animator.startAnimation()
 
-    // The ghost APPEARS MID-RUN, crossfading with the in-list capsule that is
-    // fading out as part of the list surface — the crossfade is the handoff.
+    // Twin and ghost contents slide in LOCKSTEP (same spring, same poses),
+    // so the material can crossfade DURING the travel without ever showing
+    // two labels. The solid twin stays fully opaque until the rows are
+    // nearly gone — a half-faded input let the sliding rows show through it.
     UIView.animate(
-      withDuration: 0.16, delay: 0.06,
+      withDuration: 0.26, delay: 0.06,
       options: [.beginFromCurrentState, .curveEaseInOut]
     ) {
       ghost.alpha = 1
+    }
+    UIView.animate(
+      withDuration: 0.16, delay: 0.24,
+      options: [.beginFromCurrentState, .curveEaseInOut]
+    ) {
+      twin.alpha = 0
+    }
+    // Docked = CLEAR glass, not a gray pill: the flight tint drains once the
+    // input has landed and the old surface is gone.
+    animator.addCompletion { [weak self] _ in
+      guard let self, self.presentedSearchFocus else { return }
+      UIView.animate(withDuration: 0.18) {
+        self.searchGhost?.setDockedClear(true)
+      }
     }
 
     // Keyboard AFTER the flight is committed to the render server — its ~90ms
@@ -4984,14 +5325,19 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       let ghost = searchGhost,
       ghost.superview === searchFlightContainer
     else { return }
-    let full = searchDockFrame(in: window, narrowed: false)
+    // No re-widen here anymore — the return spring animates the ghost's full
+    // frame (position and width together), so the capsule un-narrows while
+    // descending instead of dwelling at the dock first. Only the X retracts.
     let close = searchCloseButton
-    let animator = UIViewPropertyAnimator(duration: 0.12, curve: .easeOut) {
-      ghost.frame = full
-      ghost.layoutIfNeeded()
+    let animator = UIViewPropertyAnimator(duration: 0.15, curve: .easeOut) {
       close?.frame.origin.x = window.bounds.width
     }
     animator.startAnimation()
+    // The descent needs the visible flight tint back (clear glass over the
+    // black background would vanish mid-travel again).
+    UIView.animate(withDuration: 0.12) {
+      ghost.setDockedClear(false)
+    }
     // Resign AFTER this commit — dismissal stalls ~40ms on the main thread.
     DispatchQueue.main.async {
       SearchMorphProfiler.mark("keyboard dismiss request")
@@ -5001,28 +5347,72 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 
   private func beginSearchFlightReturn() {
     guard let window = view.window, let header = searchHeader,
+      let container = searchFlightContainer,
       let ghost = searchGhost,
-      ghost.superview === searchFlightContainer
+      ghost.superview === container
     else { return }
-    let target = header.convert(header.capsuleSlotFrame, to: window)
+    // The table is still slid up by the open lift when this runs; the twin
+    // must land on the slot's RESTED position (this same beat returns the
+    // table to identity), so compensate for the current translation.
+    var target = header.convert(header.capsuleSlotFrame, to: window)
+    target.origin.y -= tableView.transform.ty
+
+    // The solid twin rides back down with the ghost (same frames again) and
+    // the reverse material handoff happens mid-descent — glass turns back
+    // into the solid capsule while still moving, then lands ON the slot.
+    let twin = ensureSearchSolidTwin(in: container)
+    twin.applyPalette(isDark: isDark)
+    twin.syncText(searchTextBinding?.wrappedValue ?? "")
+    // Takes off matching the docked ghost's left-aligned layout, then the
+    // label slides back to the centered rest pose while landing.
+    twin.setLabelPose(centered: false)
+    twin.frame = ghost.frame
+    twin.alpha = 0
+    twin.layoutIfNeeded()
+    container.bringSubviewToFront(ghost)
+    if let close = searchCloseButton { container.bringSubviewToFront(close) }
+
     let spring = UISpringTimingParameters(
-      mass: 1, stiffness: 503, damping: 41.3, initialVelocity: .zero)
+      mass: 1, stiffness: 322, damping: 33.0, initialVelocity: .zero)
     let animator = UIViewPropertyAnimator(duration: 0, timingParameters: spring)
     animator.addAnimations {
       ghost.frame = target
+      ghost.setLabelPose(centered: true)
       ghost.layoutIfNeeded()
+      twin.frame = target
+      twin.setLabelPose(centered: true)
+      twin.layoutIfNeeded()
     }
     animator.addCompletion { [weak self] _ in
       SearchMorphProfiler.mark("ghost settled")
-      self?.settleSearchFlight(focused: false)
+      guard let self else { return }
+      // Landing insurance: if anything nudged layout during the descent, the
+      // precomputed target is stale by a few px — snap to the slot's CURRENT
+      // rest position inside the swap transaction, or the capsule reveal
+      // reads as a final downward shift after the input already landed.
+      if let header = self.searchHeader, let window = self.view.window {
+        var current = header.convert(header.capsuleSlotFrame, to: window)
+        current.origin.y -= self.tableView.transform.ty
+        self.searchGhost?.frame = current
+        self.searchSolidTwin?.frame = current
+      }
+      self.settleSearchFlight(focused: false)
     }
     searchReturnAnimator = animator
     animator.startAnimation()
-    // The ghost dies MID-RUN while the in-list capsule fades back in with the
-    // list surface — the reverse crossfade. Both ride the same spring, so the
-    // list can never lead the input.
+    // Reverse of the open: the solid backing fills in early (so the
+    // returning rows can never show through), while the glass drains ACROSS
+    // the descent — the material converts along the way down, not in a pop
+    // at the dock. Contents stay co-located (both slide back to center on
+    // the same spring), so the long overlap can never double the label.
     UIView.animate(
-      withDuration: 0.16, delay: 0.04,
+      withDuration: 0.18, delay: 0.0,
+      options: [.beginFromCurrentState, .curveEaseInOut]
+    ) {
+      twin.alpha = 1
+    }
+    UIView.animate(
+      withDuration: 0.30, delay: 0.06,
       options: [.beginFromCurrentState, .curveEaseInOut]
     ) {
       ghost.alpha = 0
@@ -5039,11 +5429,28 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       ghost.syncText(searchTextBinding?.wrappedValue ?? "")
       ghost.frame = searchDockFrame(in: window, narrowed: true)
       ghost.alpha = 1
+      ghost.setLabelPose(centered: false)
+      ghost.setDockedClear(true)
+      searchSolidTwin?.alpha = 0
+      searchHeader?.capsuleView.alpha = 0
+      tableView.alpha = 0
+      tableView.transform = CGAffineTransform(translationX: 0, y: -searchSurfaceLift)
     } else {
+      // The landed twin hands back to the real in-list capsule in one
+      // transaction — pixel-identical frames, invisible swap. The dissolve
+      // backing drops here too: the SwiftUI opaque background is already
+      // restored (gate-off), so the swap to clear is pixel-invisible.
       searchReturnAnimator = nil
       searchGhost?.alpha = 0
+      searchSolidTwin?.alpha = 0
+      searchHeader?.capsuleView.alpha = 1
       searchFlightContainer?.isHidden = true
       searchCloseButton?.alpha = 0
+      tableView.alpha = 1
+      tableView.transform = .identity
+      // The opaque backing STAYS — identical to the SwiftUI background
+      // behind it, so it's invisible at rest, and no settle/gate-off
+      // ordering can ever flash the sheet through the landed list.
     }
   }
 
@@ -5536,12 +5943,16 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         "hold began row=\(indexPath.row) point=\(NSCoder.string(for: point))"
       )
 
-      // The press reads in real time: the card sinks slowly for the whole hold
-      // window instead of popping to a settled scale. easeIn + the lead-in
-      // delay make the first ~150ms visually silent, so a quick tap never
-      // flashes the depress. When the sink lands, the expansion fires directly
-      // from that state — no second beat.
-      let depress = UIViewPropertyAnimator(duration: 0.35, curve: .easeIn) {
+      // This is a hold now, not a tap: the tap highlight leaves the card the
+      // moment the hold is recognized. Letting it linger into the depress made
+      // it settle under the sinking card and flicker out mid-hold.
+      cell.setPressOverlaySuppressed(true, animated: true)
+
+      // The hold is already recognized (finger still for 0.12s) — the card
+      // sinks for the commit window, easeIn keeping the first frames gentle.
+      // A released tap never reaches here at all: minimumPressDuration gates
+      // the entire hold path. Commit lands at ~0.42s from touch-down.
+      let depress = UIViewPropertyAnimator(duration: 0.30, curve: .easeIn) {
         cell.transform = self.previewHoldOriginalTransform.scaledBy(x: 0.95, y: 0.95)
       }
       depress.addCompletion { [weak self, weak recognizer, weak cell] position in
@@ -5584,11 +5995,10 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         )
       }
       previewDepressAnimator = depress
-      depress.startAnimation(afterDelay: 0.10)
+      depress.startAnimation()
 
-      // The moment the hold visibly engages: the tap highlight leaves the card
-      // (it is a hold now, not a tap — and it must not be baked into the
-      // expansion snapshot) and a soft tick confirms the grab. Cancelled
+      // The moment the hold visibly engages, a soft tick confirms the grab
+      // (the tap highlight was already suppressed at recognition). Cancelled
       // holds/taps never reach this.
       let engagement = DispatchWorkItem { [weak self, weak cell] in
         guard
@@ -5598,13 +6008,12 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
           !self.previewHoldCommitted
         else { return }
         self.previewHoldEngagement = nil
-        cell.setPressOverlaySuppressed(true, animated: true)
         UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.7)
       }
       previewHoldEngagement = engagement
-      // Late enough that even a slow tap has lifted; early enough that the
-      // highlight is long gone before the expansion snapshot is taken.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: engagement)
+      // ~0.18s from touch-down (0.12 recognition + 0.06): even a slow tap has
+      // lifted, and the highlight is long gone before the expansion snapshot.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: engagement)
 
       // Build + lay out the chat preview during the hold, on the next runloop
       // turn so the depress animation is already committed to the render
@@ -5786,8 +6195,12 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         // The original row disappears only in the transaction that paints the
         // overlay's snapshot at the same spot. Hiding it at present() time left
         // a black hole in the list for the frames UIKit needs to actually
-        // mount the presentation.
+        // mount the presentation. The depress scale resets HERE, invisibly —
+        // leaving it applied made the dismiss morph target a 0.95-scaled slot
+        // and settled the row scaled-down under the landing card (bad
+        // crossfade).
         sourceCell?.isHidden = true
+        sourceCell?.transform = originalTransform
       },
       onDismiss: { [weak self] in
         guard let self else { return }
@@ -5802,15 +6215,10 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
           visibleCell.setPressOverlaySuppressed(false, animated: false)
         }
         guard let visibleSourceCell else { return }
-        UIView.animate(
-          withDuration: 0.22,
-          delay: 0,
-          usingSpringWithDamping: 0.88,
-          initialSpringVelocity: 0,
-          options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
-        ) {
-          visibleSourceCell.transform = originalTransform
-        }
+        // Scale was already reset invisibly at onFirstFrame; enforce identity
+        // instantly for reused cells — an animated settle here left the row
+        // still moving under the landing card (bad crossfade).
+        visibleSourceCell.transform = originalTransform
       }
     )
     overlay.modalPresentationStyle = .overFullScreen
@@ -5851,13 +6259,9 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       isEditSelected: selectedChatIDs.contains(row.chatId),
       showsRightCheckmark: showsRightCheckmark
     )
-    if presentedSearchFocus {
-      cell.alpha = 0
-      cell.transform = CGAffineTransform(translationX: 0, y: -18)
-    } else {
-      cell.alpha = 1
-      cell.transform = .identity
-    }
+    // Search pose lives on the TABLE (one dissolving surface), never on cells.
+    cell.alpha = 1
+    cell.transform = .identity
     cell.isHidden = row.chatId == activePreviewChatID
     return cell
   }
@@ -6287,6 +6691,7 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
   private var didAnimateIn = false
   private var presentationAnimator: UIViewPropertyAnimator?
   private var chromeFadeAnimator: UIViewPropertyAnimator?
+  private var backdropFadeAnimator: UIViewPropertyAnimator?
   private var didFinishDismissal = false
   private var dismissStartedAt: CFTimeInterval?
   private var ignoreBackdropTapUntil: CFTimeInterval = 0
@@ -6671,7 +7076,7 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     let container = previewContainerView
     let content: UIView = previewController.view
     let menu = menuView
-    let animator = UIViewPropertyAnimator(duration: 0.16, curve: .easeIn) {
+    let animator = UIViewPropertyAnimator(duration: 0.14, curve: .easeIn) {
       container.frame = collapsedContainerFrame
       content.alpha = 0
       menu.transform = CGAffineTransform(scaleX: 0.45, y: 0.45)
@@ -6680,6 +7085,16 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     }
     let chromeAnimator = UIViewPropertyAnimator(duration: 0.08, curve: .easeIn) {
       snapshot.alpha = 1
+    }
+    // Backdrop rides the collapse OUT: blur radius → 0 (animating the effect,
+    // never a visual-effect view's alpha) + tint → clear. It used to stay
+    // fully dimmed for the whole collapse and pop off at the end — the slow,
+    // abrupt-feeling dismissal.
+    let glass = backgroundGlassView
+    let tint = colorOverlayView
+    let backdropAnimator = UIViewPropertyAnimator(duration: 0.14, curve: .easeIn) {
+      glass.effect = nil
+      tint.alpha = 0
     }
     animator.addCompletion { [weak self] position in
       guard let self else { return }
@@ -6691,8 +7106,10 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     }
     presentationAnimator = animator
     chromeFadeAnimator = chromeAnimator
+    backdropFadeAnimator = backdropAnimator
     animator.startAnimation()
-    chromeAnimator.startAnimation(afterDelay: 0.07)
+    backdropAnimator.startAnimation()
+    chromeAnimator.startAnimation(afterDelay: 0.06)
   }
 
   private func finishDismissal(action: (() -> Void)?) {
@@ -6702,6 +7119,7 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     // a retained overlay means a retained live ChatMainView burning CPU.
     presentationAnimator = nil
     chromeFadeAnimator = nil
+    backdropFadeAnimator = nil
     let elapsed = dismissStartedAt.map { CACurrentMediaTime() - $0 } ?? 0
     previewDebugLog("dismiss finish elapsed=\(String(format: "%.3f", elapsed))")
     onDismiss()
@@ -6990,6 +7408,11 @@ private final class ChatHomeMiniPreviewController: UIViewController {
     mainView.setExternalNavigationHeaderEnabled(false)
     mainView.setPreviewHeaderCenterOnly(false)
     mainView.setPreviewHeaderCompactLeading(true)
+    // The preview only ever shows the resting tail. Its narrower width misses
+    // every cached transcript height, so the progressive warmup would re-measure
+    // the whole conversation on the main thread (~30s of churn per hold) right
+    // under the open/dismiss springs — for heights nobody will ever see.
+    mainView.setProgressiveHeightWarmupSuppressed(true)
     mainView.setAppearance(Self.previewAppearance(isDark: isDark))
     mainView.surfaceId = "home_preview_\(row.chatId)"
     mainView.setEngineSurfaceId(mainView.surfaceId)

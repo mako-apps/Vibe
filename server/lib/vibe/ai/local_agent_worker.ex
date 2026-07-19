@@ -914,10 +914,10 @@ defmodule Vibe.AI.LocalAgentWorker do
   @doc """
   Pick the responsible lead for a supervisor team run.
 
-  Preference: Codex → Claude → Grok → Agy among members present.
+  Preference: Claude → Codex → Grok → Agy among members present.
   """
   def pick_supervisor_lead(workers) when is_list(workers) do
-    preferred = ["codex", "claude", "grok", "agy"]
+    preferred = ["claude", "codex", "grok", "agy"]
 
     Enum.find_value(preferred, fn handle ->
       Enum.find(workers, &(&1.handle == handle))
@@ -1459,7 +1459,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   @doc """
   Persist a coordinated bridge team run and return the lead worker.
 
-  Default mode is supervisor (Codex-preferred lead). Set opts `mode: "sequential"`
+  Default mode is supervisor (Claude-preferred lead). Set opts `mode: "sequential"`
   or env `VIBE_TEAM_MODE=sequential` for the legacy chain.
   """
   def register_bridge_team_run(

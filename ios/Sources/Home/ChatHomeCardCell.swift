@@ -103,6 +103,7 @@ final class ChatHomeCardCell: UITableViewCell {
   private var isPerformingSwipeAction = false
   private var didEmitLargeSwipeHaptic = false
   private var suppressesPressOverlay = false
+  private var swipeSurfaceColor = UIColor.clear
   private var leadingDisplaySpecs: [ChatHomeSwipeActionSpec] = []
   private var trailingDisplaySpecs: [ChatHomeSwipeActionSpec] = []
   private var leadingActionButtons: [ChatHomeSwipeActionButton] = []
@@ -334,6 +335,11 @@ final class ChatHomeCardCell: UITableViewCell {
     )
     pressOverlayView.backgroundColor = pressedColor
     dividerView.backgroundColor = dividerColor
+    // SwiftUI-List-style swipe surface: while displaced, the row becomes an
+    // opaque elevated card (secondary background) instead of a transparent
+    // slab the action tiles show through.
+    swipeSurfaceColor = isDark ? UIColor(white: 0.12, alpha: 1) : UIColor.white
+    updateSwipeChrome()
     // Capture identity before swipe config overwrites `currentRow`.
     let previousChatId = currentRow?.chatId
     let previousAvatarKey = lastAvatarURLString
@@ -1138,6 +1144,7 @@ final class ChatHomeCardCell: UITableViewCell {
       self.dividerView.transform = transform
       self.rowContentContainer.transform = transform
       self.editSelectionContainer.transform = transform
+      self.updateSwipeChrome()
       self.layoutSwipeActionViews()
     }
 
@@ -1152,6 +1159,19 @@ final class ChatHomeCardCell: UITableViewCell {
     } else {
       updates()
     }
+  }
+
+  /// SwiftUI-List-style swipe chrome: while the row is displaced it becomes an
+  /// OPAQUE rounded card (secondary background + continuous corners animating
+  /// with the same transaction) sliding over the action tiles. A
+  /// clear-background row read as transparent — the actions showed through
+  /// the content itself.
+  private func updateSwipeChrome() {
+    let active = abs(swipeOffset) > 0.5
+    rowContentContainer.layer.cornerCurve = .continuous
+    rowContentContainer.layer.cornerRadius = active ? 22 : 0
+    rowContentContainer.layer.masksToBounds = active
+    rowContentContainer.backgroundColor = active ? swipeSurfaceColor : .clear
   }
 
   private func closeSwipe(animated: Bool, notifyDelegate: Bool) {

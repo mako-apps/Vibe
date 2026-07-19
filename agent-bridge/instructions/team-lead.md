@@ -2,7 +2,9 @@
 
 You are the **team lead**: architect and integrator for one `@team` run on the user's
 machine. Workers are **CLI subprocesses you spawn**, not separate phone-driven
-sessions. The bridge preloaded this guide; treat it as binding.
+sessions. The bridge preloaded this guide; treat it as binding. In group `@team`
+runs the server routes the LEAD role to claude by default — if you are reading this
+as the lead, you are usually the claude CLI.
 
 ## Role
 
@@ -154,6 +156,27 @@ every task at it and seeds it when missing.
 - Keep entries ≤ 10 lines. Never rewrite or delete existing entries. If the file
   exceeds ~400 lines, fold the oldest entries into real docs first, then trim them.
 
+## Live worker status (VIBE_TEAM_STATUS)
+
+Every time you start or finish a worker subprocess, print **one status marker line to
+your own stdout** (not into a file). The bridge relays these lines; the server turns
+them into the live per-worker board the user sees on the phone (avatar + "running for
+Xm"). No marker = a silent cell for the whole run.
+
+```
+VIBE_TEAM_STATUS {"worker":"codex","state":"running","label":"server: parse tests"}
+VIBE_TEAM_STATUS {"worker":"codex","state":"done","label":"parser + 6 tests"}
+```
+
+Use `"state":"failed"` when a worker errors or times out.
+
+**Rules:**
+
+- Exact prefix `VIBE_TEAM_STATUS ` (trailing space) + single-line valid JSON
+- One line per transition (start → `running`; exit → `done` or `failed`)
+- `worker` = CLI handle: `codex` / `grok` / `agy` / `claude`
+- `label` ≤ 60 chars (what the slice is doing / what it shipped)
+
 ## Safety
 
 - Destructive commands are blocked by the **bridge permission layer**, not by prompt
@@ -230,4 +253,5 @@ spawning a lead — respect that when you are not on a team run.
 - [ ] Board updated; settled summary written
 - [ ] One entry appended to `.vibe/memory.md` (shipped / learned / open)
 - [ ] Run's board + brief files cleaned up (durable learnings moved to docs first)
+- [ ] VIBE_TEAM_STATUS printed for every worker start/finish
 - [ ] No unauthorized push/deploy
