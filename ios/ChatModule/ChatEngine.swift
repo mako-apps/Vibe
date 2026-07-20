@@ -11375,6 +11375,37 @@ final class ChatEngine {
           "[ChatEngine] backfillNewest OK chatId=%@ trigger=%@ fetched=%d ins=%d upd=%d retiredLive=%d",
           String(chatId.prefix(12)), trigger, remoteRows.count,
           delta.insertedIds.count, delta.updatedIds.count, retiredLiveIds.count)
+        // [BackfillReinsert] "The previous cell jumps a beat after the new one."
+        // Prime suspect: the server echoes a just-sent message back through this
+        // backfill and ingest counts it as a NEW durable row (it was previously only
+        // an OPTIMISTIC row in liveMessageRowsByChat, a separate store this delta
+        // doesn't see) — so postChatDelta fires inserted:[thatId] ~0.6s post-send and
+        // the list re-inserts/re-slots it. For every inserted id, name whether it is
+        // also a live optimistic row (liveDup=Y ⇒ this is the sent message, not a new
+        // one) and whether its slot timestamp CHANGED between the optimistic copy and
+        // the durable copy (liveTs→durableTs) — a ts change is what makes it re-sort
+        // into a different slot and drag its neighbor. retiredLive only covers agent
+        // stream rows, so a plain text send always shows liveDup=Y here.
+        if !delta.insertedIds.isEmpty {
+          let liveForChat = self.liveMessageRowsByChat[chatId] ?? [:]
+          let durableById = Dictionary(
+            remoteRows.compactMap { row -> (String, [String: Any])? in
+              guard let mid = self.messageId(fromRow: row) else { return nil }
+              return (mid, row)
+            }, uniquingKeysWith: { _, last in last })
+          let insDetail = delta.insertedIds.map { id -> String in
+            let liveRow = liveForChat[id]
+            let liveDup = liveRow != nil
+            let liveTs = liveRow.map { self.messageTimestampMs(fromRow: $0) } ?? -1
+            let durableTs = durableById[id].map { self.messageTimestampMs(fromRow: $0) } ?? -1
+            let tsMoved = liveDup && liveTs != durableTs
+            return
+              "\(id.suffix(6)){live=\(liveDup ? "Y" : "N") ts=\(liveTs)->\(durableTs)\(tsMoved ? " MOVED" : "")}"
+          }.joined(separator: ",")
+          NSLog(
+            "[BackfillReinsert] chatId=%@ ins=[%@] liveRows=%d",
+            String(chatId.prefix(12)), insDetail, liveForChat.count)
+        }
         self.appendJournalLocked(
           event: "native-chat-backfill-ok",
           payload: [

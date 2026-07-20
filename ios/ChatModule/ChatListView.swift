@@ -6802,6 +6802,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     let safeReloads = reloads.filter { $0.item >= 0 && $0.item < previousRows.count }
 
+    // [PostSend] "The previous cell jumps a beat AFTER the new message lands."
+    // Root suspect: the backfillNewest echo of a just-sent message re-inserts /
+    // re-slots it ~0.6s later, and THAT second setRows moves the list after the
+    // send morph has already completed — so hasPendingSend is false and none of the
+    // [SendShift] audits (which gate on a pending send) fire. Capture the geometry
+    // of any own-message insert/reload settle at whichever exit path runs, so the
+    // device log shows whether the list actually SCROLLED (offset moved), GREW (a
+    // genuine duplicate durable row was added → contentH jumps by ~one bubble), or
+    // merely reloaded in place (offset & contentH unchanged = harmless).
+    let meInsertKeys = insertions.compactMap {
+      $0.item < parsed.count && parsed[$0.item].isMe ? parsed[$0.item].key : nil
+    }
+    let meReloadKeys = safeReloads.compactMap {
+      $0.item < previousRows.count && previousRows[$0.item].isMe ? previousRows[$0.item].key : nil
+    }
+    let postSendPreContentH = collectionView.contentSize.height
+    let logPostSendSettle: (String) -> Void = { [weak self] path in
+      guard let self, !meInsertKeys.isEmpty || !meReloadKeys.isEmpty else { return }
+      let pendingSend = self.pendingSendTransition != nil || self.activeSendTransition != nil
+      NSLog(
+        "[PostSend] settle path=%@ pendingSend=%@ group=%@ offset=%.0f→%.0f contentH=%.0f→%.0f "
+          + "ins=%d reload=%d meIns=[%@] meReload=[%@]",
+        path, pendingSend ? "Y" : "N", self.isGroupOrChannel ? "Y" : "N",
+        previousContentOffsetY, self.collectionView.contentOffset.y,
+        postSendPreContentH, self.collectionView.contentSize.height,
+        insertions.count, safeReloads.count,
+        meInsertKeys.map { String($0.suffix(6)) }.joined(separator: ","),
+        meReloadKeys.map { String($0.suffix(6)) }.joined(separator: ","))
+    }
+
     // Cached history is a strict PREPEND, not a live-message insertion. Routing it
     // through the generic finalize path reconfigures visible cells, recalculates normal
     // bottom/send behavior, then writes the offset after layout. During an active drag
@@ -7078,6 +7108,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       emitViewport(force: true)
       finishRowsUpdate(historyRevealCompleted: isHistoryRevealPrepend)
       maybeStartPendingSendTransition()
+      logPostSendSettle("reconfigure")
       chatListUITrace(
         "ChatListView setRows content-reconfigure chatId=\(traceChatId.isEmpty ? "<empty>" : String(traceChatId.prefix(12))) reloads=\(safeReloads.count) durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000))"
       )
@@ -7340,6 +7371,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // and resets it in the completion handler.
       scrollToBottom(animated: true)
 
+      logPostSendSettle("animScrollInsert")
       updateDebugStats(shifted: 0, newSlide: 0, maxDelta: 0, scrollDelta: 0)
       return
     }
@@ -7624,6 +7656,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Safety net: ensure the send overlay starts even if the attempt
     // inside finalize failed (e.g. cell wasn't laid out yet).
     maybeStartPendingSendTransition()
+    logPostSendSettle("batchEnd")
   }
 
   /// Keep the inline agent-turn bubble's per-row UI state in sync with the live row set:
