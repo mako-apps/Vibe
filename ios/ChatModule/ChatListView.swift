@@ -7113,6 +7113,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         for indexPath in decoratePaths.sorted(by: { $0.item < $1.item }) {
           guard indexPath.item < rows.count else { continue }
           if let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell {
+            // A cell mid-send-slide carries an additive `insertionShift` (existing
+            // cell riding up) or `insertSlideUp` (the new cell) animation. This path
+            // runs for EVERY content reload — including the just-sent cell's own
+            // sending→sent status flip mid-flight — and it expands to item±1, so it
+            // re-decorates the reloaded PREVIOUS cell while it is still sliding. The
+            // removeAllAnimations() below then strips that ride and SNAPS the cell to
+            // its final slot ~250ms before its neighbors finish, so it briefly overlaps
+            // the cell above it (the "previous cell jumps a few px on send" the
+            // [SendFlight] sampler pinned: reloaded neighbor at final while everyone
+            // else was mid-slide). Leave mid-flight cells alone — they were already
+            // decorated correctly in the send batch and settle on their own. Only ever
+            // skips during a live send; no other path has these animations in flight.
+            if cell.layer.animation(forKey: "insertionShift") != nil
+              || cell.layer.animation(forKey: "insertSlideUp") != nil
+            {
+              continue
+            }
             let row = rows[indexPath.item]
             cell.applyAppearance(appearance)
             configureMessageCell(cell, at: indexPath, row: row)
