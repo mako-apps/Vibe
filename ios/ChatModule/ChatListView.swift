@@ -699,6 +699,10 @@ private let chatListSendVerticalTiming = CAMediaTimingFunction(
 )
 private let chatReactionDebugLogs = true
 private let chatGapDebugOverlayEnabled = false
+/// Presentation-layer sampling of the last cells across a send flight (see
+/// startSendFlightSampler). Diagnostic-only; the reported jump is mid-animation, which
+/// no settle-time log can capture.
+private let chatListSendFlightSamplerEnabled = true
 
 public final class ChatListView: UIView, UICollectionViewDataSource,
   UICollectionViewDelegateFlowLayout
@@ -7643,6 +7647,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           NSLog(
             "[SendShift] rides group=%@ dur=%.2f scrollΔ=%.0f %@",
             isGroupOrChannel ? "Y" : "N", animDuration, dbgScrollDelta, rides)
+          // Settle geometry is provably clean (see [BubbleFrames]), so the reported
+          // jump lives INSIDE the 0.36s flight. Sample the actual PRESENTATION-layer
+          // positions of the last cells across the animation so a transient negative
+          // gap (the reloaded previous cell riding ahead of its neighbor) is caught in
+          // motion, which no settle-time log can see.
+          startSendFlightSampler(reason: "send", duration: animDuration)
         }
 
         // --- Pass 3: keep floating sender avatars glued to their run ---
@@ -7684,6 +7694,52 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // inside finalize failed (e.g. cell wasn't laid out yet).
     maybeStartPendingSendTransition()
     logPostSendSettle("batchEnd")
+  }
+
+  /// Samples the PRESENTATION-layer position of the last few message cells across a send
+  /// flight. Every settle-time log shows the final layout clean, so the reported "previous
+  /// cell jumps / overlaps" must be a transient DURING the 0.36s animation — the reloaded
+  /// previous cell's additive ride briefly diverging from its un-reloaded neighbor. The
+  /// presentation layer is the only place that value is visible mid-animation. Each sample:
+  /// key top=<animated top in content coords> gap=<to previous bubble's bottom>, a trailing
+  /// `!` when the gap goes negative (the overlap, caught in motion) plus the live offset.
+  private func startSendFlightSampler(reason: String, duration: CFTimeInterval) {
+    guard chatListSendFlightSamplerEnabled else { return }
+    let keys =
+      collectionView.indexPathsForVisibleItems
+      .sorted { $0.item < $1.item }
+      .suffix(4)
+      .compactMap { ip -> String? in
+        ip.item < rows.count && rows[ip.item].kind == .message ? rows[ip.item].key : nil
+      }
+    guard !keys.isEmpty else { return }
+    let startedAt = ProcessInfo.processInfo.systemUptime
+    let lastMs = Int((duration + 0.06) * 1000.0)
+    for ms in stride(from: 0, through: lastMs, by: 45) {
+      DispatchQueue.main.asyncAfter(deadline: .now() + Double(ms) / 1000.0) { [weak self] in
+        guard let self else { return }
+        let t = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000.0)
+        var parts: [String] = []
+        var prevBottom: CGFloat = -.greatestFiniteMagnitude
+        for key in keys {
+          guard let idx = self.rows.firstIndex(where: { $0.key == key }),
+            let cell = self.collectionView.cellForItem(at: IndexPath(item: idx, section: 0))
+          else { continue }
+          let pres = cell.layer.presentation() ?? cell.layer
+          let top = pres.position.y - pres.bounds.height / 2.0
+          let bottom = top + pres.bounds.height
+          let gap = prevBottom == -.greatestFiniteMagnitude ? 0.0 : top - prevBottom
+          parts.append(
+            String(
+              format: "%@ top=%.1f gap=%.1f%@", String(key.suffix(6)), top, gap,
+              gap < -0.5 ? "!" : ""))
+          prevBottom = bottom
+        }
+        NSLog(
+          "[SendFlight] %@ +%dms off=%.1f %@", reason, t,
+          self.collectionView.contentOffset.y, parts.joined(separator: " "))
+      }
+    }
   }
 
   /// Keep the inline agent-turn bubble's per-row UI state in sync with the live row set:
