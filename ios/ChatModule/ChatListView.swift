@@ -10659,31 +10659,45 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let aspectHeight = displayWidth * CGFloat(mediaHeight / mediaWidth)
       return min(360.0, max(148.0, aspectHeight))
     case .text:
+      // A plain text bubble measures with pure text metrics — the very same
+      // NSAttributedString.boundingRect the estimate below would run — so estimating
+      // it saves nothing, and the estimate was WRONG: it padded by 32pt where the
+      // real bubble pads by bubbleTopPadding + bubbleBottomPadding (15pt) and floored
+      // at 48 vs the real 36. That systematic +16pt is what made every send shift
+      // twice. On send the batch is ins:1 reload:1 — the new row AND the previously
+      // last row (it loses its tail once it stops being last, so it fails
+      // chatListRowContentEqual) both miss the height caches, both get sized 16pt too
+      // tall, the insert pushes the list by the inflated delta, and then the
+      // progressive warmup re-measures exact and yanks it back. Measuring exactly here
+      // also seeds messageHeightCache, so hasExactProgressiveHeight is already true and
+      // the warmup skips the row entirely — no correction pass, no second movement.
+      // Agent turns keep the estimate: theirs is the measurement that genuinely costs
+      // (full progress-payload parse + offscreen Auto Layout pass).
+      if !bubbleUsesAgentTurnContent(row) {
+        let metrics = measureMessageBubbleLayout(
+          row: row, rowWidth: rowWidth, agentTurnState: state
+        )
+        let height = metrics.bubbleHeight + metrics.tallOuterToggleReserve
+        messageHeightCache[row.key] = RowHeightCacheEntry(
+          row: row, rowWidth: rowWidth, state: state, height: height)
+        return height
+      }
       let text = (row.plainContent ?? row.text)
         .trimmingCharacters(in: .whitespacesAndNewlines)
       if text.isEmpty { return 52.0 }
-      let textWidth = max(
-        120.0,
-        bubbleUsesAgentTurnContent(row)
-          ? rowWidth - 54.0
-          : min(300.0, rowWidth * 0.72)
-      )
+      let textWidth = max(120.0, rowWidth - 54.0)
       let measured = (text as NSString).boundingRect(
         with: CGSize(width: textWidth, height: 10_000.0),
         options: [.usesLineFragmentOrigin, .usesFontLeading],
         attributes: [.font: UIFont.systemFont(ofSize: 16.0)],
         context: nil
       ).height
-      if bubbleUsesAgentTurnContent(row) {
-        let characterHeight = CGFloat((text.count + 27) / 28) * 22.0 + 72.0
-        let progressHeight = CGFloat(min(4, row.agentProgressNodes.count)) * 28.0
-        return min(
-          430.0,
-          max(86.0, max(measured + 64.0, characterHeight + progressHeight))
-        )
-      }
-      let replyHeight: CGFloat = row.replyToId == nil ? 0.0 : 42.0
-      return min(430.0, max(48.0, measured + 32.0 + replyHeight))
+      let characterHeight = CGFloat((text.count + 27) / 28) * 22.0 + 72.0
+      let progressHeight = CGFloat(min(4, row.agentProgressNodes.count)) * 28.0
+      return min(
+        430.0,
+        max(86.0, max(measured + 64.0, characterHeight + progressHeight))
+      )
     }
   }
 
