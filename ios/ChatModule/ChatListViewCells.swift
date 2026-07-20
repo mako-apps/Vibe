@@ -1222,17 +1222,35 @@ final class BubbleBackgroundView: UIView {
       width: width, height: height, radius: radius,
       curvature: appearance.messageTailCurvature, onRight: onRight)
 
+    // The morph plate is captured with the tail SUPPRESSED, which bakes the
+    // bottom-trailing corner as a rounded arc at THIS radius (br / bl). The tail
+    // cubics, however, are scaled by `radius` = the bubble's MAX corner — so a
+    // straight chord back from bottomJoin runs INSIDE the plate's arc and the
+    // arc's bulge is covered by neither piece: the ~sub-pixel crescent the user
+    // sees as a "tiny gap where the tail meets the body" (the radius mismatch).
+    // Closing the lobe along the SAME arc the plate baked makes lobe.innerEdge ≡
+    // plate.outerEdge, so plate ∪ lobe reconstructs the real bubble with no gap
+    // and without overfilling the concave notch (which sits just outside the arc).
+    let plateCornerRadius = min(
+      max(0.0, onRight ? shape.borderBottomRightRadius : shape.borderBottomLeftRadius),
+      radiusLimit)
     let path = UIBezierPath()
     if onRight {
       path.move(to: geometry.outerStart)
       appendTelegramReferenceTailCurves(onRight: true, geometry: geometry, to: path)
+      path.addLine(to: CGPoint(x: width - plateCornerRadius, y: height))
+      path.addArc(
+        withCenter: CGPoint(x: width - plateCornerRadius, y: height - plateCornerRadius),
+        radius: plateCornerRadius, startAngle: .pi / 2, endAngle: 0.0, clockwise: false)
+      // close() runs the right edge from (width, height-plateCornerRadius) up to outerStart
     } else {
       path.move(to: geometry.bottomJoin)
       appendTelegramReferenceTailCurves(onRight: false, geometry: geometry, to: path)
+      path.addLine(to: CGPoint(x: plateCornerRadius, y: height))
+      path.addArc(
+        withCenter: CGPoint(x: plateCornerRadius, y: height - plateCornerRadius),
+        radius: plateCornerRadius, startAngle: .pi / 2, endAngle: .pi, clockwise: true)
     }
-    // The lobe snapshot may overlap the tail-suppressed rounded plate; it only needs
-    // to cover the reference tail's added pixels. A direct close keeps this mask on the
-    // exact cubic contour without reintroducing a mismatched synthetic corner arc.
     path.close()
     return path
   }
@@ -6560,6 +6578,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   // list cell). The cell only exposes an anchor via `tallToggleAnchor`.
   private var tallToggleRowMessageId: String?
   private var lastBubbleFrame: CGRect = .zero
+  /// The bubble's last laid-out frame in CELL coordinates. Exposed read-only so the
+  /// list can dump bubble-vs-cell geometry when diagnosing a visual overlap that the
+  /// cell-frame logs (which only see cell heights) can't explain: the bubble is
+  /// bottom-aligned and drawn UNCLIPPED, so a bubble taller than its cell spills into
+  /// the neighbor even though the cell frames themselves don't overlap.
+  var renderedBubbleFrameInCell: CGRect { lastBubbleFrame }
   private var lastTallToggleVisible = false
   private var lastTallCollapsed = false
   private var tallContentAnimationGeneration: UInt = 0

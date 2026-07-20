@@ -6830,6 +6830,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         insertions.count, safeReloads.count,
         meInsertKeys.map { String($0.suffix(6)) }.joined(separator: ","),
         meReloadKeys.map { String($0.suffix(6)) }.joined(separator: ","))
+      // [BubbleFrames] The user's screenshot shows the last bubble OVERLAPPING the one
+      // above it, yet cell heights + contentH are clean — so the overlap is inside the
+      // cells: the bubble is bottom-aligned and unclipped, so a bubble taller than its
+      // cell spills into the neighbor. Dump the last few message cells' absolute bubble
+      // top/bottom (cell.minY + bubbleFrameInCell) so a NEGATIVE gap between one bubble's
+      // bottom and the next bubble's top is the overlap, in points, naming the culprit.
+      let visible = self.collectionView.indexPathsForVisibleItems.sorted { $0.item < $1.item }
+      var prevBubbleBottom: CGFloat = -.greatestFiniteMagnitude
+      var prevKey = ""
+      for ip in visible.suffix(6) {
+        guard ip.item < self.rows.count, self.rows[ip.item].kind == .message,
+          let attr = self.collectionView.layoutAttributesForItem(at: ip),
+          let cell = self.collectionView.cellForItem(at: ip) as? ChatListCell
+        else { continue }
+        let bf = cell.renderedBubbleFrameInCell
+        let bubbleTop = attr.frame.minY + bf.minY
+        let bubbleBottom = bubbleTop + bf.height
+        let key = String(self.rows[ip.item].key.suffix(6))
+        let gap = prevBubbleBottom == -.greatestFiniteMagnitude ? 0 : bubbleTop - prevBubbleBottom
+        NSLog(
+          "[BubbleFrames] %@ cellY=%.1f cellH=%.1f bubY=%.1f bubH=%.1f absTop=%.1f absBot=%.1f gapToPrev=%.1f%@",
+          key, attr.frame.minY, attr.frame.height, bf.minY, bf.height,
+          bubbleTop, bubbleBottom, gap,
+          (gap < -0.5 && !prevKey.isEmpty) ? " OVERLAP(\(prevKey))" : "")
+        prevBubbleBottom = bubbleBottom
+        prevKey = key
+      }
     }
 
     // Cached history is a strict PREPEND, not a live-message insertion. Routing it
