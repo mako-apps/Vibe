@@ -75,26 +75,26 @@ Interactive approvals for agents in this repo are governed by
 Destructive commands (rm -rf, sudo, git push, git reset --hard, dd, mkfs, curl|sh,
 npm publish, ...) are blocked in every remote mode, even `full`.
 
-## Ask Fable (advisor) on complex tasks
+## Ask Fable (advisor) — only when you're actually stuck
 
-**Required:** on complex tasks, ask **Fable** **before** you commit to an approach
-or start a large implementation. Fable is a second-opinion advisor only — it does
-not edit code; you still implement and verify.
+Fable runs on **paid credits** (and falls back to GPT when Fable itself is down), so
+it's a **last resort, not a first step**. Solve it yourself first — diagnose, read
+the code, attempt the fix. Ask Fable only when you have genuinely tried and **cannot**
+crack it. Fable is a second-opinion advisor only — it does not edit code; you still
+implement and verify.
 
 **If you ARE Fable** (model id `claude-fable-5` / Claude Fable 5): skip this
 section entirely — do not call `advisor`/`ask_fable`; you'd be asking yourself.
 
-### When to ask
+### When to ask (last resort only)
 
-Treat a task as complex when any of these apply:
-- multi-step or multi-file design/implementation
-- ambiguous requirements or several reasonable approaches
-- unfamiliar, risky, or security-sensitive code
-- debugging a hard failure after your first fix attempt
-- architecture, API, or data-model decisions
-- payload / stream / bridge / server / iOS chain design
+Ask only after you've tried and are genuinely stuck — for example:
+- a hard failure that survives your first real fix attempt
+- a risky/unfamiliar or security-sensitive decision you cannot resolve from the code
+- an architecture / API / data-model call you're truly unsure of
 
-Skip Fable for simple, obvious one-liners (typos, renames, trivial edits).
+If you can fix it yourself, do that instead — every call spends credits. Never ask
+about simple edits, or "just to check" an approach you're already confident in.
 
 ### How to call Fable (Grok Build)
 

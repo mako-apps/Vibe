@@ -27,10 +27,15 @@ Interactive approvals for Claude Code in this repo are governed by
 Destructive commands (rm -rf, sudo, git push, git reset --hard, dd, mkfs, curl|sh,
 npm publish, ...) are blocked in every remote mode, even `full`.
 
-## Ask Fable (advisor) on complex tasks
+## Ask Fable (advisor) — only when you're actually stuck
 
-**Required** on complex tasks (multi-step, ambiguous, unfamiliar/risky, hard debug,
-architecture). Skip for simple one-liners.
+Fable runs on **paid credits** (and falls back to GPT when Fable itself is down),
+so it's a **last resort, not a first step**. Solve it yourself first — diagnose,
+read the code, attempt the fix. Reach for Fable only when you have genuinely tried
+and **cannot** crack it: a hard bug that survives your first fix, a risky/unfamiliar
+call you can't resolve from the code, or an architecture decision you're truly
+unsure of. Do NOT call it just because a task looks complex or multi-step — if you
+can fix it, fix it, then move on.
 
 **If you ARE Fable** (model id `claude-fable-5` / Claude Fable 5): do NOT call the
 advisor or `ask_fable` — you'd be asking yourself. Just proceed with the task.
@@ -56,7 +61,7 @@ Default package budget is ~24k chars (`VIBE_FABLE_MCP_CONTEXT_CHARS`). Do not
 paste whole files or re-ask with the same dump.
 
 Full how-to (response path + optimise tips): see [Agents.md](Agents.md)
-→ **Ask Fable (advisor) on complex tasks**.
+→ **Ask Fable (advisor)**.
 
 ## Complex task? Diagnose yourself, then dispatch worker CLIs
 
