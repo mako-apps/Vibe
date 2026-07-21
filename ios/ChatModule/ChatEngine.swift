@@ -504,9 +504,10 @@ final class ChatEngine {
   // independently so opening a transcript cannot evict the rows used by the
   // History screen on its next appearance.
   private var agentBridgeHistoryListByChatProvider: [String: [String: Any]] = [:]
-  // Request ids for history LIST reads sent over the direct LAN link, awaiting a LAN
+  // Request ids for history reads sent over the direct LAN link, awaiting their first LAN
   // reply. If the reply lands the id is removed; a 2s fallback re-issues over cloud so a
-  // silent LAN drop never leaves the History view empty.
+  // silent LAN drop never leaves either the History list or a transcript empty. Detail
+  // watcher re-pushes keep working through the separate live-ingest request-id mapping.
   private var lanHistoryPendingRequestIds: Set<String> = []
   // History can be requested while the native chat topic is still joining. Keep
   // those wire payloads here and flush them on the successful JOIN instead of
@@ -2120,34 +2121,49 @@ final class ChatEngine {
         wirePayload["computerId"] = computerId
       }
 
-      // Direct-LAN fast path for LIST reads: idempotent, needs no server persistence, and
-      // works even before the cloud socket is up. Detail / current-session ingest stays on
-      // the cloud path (session render + no_current_session logic lives there).
-      if mode == "list", AgentBridgeTransport.preference != .cloud {
-        var lanPayload = wirePayload
-        lanPayload["chatId"] = chatId
-        if LanBridgeService.shared.send(type: "history_request", payload: lanPayload) {
-          lanHistoryPendingRequestIds.insert(requestId)
-          let cloudFallback = wirePayload
-          queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self else { return }
-            guard self.lanHistoryPendingRequestIds.remove(requestId) != nil else { return }
-            NSLog(
-              "[LanBridge] history list over LAN timed out req=%@ — cloud fallback",
-              String(requestId.prefix(8)))
-            _ = self.sendAgentBridgeHistoryOverCloudLocked(
-              chatId: chatId, wirePayload: cloudFallback, requestId: requestId)
-          }
-          NSLog(
-            "[LanBridge] history list sent over LAN req=%@ chat=%@",
-            String(requestId.prefix(8)), String(chatId.prefix(12)))
-          return ["accepted": true, "transport": "lan", "requestId": requestId]
-        }
+      // History reads are idempotent and the bridge daemon supports both one-shot list
+      // reads and watched detail reads over its authenticated LAN transport. Every mode
+      // therefore gets the same direct fast path; cloud remains the bounded fallback.
+      if AgentBridgeTransport.preference != .cloud,
+        sendAgentBridgeHistoryOverLanLocked(
+          chatId: chatId, wirePayload: wirePayload, requestId: requestId)
+      {
+        return ["accepted": true, "transport": "lan", "requestId": requestId]
       }
 
       return sendAgentBridgeHistoryOverCloudLocked(
         chatId: chatId, wirePayload: wirePayload, requestId: requestId)
     }
+  }
+
+  /// Direct authenticated-LAN path for any history mode. The pending set only owns the
+  /// initial reply/fallback race; detail watcher ownership lives in
+  /// `liveBridgeSessionIngestByChatId` and deliberately survives the first response.
+  private func sendAgentBridgeHistoryOverLanLocked(
+    chatId: String, wirePayload: [String: Any], requestId: String
+  ) -> Bool {
+    var lanPayload = wirePayload
+    lanPayload["chatId"] = chatId
+    guard LanBridgeService.shared.send(type: "history_request", payload: lanPayload) else {
+      return false
+    }
+
+    lanHistoryPendingRequestIds.insert(requestId)
+    let cloudFallback = wirePayload
+    let mode = normalizedString(wirePayload["mode"]) ?? "list"
+    queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+      guard let self else { return }
+      guard self.lanHistoryPendingRequestIds.remove(requestId) != nil else { return }
+      NSLog(
+        "[LanBridge] history %@ over LAN timed out req=%@ — cloud fallback",
+        mode, String(requestId.prefix(8)))
+      _ = self.sendAgentBridgeHistoryOverCloudLocked(
+        chatId: chatId, wirePayload: cloudFallback, requestId: requestId)
+    }
+    NSLog(
+      "[LanBridge] history %@ sent over LAN req=%@ chat=%@",
+      mode, String(requestId.prefix(8)), String(chatId.prefix(12)))
+    return true
   }
 
   /// Cloud (Phoenix) path for a history request — the persistence-backed source of truth.
@@ -2769,9 +2785,6 @@ final class ChatEngine {
   /// (upsert) rather than leaving it frozen until History is manually re-opened.
   private func rearmLiveBridgeSessionLocked(chatId: String, trigger: String) {
     guard let live = liveBridgeSessionIngestByChatId[chatId] else { return }
-    guard let client = phoenixClient, nativeJoinedChatIds.contains(chatId),
-      (state["connected"] as? Bool) == true
-    else { return }
     let now = Int64(nowMs())
     let lastArm = lastBridgeRearmAtMsByChatId[chatId] ?? 0
     // Soft triggers (open / join / already_live) must not re-download an already
@@ -2798,8 +2811,33 @@ final class ChatEngine {
       )
       return
     }
-    lastBridgeRearmAtMsByChatId[chatId] = now
     let requestId = UUID().uuidString
+    var wirePayload: [String: Any] = [
+      "provider": live.provider,
+      "mode": "detail",
+      "requestId": requestId,
+      "limit": Self.bridgeSessionPageLimit,
+    ]
+    if !live.sessionId.isEmpty { wirePayload["sessionId"] = live.sessionId }
+
+    let result: [String: Any]
+    if AgentBridgeTransport.preference != .cloud,
+      sendAgentBridgeHistoryOverLanLocked(
+        chatId: chatId, wirePayload: wirePayload, requestId: requestId)
+    {
+      result = ["accepted": true, "transport": "lan", "requestId": requestId]
+    } else {
+      // Preserve the original Phoenix readiness guards when LAN is unavailable or cloud
+      // is explicitly selected. A later chat join/reconnect trigger will try again.
+      guard phoenixClient != nil, nativeJoinedChatIds.contains(chatId),
+        (state["connected"] as? Bool) == true
+      else { return }
+      result = sendAgentBridgeHistoryOverCloudLocked(
+        chatId: chatId, wirePayload: wirePayload, requestId: requestId)
+    }
+    guard (result["accepted"] as? Bool) == true else { return }
+
+    lastBridgeRearmAtMsByChatId[chatId] = now
     liveBridgeSessionIngestByChatId[chatId] = (
       provider: live.provider, sessionId: live.sessionId, requestId: requestId
     )
@@ -2809,25 +2847,15 @@ final class ChatEngine {
       lastIngestedBridgeSessionSigByChatId.removeValue(forKey: chatId)
     }
     pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: live.provider)
-    var wirePayload: [String: Any] = [
-      "provider": live.provider,
-      "mode": "detail",
-      "requestId": requestId,
-      "limit": Self.bridgeSessionPageLimit,
-    ]
-    if !live.sessionId.isEmpty { wirePayload["sessionId"] = live.sessionId }
-    let ref = client.push(
-      topic: chatTopic(for: chatId),
-      event: "agent-bridge-history",
-      payload: wirePayload
-    )
+    let transport = normalizedString(result["transport"]) ?? "native"
+    let ref = normalizedString(result["ref"]) ?? ""
     NSLog(
       "[ChatEngine][BridgeMount] rearm chat=%@ provider=%@ session=%@ trigger=%@ transport=%@ phoenix=%@",
       String(chatId.suffix(12)),
       live.provider,
       String(live.sessionId.prefix(12)),
       trigger,
-      transportModeLocked(),
+      transport,
       (state["connected"] as? Bool) == true ? "ws-up" : "ws-down"
     )
     appendJournalLocked(
@@ -5758,23 +5786,102 @@ final class ChatEngine {
       source, staleRows.count, changedChats.count, status.runningTasks.count)
   }
 
-  /// A history LIST reply that arrived over the direct LAN link. Stores it exactly like
-  /// the cloud `agent-bridge-history` list branch and cancels the cloud fallback. LAN only
-  /// ever carries list reads, so the detail-ingest / no_current_session logic isn't needed.
+  /// A history reply that arrived over the direct LAN link. The first reply cancels the
+  /// timed cloud fallback; detail watcher re-pushes continue to flow through the live
+  /// request-id mapping after that one-shot ownership has been released.
   private func applyLanHistoryResultLocked(_ payload: [String: Any]) {
     guard let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) else { return }
     let requestId = normalizedString(payload["requestId"]) ?? ""
     if !requestId.isEmpty { lanHistoryPendingRequestIds.remove(requestId) }
-    let mode = normalizedString(payload["mode"]) ?? "list"
-    guard mode == "list" else { return }  // detail never routes over LAN
-    let provider = normalizedString(payload["provider"]) ?? ""
+    applyAgentBridgeHistoryResultLocked(chatId: chatId, payload: payload, transport: "lan")
+  }
+
+  /// Shared result semantics for cloud relay and authenticated LAN history replies.
+  /// Must stay on the engine queue: transcript ingest mutates row and paging state.
+  private func applyAgentBridgeHistoryResultLocked(
+    chatId: String, payload: [String: Any], transport: String
+  ) {
+    dispatchPrecondition(condition: .onQueue(queue))
     agentBridgeHistoryByChat[chatId] = payload
+    let mode = normalizedString(payload["mode"]) ?? "list"
+    let provider = normalizedString(payload["provider"]) ?? ""
     if !provider.isEmpty {
-      agentBridgeHistoryListByChatProvider["\(chatId)|\(provider.lowercased())"] = payload
+      if mode == "list" {
+        agentBridgeHistoryListByChatProvider["\(chatId)|\(provider.lowercased())"] = payload
+      }
     }
-    NSLog(
-      "[LanBridge] history list reply over LAN req=%@ chat=%@ provider=%@",
-      String(requestId.prefix(8)), String(chatId.prefix(12)), provider)
+    let requestId = normalizedString(payload["requestId"]) ?? ""
+    if transport == "lan" {
+      NSLog(
+        "[LanBridge] history %@ reply over LAN req=%@ chat=%@ provider=%@",
+        mode, String(requestId.prefix(8)), String(chatId.prefix(12)), provider)
+    }
+
+    let okFlag = payload["ok"]
+    let ok: Bool = {
+      if let b = okFlag as? Bool { return b }
+      if let n = okFlag as? NSNumber { return n.boolValue }
+      if let s = okFlag as? String { return s.lowercased() != "false" && s != "0" }
+      return true
+    }()
+    let message = (normalizedString(payload["message"]) ?? "").lowercased()
+    let isNoCurrent =
+      !ok
+      && (message.contains("no_current_session") || message.contains("no session") || message.isEmpty)
+    if isNoCurrent, mode == "detail", payload["session"] == nil {
+      // Idle DM: bridge has nothing live — stop re-polling for 90s.
+      noCurrentSessionUntilMsByChatId[chatId] = Int64(nowMs()) + 90_000
+      currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
+      pendingBridgeSessionIngestByRequestId.removeValue(forKey: requestId)
+      NSLog(
+        "[ChatEngine][BridgeMount] no_current_session chat=%@ msg=%@ transport=%@ — suppress polls 90s",
+        String(chatId.suffix(12)),
+        message.isEmpty ? "<empty>" : message,
+        transport
+      )
+      postChangeLocked(
+        reason: "agentBridgeHistory",
+        userInfo: [
+          "chatId": chatId,
+          "provider": provider,
+          "mode": mode,
+          "requestId": requestId,
+          "message": "no_current_session",
+        ]
+      )
+      return
+    }
+    // Successful current-session load clears the idle suppress.
+    if ok { noCurrentSessionUntilMsByChatId.removeValue(forKey: chatId) }
+    // If this detail reply was requested to be opened into the chat, render its
+    // transcript as bubbles. The one-shot pending map is removed after the first
+    // response, while the live map remains registered for watcher re-pushes.
+    if mode == "detail" {
+      var ingestProvider: String?
+      if let target = pendingBridgeSessionIngestByRequestId.removeValue(forKey: requestId) {
+        ingestProvider = provider.isEmpty ? target.provider : provider
+      } else if let live = liveBridgeSessionIngestByChatId[chatId],
+        live.requestId == requestId
+      {
+        ingestProvider = provider.isEmpty ? live.provider : provider
+      }
+      if let ingestProvider {
+        if payload["session"] is [String: Any] {
+          ingestAgentBridgeSessionLocked(
+            chatId: chatId,
+            provider: ingestProvider,
+            payload: payload
+          )
+          // Clear single-flight gates once a detail payload landed for this chat.
+          currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
+          sessionLoadInflightByChatId.removeValue(forKey: chatId)
+        } else if var paging = bridgeSessionPagingByChatId[chatId] {
+          paging.loadingOlder = false
+          bridgeSessionPagingByChatId[chatId] = paging
+          currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
+        }
+      }
+    }
     postChangeLocked(
       reason: "agentBridgeHistory",
       userInfo: [
@@ -7355,89 +7462,8 @@ final class ChatEngine {
           return
         }
         if frame.event == "agent-bridge-history" {
-          self.agentBridgeHistoryByChat[chatId] = frame.payload
-          let mode = self.normalizedString(frame.payload["mode"]) ?? "list"
-          let provider = self.normalizedString(frame.payload["provider"]) ?? ""
-          if mode == "list", !provider.isEmpty {
-            self.agentBridgeHistoryListByChatProvider[
-              "\(chatId)|\(provider.lowercased())"
-            ] = frame.payload
-          }
-          let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
-          let okFlag = frame.payload["ok"]
-          let ok: Bool = {
-            if let b = okFlag as? Bool { return b }
-            if let n = okFlag as? NSNumber { return n.boolValue }
-            if let s = okFlag as? String { return s.lowercased() != "false" && s != "0" }
-            return true
-          }()
-          let message = (self.normalizedString(frame.payload["message"]) ?? "").lowercased()
-          let isNoCurrent =
-            !ok
-            && (message.contains("no_current_session") || message.contains("no session") || message.isEmpty)
-          if isNoCurrent, mode == "detail", frame.payload["session"] == nil {
-            // Idle DM: bridge has nothing live — stop re-polling for 90s.
-            self.noCurrentSessionUntilMsByChatId[chatId] = Int64(self.nowMs()) + 90_000
-            self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
-            self.pendingBridgeSessionIngestByRequestId.removeValue(forKey: requestId)
-            NSLog(
-              "[ChatEngine][BridgeMount] no_current_session chat=%@ msg=%@ — suppress polls 90s",
-              String(chatId.suffix(12)),
-              message.isEmpty ? "<empty>" : message
-            )
-            self.postChangeLocked(
-              reason: "agentBridgeHistory",
-              userInfo: [
-                "chatId": chatId,
-                "provider": provider,
-                "mode": mode,
-                "requestId": requestId,
-                "message": "no_current_session",
-              ]
-            )
-            return
-          }
-          // Successful current-session load clears the idle suppress.
-          if ok { self.noCurrentSessionUntilMsByChatId.removeValue(forKey: chatId) }
-          // If this detail reply was requested to be opened into the chat, render
-          // its transcript as bubbles (the profile no longer shows a transcript).
-          if mode == "detail" {
-            var ingestProvider: String?
-            if let target = self.pendingBridgeSessionIngestByRequestId.removeValue(forKey: requestId) {
-              ingestProvider = provider.isEmpty ? target.provider : provider
-            } else if let live = self.liveBridgeSessionIngestByChatId[chatId],
-              live.requestId == requestId
-            {
-              // Live-tail re-push from the bridge's transcript watcher — keep the
-              // subscription registered and upsert the (now longer) transcript.
-              ingestProvider = provider.isEmpty ? live.provider : provider
-            }
-            if let ingestProvider {
-              if frame.payload["session"] is [String: Any] {
-                self.ingestAgentBridgeSessionLocked(
-                  chatId: chatId,
-                  provider: ingestProvider,
-                  payload: frame.payload
-                )
-                // Clear single-flight gates once a detail payload landed for this chat.
-                self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
-                self.sessionLoadInflightByChatId.removeValue(forKey: chatId)
-              } else if var paging = self.bridgeSessionPagingByChatId[chatId] {
-                paging.loadingOlder = false
-                self.bridgeSessionPagingByChatId[chatId] = paging
-                self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
-              }
-            }
-          }
-          self.postChangeLocked(
-            reason: "agentBridgeHistory",
-            userInfo: [
-              "chatId": chatId,
-              "provider": provider,
-              "mode": mode,
-              "requestId": requestId,
-            ]
-          )
+          self.applyAgentBridgeHistoryResultLocked(
+            chatId: chatId, payload: frame.payload, transport: "cloud")
           return
         }
         if frame.event == "agent-bridge-file" {
@@ -8850,9 +8876,27 @@ final class ChatEngine {
     ingestHistoryRowsLocked(chatId: chatId, remoteRows: remoteRows).rows
   }
 
+  /// Durability must NOT depend on network-load state.
+  ///
+  /// This used to be gated on `historyFullyLoadedChats`, which created a bootstrap
+  /// dependency: writing required the flag, and for a chat with nothing stored yet
+  /// that flag could only be set by a SUCCESSFUL network history load. So a dormant
+  /// or very old chat whose history request never completes with rows (server returns
+  /// an empty page, the request errors, offline) was NEVER written to SQLite — every
+  /// cold launch then found nothing and painted an empty transcript, permanently,
+  /// because the same condition repeats on every run. Healthy chats had crossed that
+  /// bootstrap once and self-sustained via restore -> flag -> write.
+  ///
+  /// No permission check is needed, because the store is MONOTONE:
+  /// `persistHistoryRowsToStoreLocked` only upserts validated rows (it filters
+  /// transient `stream-`/`lan-` ids, applies local tombstones, and requires a userId).
+  /// Rows leave the store only through explicit deleteMessages / pruneChat / deleteChat.
+  /// A partial tail upserted over a fuller stored transcript can therefore only grow
+  /// it — it can never truncate one.
   private func storeMergedChatHistoryIfLoadedLocked(chatId: String) {
-    guard historyFullyLoadedChats.contains(chatId) else { return }
-    let rows = mergedChatRowsLocked(chatId: chatId)
+    // Drop a merge that carries nothing persistable (a streaming-only tick), so token
+    // streaming never churns the store.
+    let rows = mergedChatRowsLocked(chatId: chatId).filter { !isTransientStreamRow($0) }
     guard !rows.isEmpty else { return }
     storeCachedHistoryRowsLocked(chatId: chatId, rows: rows)
   }
@@ -10846,6 +10890,11 @@ final class ChatEngine {
         let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
         let legacyRows = object as? [[String: Any]]
       else {
+        // Names the exact failure behind an "empty chat on every launch": the durable
+        // store holds nothing for this chat, so there is nothing to paint offline.
+        NSLog(
+          "[HistoryStore] restore MISS chat=%@ — SQLite holds 0 rows and no legacy blob",
+          String(chatId.prefix(12)))
         return false
       }
       decodedRows = legacyRows
@@ -10859,6 +10908,9 @@ final class ChatEngine {
     historyRowsByChat[chatId] = rows
     historyFullyLoadedChats.insert(chatId)
     historyRowsRestoredFromCacheChats.insert(chatId)
+    NSLog(
+      "[HistoryStore] restore HIT chat=%@ rows=%d (painted from local store, no network)",
+      String(chatId.prefix(12)), rows.count)
     appendJournalLocked(
       event: "native-chat-history-cache-restore",
       payload: ["chatId": chatId, "rows": rows.count])
@@ -11908,7 +11960,14 @@ final class ChatEngine {
     // rendered these exact rows from cache, and the reload notification would send the
     // whole transcript back through the full parse/diff/layout pipeline on main.
     let isUnchangedRefetch = !existingRows.isEmpty && (rows as NSArray).isEqual(to: existingRows)
-    historyRowsByChat[chatId] = rows
+    // An empty/failed refresh must never wipe rows we already restored from the local
+    // store. A dormant chat whose server page comes back empty would otherwise blank a
+    // transcript the cache had just painted (the failure mode that only becomes
+    // reachable once persistence above is unconditional). Adopt an empty result only
+    // when there is nothing better on screen.
+    if !rows.isEmpty || existingRows.isEmpty {
+      historyRowsByChat[chatId] = rows
+    }
     historyFullyLoadedChats.insert(chatId)
     historyRowsRestoredFromCacheChats.remove(chatId)
     storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
