@@ -319,6 +319,9 @@ defmodule Vibe.Chat do
           %{
             chatId: chat_id,
             type: room_type,
+            # True for multi-party rooms (groups + broadcast channels). Clients
+            # also derive this from type, but an explicit flag avoids DM fallthrough.
+            isGroup: room_type in ["group", "channel"],
             lastMessageAt: last_activity_at,
             name: if(room, do: room.name, else: nil),
             description: if(room, do: room.description, else: nil),
@@ -1412,33 +1415,44 @@ defmodule Vibe.Chat do
   # ── Channels ────────────────────────────────────────────────────
 
   def create_channel(creator_id, name, description \\ nil, avatar_url \\ nil) do
-    id = Ecto.UUID.generate() |> String.slice(0, 12)
+    trimmed_name =
+      name
+      |> to_string()
+      |> String.trim()
 
-    result =
-      Repo.transaction(fn ->
-        room =
-          Repo.insert!(%Room{
-            id: id,
-            is_group: false,
-            type: "channel",
-            name: name,
-            description: description,
-            avatar_url: avatar_url,
-            creator_id: creator_id
-          })
+    if trimmed_name == "" do
+      {:error, :invalid_name}
+    else
+      id = Ecto.UUID.generate() |> String.slice(0, 12)
 
-        Repo.insert!(%Participant{chat_id: id, user_id: creator_id, role: "owner"})
+      result =
+        Repo.transaction(fn ->
+          room =
+            Repo.insert!(%Room{
+              id: id,
+              # Multi-party room flag (shared with groups). Type "channel" is the
+              # broadcast discriminator for permissions / UI.
+              is_group: true,
+              type: "channel",
+              name: trimmed_name,
+              description: present_string(description),
+              avatar_url: present_string(avatar_url),
+              creator_id: creator_id
+            })
 
-        room
-      end)
+          Repo.insert!(%Participant{chat_id: id, user_id: creator_id, role: "owner"})
 
-    case result do
-      {:ok, room} ->
-        ChatHomeCache.invalidate_user(creator_id)
-        {:ok, room}
+          room
+        end)
 
-      other ->
-        other
+      case result do
+        {:ok, room} ->
+          ChatHomeCache.invalidate_user(creator_id)
+          {:ok, room}
+
+        other ->
+          other
+      end
     end
   end
 

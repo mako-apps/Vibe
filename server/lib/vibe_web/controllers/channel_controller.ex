@@ -2,23 +2,41 @@ defmodule VibeWeb.ChannelController do
   use VibeWeb, :controller
   alias Vibe.Chat
 
-  def create(conn, %{"name" => name} = params) do
+  def create(conn, params) when is_map(params) do
     creator_id = conn.assigns.current_user.id
+    name = params["name"] || params["channelName"] || params["title"]
     description = params["description"]
-    avatar_url = params["avatarUrl"]
+    avatar_url = params["avatarUrl"] || params["avatar_url"]
 
-    case Chat.create_channel(creator_id, name, description, avatar_url) do
-      {:ok, room} ->
-        json(conn, %{
-          chatId: room.id,
-          type: "channel",
-          name: room.name,
-          description: room.description,
-          creatorId: room.creator_id
-        })
+    cond do
+      not is_binary(name) or String.trim(name) == "" ->
+        conn
+        |> put_status(:bad_request)
+        |> json(%{error: "Channel name is required"})
 
-      {:error, reason} ->
-        conn |> put_status(500) |> json(%{error: "Failed to create channel: #{inspect(reason)}"})
+      true ->
+        case Chat.create_channel(creator_id, name, description, avatar_url) do
+          {:ok, room} ->
+            json(conn, %{
+              chatId: room.id,
+              type: "channel",
+              name: room.name,
+              description: room.description,
+              creatorId: room.creator_id,
+              role: "owner",
+              isGroup: true
+            })
+
+          {:error, :invalid_name} ->
+            conn
+            |> put_status(:bad_request)
+            |> json(%{error: "Channel name is required"})
+
+          {:error, reason} ->
+            conn
+            |> put_status(500)
+            |> json(%{error: "Failed to create channel: #{inspect(reason)}"})
+        end
     end
   end
 
@@ -31,7 +49,7 @@ defmodule VibeWeb.ChannelController do
     user_id = conn.assigns.current_user.id
     case Chat.join_channel(channel_id, user_id) do
       {:ok, _} -> json(conn, %{success: true})
-      {:error, reason} -> conn |> put_status(400) |> json(%{error: reason})
+      {:error, reason} -> conn |> put_status(400) |> json(%{error: to_string(reason)})
     end
   end
 
@@ -39,7 +57,7 @@ defmodule VibeWeb.ChannelController do
     user_id = conn.assigns.current_user.id
     case Chat.leave_channel(channel_id, user_id) do
       {:ok, _} -> json(conn, %{success: true})
-      {:error, reason} -> conn |> put_status(400) |> json(%{error: reason})
+      {:error, reason} -> conn |> put_status(400) |> json(%{error: to_string(reason)})
     end
   end
 
