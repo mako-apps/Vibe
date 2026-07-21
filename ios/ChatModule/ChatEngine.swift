@@ -10874,7 +10874,16 @@ final class ChatEngine {
       clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "restore_cache")
       return false
     }
-    if historyRowsByChat[chatId] != nil, historyFullyLoadedChats.contains(chatId) {
+    // The in-memory entry only counts as "already restored" when it actually HOLDS rows.
+    // An EMPTY array here is a poison pill: a background history load whose server page
+    // came back with zero rows installs `[]` plus the fullyLoaded flag, and from then on
+    // every restore for this chat short-circuits `true` WITHOUT ever reading SQLite. A
+    // chat with a full transcript on disk then paints EMPTY for the rest of the run —
+    // and again after every relaunch, because the same background load repeats. Falling
+    // through on empty costs one bounded (120-row) SQLite read.
+    if let existing = historyRowsByChat[chatId], !existing.isEmpty,
+      historyFullyLoadedChats.contains(chatId)
+    {
       return true
     }
     guard let userId = chatHistoryCacheUserIdLocked() else { return false }
@@ -10973,6 +10982,15 @@ final class ChatEngine {
 
   private func clearCachedHistoryRowsLocked(chatId: String) {
     if let userId = chatHistoryCacheUserIdLocked() {
+      // Destructive: this is the only path that DELETES a chat's durable transcript.
+      // Name it in the log — "the cache is gone after relaunch" is indistinguishable from
+      // "it was never written" without this line.
+      let before = messageStore.messageCount(userId: userId, chatId: chatId)
+      if before > 0 {
+        NSLog(
+          "[HistoryStore] WIPE chat=%@ — deleting %d stored rows",
+          String(chatId.prefix(12)), before)
+      }
       messageStore.deleteChat(userId: userId, chatId: chatId)
     }
     guard let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId) else { return }
@@ -11965,11 +11983,29 @@ final class ChatEngine {
     // transcript the cache had just painted (the failure mode that only becomes
     // reachable once persistence above is unconditional). Adopt an empty result only
     // when there is nothing better on screen.
-    if !rows.isEmpty || existingRows.isEmpty {
-      historyRowsByChat[chatId] = rows
+    var adoptedFromStore = false
+    if rows.isEmpty, existingRows.isEmpty {
+      // The fetch returned NOTHING for this chat. Before adopting an empty transcript —
+      // what the user sees as "this chat opens empty on every launch" — give the durable
+      // store its turn: it may hold a full transcript this particular page simply did not
+      // return (dormant chat, archived window, partial outage). Dropping the flags first
+      // is what lets the restore actually read SQLite instead of short-circuiting.
+      historyRowsByChat.removeValue(forKey: chatId)
+      historyFullyLoadedChats.remove(chatId)
+      adoptedFromStore = restoreCachedHistoryRowsLocked(chatId: chatId)
+      if adoptedFromStore {
+        NSLog(
+          "[HistoryStore] empty-fetch chat=%@ — repainted %d rows from the local store",
+          String(chatId.prefix(12)), historyRowsByChat[chatId]?.count ?? 0)
+      }
     }
-    historyFullyLoadedChats.insert(chatId)
-    historyRowsRestoredFromCacheChats.remove(chatId)
+    if !adoptedFromStore {
+      if !rows.isEmpty || existingRows.isEmpty {
+        historyRowsByChat[chatId] = rows
+      }
+      historyFullyLoadedChats.insert(chatId)
+      historyRowsRestoredFromCacheChats.remove(chatId)
+    }
     storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
     state["updatedAt"] = nowMs()
     appendJournalLocked(
@@ -11982,13 +12018,22 @@ final class ChatEngine {
         "liveRows": liveRowsCount,
         "messages": messagesArray.count,
       ])
+    // `messages` (what the server actually sent) vs `remoteRows` (what survived row
+    // building) separates "the server has nothing" from "we dropped everything it sent";
+    // `store` says whether the durable transcript exists regardless of either.
+    let storedRowCount =
+      chatHistoryCacheUserIdLocked().map {
+        messageStore.messageCount(userId: $0, chatId: chatId)
+      } ?? -1
     NSLog(
-      "[ChatEngine] loadChatHistory MERGE chatId=%@ remoteRows=%d existingRows=%d liveRows=%d mergedRows=%d unchanged=%@",
+      "[ChatEngine] loadChatHistory MERGE chatId=%@ messages=%d remoteRows=%d existingRows=%d liveRows=%d mergedRows=%d store=%d unchanged=%@",
       String(chatId.prefix(12)),
+      messagesArray.count,
       remoteRows.count,
       existingRowsCount,
       liveRowsCount,
-      rows.count,
+      historyRowsByChat[chatId]?.count ?? rows.count,
+      storedRowCount,
       isUnchangedRefetch ? "Y" : "N"
     )
     scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "history_loaded")
