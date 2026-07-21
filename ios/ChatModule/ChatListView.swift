@@ -774,6 +774,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// narrower bounds miss every cached height, so a full progressive sweep would
   /// re-measure the whole transcript on the main thread for nothing.
   var suppressesProgressiveHeightWarmup = false
+  /// The home long-press PREVIEW list (a transient, read-only, non-scrolling card
+  /// showing the resting tail). The card is narrower than the real chat (416 vs
+  /// 440pt → rows 400 vs 424pt), so every persisted height — measured at the real
+  /// width — MISSes on width and the whole visible tail re-measures on the MAIN
+  /// thread during the hold (the per-hold lag; logged `height-promote MISS
+  /// reason=w[424→400]`). When set: persisted exact-content heights are reused as
+  /// close-enough estimates regardless of width, and this list NEVER writes heights
+  /// to the shared on-disk store (it would clobber the real chat's true-width cache
+  /// with narrow-width values). The real chat, opened for real, still measures exact.
+  var isEphemeralPreview = false
   /// The first authoritative snapshot after a presentation seed is a reconciliation,
   /// never a live list mutation. Even if cache/server content differs, replace it in one
   /// disabled-actions reload instead of exposing insert/delete animations or offset churn.
@@ -828,6 +838,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private static let initialTranscriptWindow = 16
   private static let largeTranscriptThreshold = 12
   private static let warmTranscriptCacheLimit = 8
+  /// Upper bound for mounting a COMPLETE cached transcript during the push when only the
+  /// disk heights are warm and the in-memory parse cache is cold (see the seed's coverage
+  /// gate). Keeps a pathological transcript from turning the push into a long parse.
+  private static let coldFullWindowMountLimit = 400
   private struct WarmTranscriptSnapshot {
     let rows: [ChatListRow]
     let sourceRows: [[String: Any]]
@@ -4573,11 +4587,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       return nil
     }
-    guard abs(entry.w - Double(rowWidth)) < 0.5,
-      entry.v == contentVersion,
-      entry.s == Self.bubbleStateSignature(state),
-      entry.sig == chatListRowContentSignature(row)
-    else {
+    let widthMatches = abs(entry.w - Double(rowWidth)) < 0.5
+    let contentMatches =
+      entry.v == contentVersion
+      && entry.s == Self.bubbleStateSignature(state)
+      && entry.sig == chatListRowContentSignature(row)
+    // Transient preview: the content is identical, only the card width differs.
+    // Reuse the real-width height as a close-enough estimate rather than
+    // re-measuring the whole tail on the main thread mid-hold. Pure read — the
+    // width-keyed in-memory cache and the shared on-disk file are left untouched
+    // (never promote a narrow-width value that a real open would then trust).
+    if isEphemeralPreview, contentMatches, !widthMatches {
+      return CGFloat(entry.h)
+    }
+    guard widthMatches, contentMatches else {
       if persistedHeightMissLogBudget > 0 {
         persistedHeightMissLogBudget -= 1
         var reasons: [String] = []
@@ -4619,6 +4642,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func schedulePersistRowHeights() {
+    // The preview list sizes at the narrow card width; persisting those heights
+    // would overwrite the real chat's true-width on-disk cache. Never write.
+    guard !isEphemeralPreview else { return }
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatId.isEmpty, chatId == persistedHeightsChatId,
       persistedHeightsWriteWorkItem == nil
@@ -4964,6 +4990,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard let data = try? JSONEncoder().encode(viewport) else { return }
     UserDefaults.standard.set(data, forKey: Self.persistedViewportKey(chatId: chatId))
     persistedOpeningViewport = viewport
+    // Leaving a chat with the keyboard UP and returning with it DOWN reportedly lands the
+    // list shifted. This view is reused across open/close, so capture the keyboard-derived
+    // geometry on BOTH sides of the boundary to see whether the saved anchor/atBottom was
+    // measured against a keyboard inset that no longer exists at restore.
+    NSLog(
+      "[KbViewport] PERSIST chat=%@ kb=%.0f insetB=%.0f off=%.0f contentH=%.0f boundsH=%.0f atBottom=%@ anchor=%@ screenY=%.0f",
+      String(chatId.prefix(12)), keyboardHeight, collectionView.contentInset.bottom,
+      collectionView.contentOffset.y, collectionView.contentSize.height,
+      collectionView.bounds.height, atBottom ? "Y" : "N",
+      String((anchor?.messageId ?? "none").prefix(8)), anchor?.screenY ?? 0.0)
   }
 
   /// Applies exactly once, after the complete cached snapshot has mounted. New unread
@@ -4974,6 +5010,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard shouldApplyOpeningViewport, !rows.isEmpty, searchQuery.isEmpty else { return false }
     shouldApplyOpeningViewport = false
     collectionView.layoutIfNeeded()
+    NSLog(
+      "[KbViewport] RESTORE chat=%@ kb=%.0f insetB=%.0f contentH=%.0f boundsH=%.0f savedAtBottom=%@ savedScreenY=%.0f",
+      String(engineChatId.prefix(12)), keyboardHeight, collectionView.contentInset.bottom,
+      collectionView.contentSize.height, collectionView.bounds.height,
+      (persistedOpeningViewport?.atBottom ?? false) ? "Y" : "N",
+      persistedOpeningViewport?.screenY ?? -1.0)
 
     let unreadTargetIndex: Int? = {
       guard openingUnreadCount > 0 else { return nil }
@@ -5779,13 +5821,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
       }
       if messageRowCount > 0 {
-        // Parse coverage alone decides the mount: reused rows keep the seed cheap and
-        // the post-appear flush reconciles mode=equal instead of batch-inserting ~100
-        // rows (the felt 130-200ms stall). Height coverage only picks the sizing mode —
-        // uncovered rows mount with estimates and the progressive warmup corrects them
-        // quietly after the push, exactly like large-DM opens already do.
-        fullWindow = parsedHits * 100 >= messageRowCount * 95
+        // Parse coverage keeps the seed cheapest: reused rows mean the post-appear flush
+        // reconciles mode=equal instead of batch-inserting ~100 rows.
+        let parseCovered = parsedHits * 100 >= messageRowCount * 95
         fullWindowHeightsCovered = heightHits * 100 >= messageRowCount * 90
+        // ...but reusableParsedRowsByKey is IN-MEMORY, so a cold launch — or any chat that
+        // missed the bounded launch prewarm — has zero parse hits and could NEVER qualify.
+        // Those opens mounted a 16-row tail and then batch-inserted the remainder ~800ms
+        // later: the "chat opens empty / still only 16 rows even though it's cached"
+        // report, which also cost a 145ms stall (layoutMs=120) right after the open.
+        //
+        // Disk-persisted heights DO survive relaunch, and they are the signal that makes
+        // the mount cheap: with a known height, sizeForItemAt is a dictionary lookup.
+        // Re-parsing the rest is comparatively trivial (~4ms for 130 rows, measured, vs
+        // the 120ms layout pass it replaces), so height coverage alone is enough to mount
+        // the whole cached transcript during the push instead of after it.
+        fullWindow =
+          parseCovered
+          || (fullWindowHeightsCovered
+            && normalizedSource.count <= Self.coldFullWindowMountLimit)
       }
     }
     let seedNormalizeMs = seedPhaseMs()
@@ -7619,9 +7673,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             }
           } else if !info.isHiddenForSend {
             // Skip slide animation for media/GIF/sticker — just appear in place.
+            // Day separators too: this block is only reached during a SEND transition, so
+            // a send that crosses a day boundary inserts the divider in the same batch as
+            // the sent bubble. Sliding the divider while the morph overlay crossfades into
+            // that bubble reads as two animations competing/overlapping in one spot — the
+            // date should simply be there when the crossfade lands.
             let skipSlide: Bool = {
               guard info.indexPath.item < rows.count else { return false }
-              let vk = rows[info.indexPath.item].visualKind
+              let row = rows[info.indexPath.item]
+              if row.kind == .day { return true }
+              let vk = row.visualKind
               return vk == .media || vk == .sticker || vk == .video || vk == .videoNote
             }()
             if !skipSlide {
@@ -14079,6 +14140,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let preferredMode =
         agentSurfaceMode(for: AgentBridgeSelectionStore.defaultView(provider: provider)) ?? .transcript
       presentBridgeAgentConversation(provider: provider, surfaceMode: preferredMode)
+      presentedBridgeAgentVC?.runModel = session.model
+      presentedBridgeAgentVC?.runReasoningEffort = session.reasoningEffort
       return
     }
     // 1) Scope isolation so foreign DM rows drop out.
@@ -14090,6 +14153,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     clearRows()
     showBridgeSessionLoadingSpinner()
     presentedBridgeAgentVC?.isHistoryPicked = true
+    presentedBridgeAgentVC?.runModel = session.model
+    presentedBridgeAgentVC?.runReasoningEffort = session.reasoningEffort
     presentedBridgeAgentVC?.setTranscriptLoading(true)
     let result = ChatEngine.shared.loadAgentBridgeSessionIntoChat([
       "chatId": chatId,
@@ -15444,6 +15509,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     // Seed the header so it shows this run's real model + the connected computer.
     vc.runModel = agentRow.agentRuntime?.model
+    vc.runReasoningEffort = agentRow.agentRuntime?.reasoningEffort
     vc.deviceLabel = AgentPairingService.lastDeviceLabel
     vc.deviceConnected = AgentPairingService.lastConnected
     // Match the main chat view's avatar (gradient + fetched picture) in the header.
