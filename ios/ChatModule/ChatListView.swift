@@ -709,6 +709,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 {
   public var onViewportChanged = NativeEventDispatcher()
   public var onNativeEvent = NativeEventDispatcher()
+  var onAgentRunStateChanged: (() -> Void)?
 
   @objc public var surfaceId: String = "" {
     didSet {
@@ -820,12 +821,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var reopenSnapshotOverlay: UIImageView?
   private var seedLoadingIndicator: UIActivityIndicatorView?
   private var seedSpinnerGraceWorkItem: DispatchWorkItem?
-  /// A cold-launched agent DM opens intentionally clean (the transcript cache is purged
-  /// at launch, and auto-mounting a past session was removed for dropping an unrelated
-  /// transcript in late). So on an empty 1:1 agent DM we surface ONE obvious tap to the
-  /// History sheet — past work is a tap away without the fresh view ever being replaced.
-  private var bridgeEmptyHistoryPromptView: UIView?
-  private var bridgeEmptyHistoryPromptShowWork: DispatchWorkItem?
   /// Marks the one rows application initiated by the cached-history reveal path. That
   /// update is a strict prefix insert and must not run through the generic new-message
   /// finalize/scroll behavior while the user's finger owns the list.
@@ -943,6 +938,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // next composer send re-uses it (triggering a clean truncate-and-resend).
   private var editingAgentMessageId: String?
   private var agentStreaming = false
+  /// A bridge send exposes STOP immediately, before the first runtime row can make the
+  /// computer -> phone round trip. This is deliberately short-lived: a transport flag
+  /// that never receives its matching terminal callback must not strand the UI on
+  /// "Working" after the run has already completed.
+  private static let bridgeOptimisticRunWindow: TimeInterval = 4.0
+  private var bridgeOptimisticRunDeadline: TimeInterval = 0
+  private var bridgeOptimisticBaselineTerminalIdentity: String?
+  private var bridgeOptimisticRunClearWorkItem: DispatchWorkItem?
   /// After the user taps STOP, keep the composer out of stop-mode even while rows
   /// briefly still report live (cancel is in flight). Keys are per-task / per-row;
   /// cleared when those rows settle or after a short grace timeout.
@@ -1711,8 +1714,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     tallToggleOverlay.isUserInteractionEnabled = true
     addSubview(tallToggleOverlay)
 
-    setupBridgeEmptyHistoryPrompt()
-
     collectionView.backgroundColor = .clear
     collectionView.clipsToBounds = false
     collectionView.alwaysBounceVertical = true
@@ -2168,106 +2169,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     UIView.animate(
       withDuration: 0.15, delay: 0, options: [.beginFromCurrentState],
       animations: { overlay.alpha = 0 },
-      completion: { [weak self] _ in
+      completion: { _ in
         overlay.removeFromSuperview()
-        // The snapshot gated the empty-DM prompt; re-evaluate now that it's gone.
-        self?.updateBridgeEmptyHistoryPromptVisibility()
       })
-  }
-
-  private func setupBridgeEmptyHistoryPrompt() {
-    let container = UIView()
-    container.translatesAutoresizingMaskIntoConstraints = false
-    container.isHidden = true
-    addSubview(container)
-    NSLayoutConstraint.activate([
-      container.centerXAnchor.constraint(equalTo: centerXAnchor),
-      container.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -24),
-      container.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 32),
-      container.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -32),
-    ])
-
-    let hint = UILabel()
-    hint.text = "Pick up a past conversation"
-    hint.font = .systemFont(ofSize: 14.0, weight: .regular)
-    hint.textColor = .secondaryLabel
-    hint.textAlignment = .center
-    hint.numberOfLines = 2
-
-    var config = UIButton.Configuration.gray()
-    config.cornerStyle = .capsule
-    config.buttonSize = .large
-    config.image = UIImage(systemName: "clock.arrow.circlepath")
-    config.imagePadding = 8.0
-    config.title = "Recent sessions"
-    config.baseForegroundColor = .label
-    let button = UIButton(
-      configuration: config,
-      primaryAction: UIAction { [weak self] _ in self?.handleEmptyHistoryPromptTapped() })
-
-    let stack = UIStackView(arrangedSubviews: [hint, button])
-    stack.axis = .vertical
-    stack.alignment = .center
-    stack.spacing = 12.0
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    container.addSubview(stack)
-    NSLayoutConstraint.activate([
-      stack.topAnchor.constraint(equalTo: container.topAnchor),
-      stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-      stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-      stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-    ])
-    bridgeEmptyHistoryPromptView = container
-  }
-
-  private func handleEmptyHistoryPromptTapped() {
-    guard let provider = currentBridgeProvider, !provider.isEmpty else { return }
-    presentBridgeHistorySurface(provider: provider)
-  }
-
-  /// Show the "Recent sessions" tap only on a genuinely empty 1:1 agent DM — never over a
-  /// group, a loaded transcript, a history-session load, or the reopen snapshot.
-  private func bridgeEmptyHistoryPromptShouldShow() -> Bool {
-    currentBridgeProvider != nil
-      && !isGroupOrChannel
-      && rows.isEmpty
-      && bridgeLoadedSessionId == nil
-      && !isBridgeHistorySessionLoading()
-      && reopenSnapshotOverlay == nil
-  }
-
-  private func updateBridgeEmptyHistoryPromptVisibility() {
-    guard Thread.isMainThread else {
-      DispatchQueue.main.async { [weak self] in
-        self?.updateBridgeEmptyHistoryPromptVisibility()
-      }
-      return
-    }
-    guard let prompt = bridgeEmptyHistoryPromptView else { return }
-    bridgeEmptyHistoryPromptShowWork?.cancel()
-    bridgeEmptyHistoryPromptShowWork = nil
-    guard bridgeEmptyHistoryPromptShouldShow() else {
-      if !prompt.isHidden { prompt.isHidden = true }
-      return
-    }
-    // Debounce the reveal: a warm reopen is briefly empty before its cached rows land —
-    // only show if the DM is STILL empty after a short settle, so it never flashes over
-    // a chat that is about to paint.
-    guard prompt.isHidden else {
-      bringSubviewToFront(prompt)
-      return
-    }
-    let work = DispatchWorkItem { [weak self] in
-      guard let self, let prompt = self.bridgeEmptyHistoryPromptView,
-        self.bridgeEmptyHistoryPromptShouldShow()
-      else { return }
-      prompt.alpha = 0.0
-      prompt.isHidden = false
-      self.bringSubviewToFront(prompt)
-      UIView.animate(withDuration: 0.2) { prompt.alpha = 1.0 }
-    }
-    bridgeEmptyHistoryPromptShowWork = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
   }
 
   /// Telegram-style loading affordance for a deferred open with NOTHING to show — but
@@ -2632,7 +2536,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Re-paint under the new filter. Prefer engine rows so an already-ingested
     // `bridge-<sessionId>-…` transcript is not stuck behind a stale empty payload.
     reapplyRowsAfterBridgeSessionScopeChange()
-    updateBridgeEmptyHistoryPromptVisibility()
   }
 
   /// Whether a History session is currently scoped into this chat surface.
@@ -2645,6 +2548,42 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// "Loading…" instead of the idle "Start session" default.
   func isBridgeHistorySessionLoading() -> Bool {
     bridgeHistoryLoadInFlight
+  }
+
+  /// Latest model/effort reported by the rows currently visible in the default chat.
+  /// ChatMainView uses this for its two-line agent header.
+  func visibleBridgeRunConfiguration(provider: String) -> (
+    model: String?, reasoningEffort: String?, status: String?
+  ) {
+    let wantedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    var model: String?
+    var effort: String?
+    var status: String?
+    for row in rows.reversed() {
+      guard let runtime = row.agentRuntime else { continue }
+      let runtimeProvider = runtime.provider?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+      if !wantedProvider.isEmpty && !runtimeProvider.isEmpty && runtimeProvider != wantedProvider {
+        continue
+      }
+      if model == nil {
+        let value = runtime.model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !value.isEmpty { model = value }
+      }
+      if effort == nil {
+        let value = runtime.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !value.isEmpty { effort = value }
+      }
+      if status == nil {
+        let value = runtime.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !value.isEmpty { status = value }
+      }
+      if model != nil && effort != nil && status != nil { break }
+    }
+    return (model, effort, status)
+  }
+
+  func hasActiveBridgeRun() -> Bool {
+    agentComposerHasLiveTask()
   }
 
   /// Pull the latest engine rows (or fall back to the current payload) and re-run
@@ -2670,6 +2609,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func bridgeRowIsLive(_ row: ChatListRow) -> Bool {
+    // The terminal runtime is the bridge's authoritative acknowledgement. It must
+    // override stale `isStreamingText`, top-level `running`, or `canCancel` hints
+    // left on an out-of-order packet.
+    if let runtimeStatus = row.agentRuntime?.status
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+      Self.bridgeTerminalRuntimeStatuses.contains(runtimeStatus)
+    {
+      return false
+    }
     if row.isStreamingText { return true }
     let status = (row.status ?? "").lowercased()
     if status == "running" || status == "streaming" { return true }
@@ -2686,6 +2634,68 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       if runtime.teamWorkersStatus.contains(where: \.isRunning) { return true }
     }
     return false
+  }
+
+  private static let bridgeTerminalRuntimeStatuses: Set<String> = [
+    "done", "complete", "completed", "success", "ok", "finished",
+    "stopped", "cancelled", "canceled", "interrupted",
+    "failed", "failure", "error", "rate_limited", "rate-limited",
+  ]
+
+  /// The newest runtime row is authoritative once it settles. In particular, it must
+  /// beat ChatEngine's short anti-flicker running grace and any stale transport latch.
+  private func latestBridgeRuntimeState() -> (status: String, identity: String)? {
+    let wantedProvider = currentBridgeProvider?
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    for row in rows.reversed() {
+      guard let runtime = row.agentRuntime else { continue }
+      let runtimeProvider = runtime.provider?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+      if !wantedProvider.isEmpty && !runtimeProvider.isEmpty && runtimeProvider != wantedProvider {
+        continue
+      }
+      let status = runtime.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      // Include the row identity even when a resumed session reuses its session id.
+      // Each completed turn must be distinguishable from the terminal row that was
+      // already on screen when a new send began.
+      let taskIdentity =
+        runtime.taskId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        ?? runtime.teamRunId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        ?? "turn"
+      let rowIdentity =
+        row.messageId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? row.key
+      let identity = "\(taskIdentity)|\(rowIdentity)"
+      return (status, identity)
+    }
+    return nil
+  }
+
+  private func beginBridgeOptimisticRun() {
+    let latest = latestBridgeRuntimeState()
+    bridgeOptimisticBaselineTerminalIdentity =
+      latest.map { Self.bridgeTerminalRuntimeStatuses.contains($0.status) ? $0.identity : nil } ?? nil
+    let deadline = ProcessInfo.processInfo.systemUptime + Self.bridgeOptimisticRunWindow
+    bridgeOptimisticRunDeadline = deadline
+    bridgeOptimisticRunClearWorkItem?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, self.bridgeOptimisticRunDeadline == deadline else { return }
+      self.bridgeOptimisticRunDeadline = 0
+      self.bridgeOptimisticBaselineTerminalIdentity = nil
+      self.bridgeOptimisticRunClearWorkItem = nil
+      self.syncComposerStopState()
+    }
+    bridgeOptimisticRunClearWorkItem = work
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + Self.bridgeOptimisticRunWindow, execute: work)
+    syncComposerStopState()
+  }
+
+  private func clearBridgeOptimisticRun() {
+    bridgeOptimisticRunClearWorkItem?.cancel()
+    bridgeOptimisticRunClearWorkItem = nil
+    bridgeOptimisticRunDeadline = 0
+    bridgeOptimisticBaselineTerminalIdentity = nil
+    syncComposerStopState()
   }
 
   /// Stable key for optimistic STOP suppression after a cancel is fired.
@@ -3854,8 +3864,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func bridgeRunIsLive() -> Bool {
     let chatId = pendingBridgeChatKey
     guard !chatId.isEmpty, currentBridgeProvider != nil else { return false }
-    if ChatEngine.shared.bridgeRunIsActive(chatId: chatId) { return true }
-    return rows.contains { $0.isAgentMessage && bridgeRowIsLive($0) }
+    return agentComposerHasLiveTask()
   }
 
   private func enqueuePendingBridgeSend(
@@ -5017,7 +5026,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       (persistedOpeningViewport?.atBottom ?? false) ? "Y" : "N",
       persistedOpeningViewport?.screenY ?? -1.0)
 
+    // Direct Claude/Codex/etc. chats always open on their newest turn. Reusing a
+    // same-run mid-history anchor here makes a late history-detail mount paint an
+    // old/top viewport before correcting to the bottom.
+    let bridgeAgentOpensAtLatest = currentBridgeProvider != nil && !isGroupOrChannel
+
     let unreadTargetIndex: Int? = {
+      guard !bridgeAgentOpensAtLatest else { return nil }
       guard openingUnreadCount > 0 else { return nil }
       let incomingIndices = rows.indices.filter { index in
         let row = rows[index]
@@ -5029,7 +5044,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }()
 
     let savedTargetIndex: Int? = {
-      guard unreadTargetIndex == nil,
+      guard !bridgeAgentOpensAtLatest, unreadTargetIndex == nil,
         let messageId = persistedOpeningViewport?.messageId,
         !messageId.isEmpty
       else { return nil }
@@ -6099,8 +6114,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // racing a pop that detached the view before its post-commit mount tick ran).
     deferredPresentationSeedSourceRows = nil
     deferredPresentationSeedPreferredRows = nil
-    removeReopenSnapshotOverlay(reason: "rows-applied", animated: false)
-    removeSeedLoadingIndicator(reason: "rows-applied")
     isApplyingRowsUpdate = true
     _setRowsGeneration &+= 1
     let mySetRowsGeneration = _setRowsGeneration
@@ -6419,7 +6432,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         ChatAudioQueueRegistry.shared.setRows(parsed, for: resolvedChatId)
         VoiceBubblePlaybackCoordinator.shared.refreshCurrentSnapshotIfNeeded(forChatId: resolvedChatId)
       }
-      self.updateBridgeEmptyHistoryPromptVisibility()
     }
 
     // Set to true (before calling finalize) by the reconfigure path when this update is
@@ -6533,6 +6545,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       } else {
         self.restoreStationaryDistance(previousDistanceFromBottom)
       }
+      // Keep the frame-one raster/loading cover over the collection until rows are
+      // fully laid out and positioned. Removing it at apply start exposed the list at
+      // its provisional top offset for the 100–500ms rich-cell measurement pass, then
+      // visibly jumped to bottom when opening-viewport restore ran.
+      self.removeReopenSnapshotOverlay(reason: "rows-mounted", animated: false)
+      self.removeSeedLoadingIndicator(reason: "rows-mounted")
       self.previousOffsetY = self.collectionView.contentOffset.y
       self.emitViewport(force: true)
       self.finishRowsUpdate(historyRevealCompleted: isHistoryRevealPrepend)
@@ -6664,11 +6682,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       applyDataSource()
       UIView.performWithoutAnimation {
-        collectionView.reloadData()
-      }
-      UIView.performWithoutAnimation {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        collectionView.reloadData()
         finalize(false)
         CATransaction.commit()
       }
@@ -7955,6 +7971,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   func setEngineChatId(_ value: String) {
     let next = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if engineChatId == next { return }
+    bridgeOptimisticRunClearWorkItem?.cancel()
+    bridgeOptimisticRunClearWorkItem = nil
+    bridgeOptimisticRunDeadline = 0
+    bridgeOptimisticBaselineTerminalIdentity = nil
     engineChatId = next
     chatOpenStartedAt = ProcessInfo.processInfo.systemUptime
     openingUnreadCount = 0
@@ -11481,16 +11501,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return nil
   }
 
-  private func projectedTransitionTargetRect(for row: ChatListRow) -> CGRect? {
+  private func projectedTransitionTargetRect(for row: ChatListRow, at indexPath: IndexPath? = nil)
+    -> CGRect?
+  {
     guard row.kind == .message else {
       return nil
     }
     let rowWidth = max(1.0, collectionView.bounds.width - (messageHorizontalInset * 2.0))
+    // A projected group target must use the same gutter-aware width as the real row.
+    let groupExtras = isGroupOrChannel
+      ? indexPath.map { groupMeasurementExtras(at: $0) }
+      : nil
     let metrics = measureMessageBubbleLayout(
-      row: row, rowWidth: rowWidth, agentTurnState: agentTurnBubbleState(for: row)
+      row: row,
+      rowWidth: groupExtras?.measurementWidth ?? rowWidth,
+      agentTurnState: agentTurnBubbleState(for: row)
     )
-    let bubbleXInRow =
-      row.isMe ? rowWidth - metrics.bubbleWidth - bubbleSideMargin : bubbleSideMargin
+    let bubbleXInRow: CGFloat
+    if let groupExtras {
+      bubbleXInRow =
+        row.isMe
+        ? rowWidth - metrics.bubbleWidth - bubbleSideMargin
+        : bubbleSideMargin + groupExtras.extraLeading
+    } else {
+      // Keep direct-chat target geometry exactly on its existing path.
+      bubbleXInRow =
+        row.isMe ? rowWidth - metrics.bubbleWidth - bubbleSideMargin : bubbleSideMargin
+    }
 
     let bubbleYInHost: CGFloat = {
       let listMinY = collectionView.frame.minY
@@ -12223,15 +12260,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     messageId: String,
     fallbackPayload: SendTransitionPayload? = nil
   ) -> CGRect? {
+    // Reuse the post-insert index for group-aware projected geometry when available.
+    let indexPath = indexForMessage(messageId).flatMap { rowIndex in
+      rowIndex < rows.count ? IndexPath(item: rowIndex, section: 0) : nil
+    }
     if projectedSendTransitionMessageId == messageId,
       let fallbackPayload,
       let row = resolveTransitionRow(for: fallbackPayload),
-      let projected = projectedTransitionTargetRect(for: row)
+      let projected = projectedTransitionTargetRect(for: row, at: indexPath)
     {
       return projected
     }
-    if let rowIndex = indexForMessage(messageId), rowIndex < rows.count {
-      let indexPath = IndexPath(item: rowIndex, section: 0)
+    if let indexPath {
       if let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell,
         let rect = cell.bubbleRect(in: self)
       {
@@ -12239,27 +12279,51 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
     }
     if let fallbackPayload, let row = resolveTransitionRow(for: fallbackPayload) {
-      return projectedTransitionTargetRect(for: row)
+      return projectedTransitionTargetRect(for: row, at: indexPath)
     }
     return nil
   }
 
-  private func makeTransitionSnapshotCell(for row: ChatListRow, targetBubbleRect: CGRect)
-    -> ChatListCell
+  private func makeTransitionSnapshotCell(
+    for row: ChatListRow,
+    at indexPath: IndexPath?,
+    targetBubbleRect: CGRect
+  ) -> ChatListCell
   {
     let rowWidth = max(1.0, bounds.width - (messageHorizontalInset * 2.0))
+    // Match the real group row's gutter/name measurement whenever it already has an index.
+    let groupExtras = isGroupOrChannel
+      ? indexPath.map { groupMeasurementExtras(at: $0) }
+      : nil
     let rowHeight: CGFloat
     if row.kind == .day {
       rowHeight = 30.0
     } else {
-      rowHeight = estimateMessageHeight(row, rowWidth: rowWidth)
+      rowHeight =
+        estimateMessageHeight(row, rowWidth: groupExtras?.measurementWidth ?? rowWidth)
+        + (groupExtras?.extraTop ?? 0.0)
     }
 
     let renderCell = ChatListCell(
       frame: CGRect(x: messageHorizontalInset, y: 0.0, width: rowWidth, height: max(1.0, rowHeight))
     )
     renderCell.applyAppearance(appearance)
-    renderCell.configure(row: row, hiddenMessageId: nil)
+    if isGroupOrChannel, let indexPath {
+      // Snapshot-only cells bypass configureMessageCell, so pass its group context explicitly.
+      let groupContext = groupCellContext(at: indexPath)
+      renderCell.configure(
+        row: row,
+        hiddenMessageId: nil,
+        agentTurnState: agentTurnBubbleState(for: row),
+        groupExtraLeading: groupContext.reservesGutter ? Self.groupIncomingExtraLeading : 0.0,
+        groupSenderName: groupContext.senderName,
+        groupSenderColor: groupContext.senderColor,
+        groupSenderNameHeight: Self.groupSenderNameHeight
+      )
+    } else {
+      // Preserve the direct-chat snapshot configuration byte-for-byte.
+      renderCell.configure(row: row, hiddenMessageId: nil)
+    }
     bindWallpaperBackdrop(to: renderCell)
     transitionOverlayHost.addSubview(renderCell)
     renderCell.setNeedsLayout()
@@ -12303,8 +12367,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let settledTargetRect =
       resolveTransitionTargetRect(messageId: payload.messageId, fallbackPayload: payload)
       ?? targetRect
+    // The optimistic row index makes the offscreen snapshot group-decoration aware.
+    let targetIndexPath = indexForMessage(payload.messageId).map {
+      IndexPath(item: $0, section: 0)
+    }
     let snapshotCell = makeTransitionSnapshotCell(
       for: targetRow,
+      at: targetIndexPath,
       targetBubbleRect: settledTargetRect
     )
     defer {
@@ -13203,11 +13272,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard agentChatMode || currentBridgeProvider != nil || groupHasBridgeAgents() else {
       return false
     }
-    if agentStreaming && !stopRequestedAgentStream { return true }
-    return rows.contains { row in
-      guard bridgeRowIsLive(row) else { return false }
-      return !stopCancelRequestedKeys.contains(liveBridgeTaskKey(for: row))
+    let bridgeSurface = currentBridgeProvider != nil || groupHasBridgeAgents()
+    if bridgeSurface {
+      // A real live row always wins, including concurrent workers in an agent group.
+      if rows.contains(where: bridgeRowIsLive) { return true }
+
+      let optimisticActive =
+        ProcessInfo.processInfo.systemUptime < bridgeOptimisticRunDeadline
+      if let latest = latestBridgeRuntimeState(),
+        Self.bridgeTerminalRuntimeStatuses.contains(latest.status)
+      {
+        // Ignore only the already-visible terminal row captured when this send began.
+        // A different terminal identity is the result of the new run and settles the
+        // header + STOP immediately, even while the engine's anti-flicker grace is live.
+        let isPreSendTerminal =
+          optimisticActive && latest.identity == bridgeOptimisticBaselineTerminalIdentity
+        if !isPreSendTerminal { return false }
+      }
+      if ChatEngine.shared.bridgeRunIsActive(chatId: engineChatId) { return true }
+      return optimisticActive
     }
+    return agentStreaming && !stopRequestedAgentStream
   }
 
   /// Push SEND vs STOP onto whichever composer is mounted (ChatInputBar is the
@@ -13216,6 +13301,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let live = agentComposerHasLiveTask()
     inputBar?.setAgentStreaming(live)
     agentComposerView?.setTaskActive(live)
+    onAgentRunStateChanged?()
   }
 
   /// Composer STOP: cancel every live bridge run in this chat (DM or multi-agent
@@ -13229,12 +13315,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     let liveRows = rows.filter(bridgeRowIsLive)
-    // Record optimistic cancels first so STOP flips off even if the socket is slow.
-    for row in liveRows {
-      stopCancelRequestedKeys.insert(liveBridgeTaskKey(for: row))
-    }
-    scheduleStopCancelClearTimeout()
-    syncComposerStopState()
+    // Keep STOP visible until the bridge/runtime actually settles. Optimistically
+    // hiding it made a dropped cancel look successful and prevented a second attempt.
 
     if liveRows.isEmpty {
       // No live row yet (race after send) — still cancel the DM provider if known.
@@ -13246,6 +13328,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         ]
         NSLog("[ChatListView] agentComposerStop chat=%@ provider=%@ taskId=nil (no live row)", chatId, provider)
         _ = ChatEngine.shared.sendAgentBridgeControl(payload)
+        // STOP can win the race with bridge task registration. Repeat the idempotent
+        // cancel while the authoritative state still says this run is active.
+        for delay in [0.3, 0.9] {
+          DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard self.agentComposerHasLiveTask() else { return }
+            _ = ChatEngine.shared.sendAgentBridgeControl(payload)
+          }
+        }
       }
       return
     }
@@ -13826,7 +13916,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     inputBar?.setAgentControlMode(
       agentChatMode || currentBridgeProvider != nil || groupHasBridgeAgents())
     scheduleBridgeAgentPresenceRefresh()
-    updateBridgeEmptyHistoryPromptVisibility()
   }
 
   func setAvatarUri(_ value: String?) {
@@ -14106,6 +14195,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   func startNewBridgeSession() {
+    clearBridgeOptimisticRun()
     self.setBridgeLoadedSessionId(nil)
     self.activeBridgeSessionId = nil
     hideBridgeSessionLoadingSpinner()
@@ -14125,7 +14215,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     presentedBridgeAgentVC?.isHistoryPicked = false
     presentedBridgeAgentVC?.setMessages([])
     if !self.sourceRowsPayload.isEmpty { self.setRows(self.sourceRowsPayload) }
-    updateBridgeEmptyHistoryPromptVisibility()
   }
 
   /// Ingest a picked history session's transcript into THIS chat (keyed
@@ -14490,28 +14579,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
-    // Multi-agent group text send (no attachments): also skip morph when the
-    // fan-out metadata is present so agent-bound messages don't hide mid-flight.
+    // Preserve the group retry id/fresh-row bookkeeping, but let renderable text continue
+    // into the shared native transition below; agent fan-out is not a morph capability test.
+    var nativeTransitionMessageId = messageId
     if isGroupAgentSurface && !fromAgentSurface && !bridgeMetadata.isEmpty {
-      inputBar?.dismissReplyBanner(animated: false)
-      inputBar?.clearText()
       let outgoingMessageId = editingAgentMessageId ?? messageId
       editingAgentMessageId = nil
       if !bridgeMetadata.isEmpty {
         noteBridgeFreshOwnSentId(outgoingMessageId)
       }
-      dispatchOutgoingSend(
-        messageId: outgoingMessageId,
-        text: text,
-        timestamp: timestamp,
-        timestampMs: timestampMs,
-        replyToMessageId: replyToMessageId,
-        bridgeMetadata: bridgeMetadata,
-        agentMention: agentMention,
-        agentText: agentText,
-        mentionedAgentUsername: mentionedAgentUsername
-      )
-      return
+      nativeTransitionMessageId = outgoingMessageId
     }
 
     // Agent runtime surface: it owns its own composer (the chat input bar is offscreen
@@ -14556,7 +14633,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     // 1. Hide the message cell immediately (before it even exists).
-    hiddenMessageId = messageId
+    hiddenMessageId = nativeTransitionMessageId
 
     // 2. Compute source rects and capture live text snapshot (BEFORE clearing).
     let sourceRect: CGRect
@@ -14601,7 +14678,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     // 3. Store pending transition so it starts when the cell arrives.
     let payload = SendTransitionPayload(
-      messageId: messageId,
+      messageId: nativeTransitionMessageId,
       text: text,
       timestamp: timestamp,
       startRect: sourceRect,
@@ -14622,7 +14699,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     // 6. Either append natively (no JS dependency) or delegate to JS.
     dispatchOutgoingSend(
-      messageId: messageId,
+      messageId: nativeTransitionMessageId,
       text: text,
       timestamp: timestamp,
       timestampMs: timestampMs,
@@ -14691,6 +14768,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         return
       }
+      // Expose STOP as soon as the validated bridge send begins; do not wait for the
+      // first streamed runtime row to round-trip from the computer.
+      if isBridgeSend {
+        beginBridgeOptimisticRun()
+      }
       var sendPayload: [String: Any] = [
         "chatId": chatId,
         "messageId": messageId,
@@ -14731,6 +14813,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           )
           DispatchQueue.main.async {
             if isBridgeSend {
+              self?.clearBridgeOptimisticRun()
               self?.showBridgeSendFailure(
                 messageId: messageId,
                 reason: (result["reason"] as? String) ?? "send_failed",
@@ -17297,7 +17380,8 @@ extension ChatListView: ChatInputBarDelegate {
     }
 
     // Native Vibe AI stream (agent chat without a bridge provider).
-    if agentChatMode || agentStreaming {
+    let isNativeAgentStream = currentBridgeProvider == nil && !groupHasBridgeAgents()
+    if isNativeAgentStream && (agentChatMode || agentStreaming) {
       stopRequestedAgentStream = true
       syncComposerStopState()
       scheduleStopCancelClearTimeout()
