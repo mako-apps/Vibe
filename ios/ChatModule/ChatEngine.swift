@@ -1644,6 +1644,10 @@ final class ChatEngine {
       let existingCount = self.historyRowsByChat[chatId]?.count ?? 0
       guard existingCount < rows.count else { return }
       self.historyRowsByChat[chatId] = rows
+      // If a row is good enough to paint, it is good enough to persist. These came from
+      // the Home payload — for a chat the user never opens they may be the only rows we
+      // ever hold, and without this they died with the process.
+      self.storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
       self.appendJournalLocked(
         event: "native-chat-history-seed-recent",
         payload: ["chatId": chatId, "rows": rows.count]
@@ -1671,8 +1675,17 @@ final class ChatEngine {
         // We only seed if the full history hasn't already been loaded.
         if !historyFullyLoadedChats.contains(chatId) {
           let rows = buildHistoryRowsLocked(chatId: chatId, rawMessages: messagesArray)
+          // A home payload that carries no messages for this chat must not install an
+          // empty transcript, and a 5-row preview must not replace a longer slice some
+          // other seed already put there. The in-memory entry is nil (unknown) or real.
+          guard !rows.isEmpty, rows.count > (historyRowsByChat[chatId]?.count ?? 0) else {
+            continue
+          }
           historyRowsByChat[chatId] = rows
           historyRowsRestoredFromCacheChats.remove(chatId)
+          // Same rule as seedRecentChatHistory: paintable ⇒ persisted. This is what gives
+          // a never-opened chat a durable tail to paint from on the next cold launch.
+          storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
           triggered += 1
         }
       }
@@ -10871,6 +10884,12 @@ final class ChatEngine {
   private func restoreCachedHistoryRowsLocked(chatId: String) -> Bool {
     guard !chatId.isEmpty else { return false }
     if isVolatileBridgeAgentChatLocked(chatId: chatId) {
+      // Classified as an agent/bridge DM, whose transcript is deliberately volatile.
+      // Say so: otherwise a misclassified normal DM looks identical to a chat that was
+      // never persisted, and this path also DELETES whatever was stored.
+      NSLog(
+        "[HistoryStore] restore SKIP-BRIDGE chat=%@ — classified as an agent DM (volatile)",
+        String(chatId.prefix(12)))
       clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "restore_cache")
       return false
     }
@@ -10912,7 +10931,15 @@ final class ChatEngine {
     }
     // Self-heal caches written before transient rows were excluded from storage.
     let rows = decodedRows.filter { !isTransientStreamRow($0) }
-    guard !rows.isEmpty else { return false }
+    guard !rows.isEmpty else {
+      // The store HAS rows for this chat but every one of them is a transient
+      // placeholder — a distinct failure from "nothing was ever written", and
+      // previously silent.
+      NSLog(
+        "[HistoryStore] restore DROPPED chat=%@ — all %d stored rows are transient (stream-/lan-)",
+        String(chatId.prefix(12)), decodedRows.count)
+      return false
+    }
 
     historyRowsByChat[chatId] = rows
     historyFullyLoadedChats.insert(chatId)
@@ -11157,7 +11184,13 @@ final class ChatEngine {
       !$0.key.hasPrefix(listPrefix)
     }
     pendingAgentBridgeHistoryRequestsByChat.removeValue(forKey: chatId)
-    clearCachedHistoryRowsLocked(chatId: chatId)
+    // Deliberately NOT clearing the durable store. This runs off a RUNTIME
+    // classification (`bridgeProviderForChatLocked`) whose maps are empty at t=0.1s and
+    // populated seconds later, so the same chat can classify differently within one run —
+    // and for a chat whose content is device-only, the delete is unrecoverable. Rendering
+    // hygiene is already handled by refusing to RESTORE for a bridge chat (see
+    // `restoreCachedHistoryRowsLocked`), which needs no bytes destroyed to work.
+    // Classification may route; it may not destroy.
     appendJournalLocked(
       event: "native-bridge-history-cleared",
       payload: ["chatId": chatId, "reason": reason]
@@ -11788,7 +11821,9 @@ final class ChatEngine {
       historyHasMoreByChat.removeValue(forKey: chatId)
       historyNextCursorByChat.removeValue(forKey: chatId)
       historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
-      clearCachedHistoryRowsLocked(chatId: chatId)
+      // In-memory only: same reason as `clearVolatileBridgeHistoryLocked` — this branch
+      // is reached by a runtime classification that can flip within a run, so it must
+      // never delete a chat's durable rows.
       appendJournalLocked(
         event: "native-chat-history-skip",
         payload: ["chatId": chatId, "reason": "agent_surface"]
@@ -12058,13 +12093,21 @@ final class ChatEngine {
           "chatId": chatId,
           "error": "empty_saved_messages_response",
         ])
-      historyFullyLoadedChats.insert(chatId)
-      if historyRowsByChat[chatId] == nil {
-        historyRowsByChat[chatId] = []
-      }
-      historyRowsRestoredFromCacheChats.remove(chatId)
-      clearCachedHistoryRowsLocked(chatId: chatId)
+      // An empty saved-messages response is NOT evidence that saved messages were
+      // deleted — it is equally a hiccup, an auth blip or an outage. It used to be
+      // treated as truth twice over: it wiped the durable transcript AND installed an
+      // empty in-memory array, which then satisfied every later restore. Absence is
+      // never delete evidence; fall back to whatever the local store holds.
       cachedSavedMessagesResponse = []
+      if (historyRowsByChat[chatId] ?? []).isEmpty {
+        historyRowsByChat.removeValue(forKey: chatId)
+        historyFullyLoadedChats.remove(chatId)
+        if !restoreCachedHistoryRowsLocked(chatId: chatId) {
+          historyRowsByChat[chatId] = []
+          historyFullyLoadedChats.insert(chatId)
+          historyRowsRestoredFromCacheChats.remove(chatId)
+        }
+      }
       let snapshot = statusSnapshotLocked()
       postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId, "state": snapshot])
       return
