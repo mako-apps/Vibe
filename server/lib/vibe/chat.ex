@@ -322,6 +322,9 @@ defmodule Vibe.Chat do
             # True for multi-party rooms (groups + broadcast channels). Clients
             # also derive this from type, but an explicit flag avoids DM fallthrough.
             isGroup: room_type in ["group", "channel"],
+            # Explicit channel flag so clients never fall back to "Group" chrome
+            # when type is missing from a stale cache row.
+            isChannel: room_type == "channel",
             lastMessageAt: last_activity_at,
             name: if(room, do: room.name, else: nil),
             description: if(room, do: room.description, else: nil),
