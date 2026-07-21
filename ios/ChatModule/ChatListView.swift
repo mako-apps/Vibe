@@ -5200,14 +5200,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private static let scrollingDayFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = .autoupdatingCurrent
-    formatter.setLocalizedDateFormatFromTemplate("MMM d")
+    // Full month name ("July 20"), not the abbreviated "Jul 20" — the in-list day
+    // divider and the floating scroll pill both read from here.
+    formatter.setLocalizedDateFormatFromTemplate("MMMM d")
     return formatter
   }()
 
   private static let scrollingDayYearFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = .autoupdatingCurrent
-    formatter.setLocalizedDateFormatFromTemplate("MMM d yyyy")
+    formatter.setLocalizedDateFormatFromTemplate("MMMM d yyyy")
     return formatter
   }()
 
@@ -8679,6 +8681,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     scrollingDatePill.isHidden = false
     scrollingDatePill.alpha = 1.0
     layoutScrollingDatePill()
+
+    // Pinned-section-header shove: when the NEXT day's in-list separator rises into the
+    // sticky slot from below, translate the current floating date UP so it tucks up behind
+    // the header, then that separator hands off as the new sticky date (the reverse,
+    // scroll-up direction, is covered by the same-label suppression above). This is what
+    // makes the date read as an attached element that y-translates behind the header,
+    // rather than a fixed pill that only cross-fades its text in place.
+    let pillHeight = scrollingDatePill.bounds.height
+    var shoveUp: CGFloat = 0.0
+    if pillHeight > 0.0 {
+      for candidate in visibleItems {
+        guard candidate.item < rows.count, rows[candidate.item].kind == .day,
+          rows[candidate.item].label != label,
+          let attrs = collectionView.layoutAttributesForItem(at: candidate)
+        else { continue }
+        let separatorTop = attrs.frame.midY - offsetY - (pillHeight / 2.0)
+        guard separatorTop >= slotY - 0.5 else { continue }  // only separators still below the slot
+        if separatorTop <= slotY + pillHeight {
+          shoveUp = min(pillHeight, max(0.0, (slotY + pillHeight) - separatorTop))
+        }
+        break  // the nearest upcoming boundary owns the shove
+      }
+    }
+    if shoveUp > 0.5 {
+      scrollingDatePill.transform = CGAffineTransform(translationX: 0.0, y: -shoveUp)
+      scrollingDatePill.alpha = max(0.0, 1.0 - (shoveUp / pillHeight))
+    } else {
+      scrollingDatePill.transform = .identity
+      scrollingDatePill.alpha = 1.0
+    }
   }
 
   func scrollToMessage(messageId: String, animated: Bool, viewPosition: Double) {
