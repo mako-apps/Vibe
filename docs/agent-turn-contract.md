@@ -41,6 +41,23 @@ the user's answer starts a new turn. If a provider emits `ask_user` beside other
 tool calls, Vibe executes only the question call and ends the turn, so no sibling
 mutation can run speculatively while required input is missing.
 
+## Provider failover
+
+The shared Vibe agent runtime uses Claude as its primary provider. If Claude is
+unavailable before visible text has streamed, the same turn automatically moves
+to OpenAI's Responses API using `gpt-5.6-luna`; the selected provider remains
+sticky through later tool rounds in that turn. The adapter preserves ordered
+text deltas, function-call `call_id` values, function outputs, image inputs, and
+the terminal `ask_user` contract.
+
+`OPENAI_API_KEY` enables the fallback. Operators may override the model with
+`OPENAI_AGENT_FALLBACK_MODEL`, but only GPT-5.5 and GPT-5.6 family identifiers
+are accepted; an old GPT-5 value is rejected in favor of `gpt-5.6-luna`.
+`OPENAI_AGENT_FALLBACK_REASONING_EFFORT` defaults to `medium` and accepts
+`none`, `low`, `medium`, `high`, `xhigh`, or `max`. If Claude fails after text
+has already reached the client, the runtime ends that attempt instead of mixing
+two providers inside one mutable streaming row.
+
 Standalone invoke responses also carry `status` (`completed` or
 `waiting_for_user`) and `agent_turn_id`; the same turn id is copied into every
 finalized output part.
