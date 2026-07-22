@@ -11,6 +11,7 @@ defmodule VibeWeb.AgentChannel do
   alias Vibe.AI.Agent
   alias Vibe.AI.AgentBuilder
   alias Vibe.AI.AgenticEventShape
+  alias Vibe.AI.StandaloneAgent
   alias Vibe.AgentConversation
 
   @doc """
@@ -85,10 +86,19 @@ defmodule VibeWeb.AgentChannel do
              images: images,
              user_id: user_id
            ) do
-        {:ok, full_response, _runtime_state} ->
+        {:ok, full_response, runtime_state} ->
           # Update the assistant message in database
           send(channel_pid, {:finalize_message, conv_id, full_response})
-          send(channel_pid, {:push, "done", %{success: true, conversation_id: conv_id}})
+
+          send(
+            channel_pid,
+            {:push, "done",
+             %{
+               success: true,
+               conversation_id: conv_id,
+               status: Map.get(runtime_state, :terminal_status, "completed")
+             }}
+          )
 
         {:ok, full_response} ->
           # Update the assistant message in database
@@ -300,12 +310,35 @@ defmodule VibeWeb.AgentChannel do
   def handle_info({:finalize_message, conv_id, full_response}, socket) do
     socket = flush_pending_agent_cards(socket)
     tool_results = socket.assigns[:tool_results] || []
+    final_text = StandaloneAgent.final_text_with_tool_fallback(full_response, tool_results)
+
+    if final_text != "" and normalize_optional_string(full_response) == nil do
+      push(
+        socket,
+        "chunk",
+        AgenticEventShape.enrich("chunk", %{text: final_text, conversation_id: conv_id})
+      )
+    end
+
+    rich_outputs =
+      StandaloneAgent.finalized_rich_outputs(tool_results, final_text,
+        agent_turn_id: Ecto.UUID.generate(),
+        base_timestamp: :os.system_time(:millisecond)
+      )
+
+    if rich_outputs != [] do
+      push(socket, "rich_outputs", %{
+        conversation_id: conv_id,
+        outputs: rich_outputs
+      })
+    end
 
     # Update the last message in the database
     AgentConversation.update_last_message(conv_id, %{
-      "content" => full_response,
+      "content" => final_text,
       "isStreaming" => false,
-      "toolResults" => tool_results
+      "toolResults" => tool_results,
+      "richOutputs" => rich_outputs
     })
 
     # Reset streaming state

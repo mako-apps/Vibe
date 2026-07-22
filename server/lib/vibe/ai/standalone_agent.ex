@@ -38,6 +38,10 @@ defmodule Vibe.AI.StandaloneAgent do
         {:error, :chat_not_attached}
 
       true ->
+        agent_turn_id =
+          normalize_string(params["agentTurnId"] || params["agent_turn_id"]) ||
+            Ecto.UUID.generate()
+
         with {:ok, scoped_agent} <- delivery_scoped_agent(agent, response_mode, vibe_chat_id),
              {:ok, outputs} <-
                generate_outputs(
@@ -48,6 +52,11 @@ defmodule Vibe.AI.StandaloneAgent do
                  vibe_chat_id,
                  requester_user_id
                ) do
+          outputs =
+            finalize_batch(outputs,
+              agent_turn_id: agent_turn_id
+            )
+
           # Attach provider content onto each output's metadata so it flows into
           # both the invoke response `outputs` map and Chat.add_message attrs
           # (via output_metadata → deliver_output_to_chat metadata merge).
@@ -55,7 +64,13 @@ defmodule Vibe.AI.StandaloneAgent do
 
           with {:ok, deliveries} <-
                  maybe_deliver(scoped_agent, vibe_chat_id, outputs, response_mode, reply_to_id) do
-            {:ok, %{outputs: outputs, vibe_deliveries: deliveries}}
+            {:ok,
+             %{
+               outputs: outputs,
+               vibe_deliveries: deliveries,
+               status: response_status(outputs),
+               agent_turn_id: agent_turn_id
+             }}
           end
         end
     end
@@ -137,11 +152,7 @@ defmodule Vibe.AI.StandaloneAgent do
 
       %{type: :tool_result, tool: tool_name, result: result} ->
         Elixir.Agent.update(collected, fn acc ->
-          next_outputs =
-            case tool_output_from_result(tool_name, result) do
-              nil -> acc.outputs
-              output -> merge_outputs(acc.outputs, [output])
-            end
+          next_outputs = merge_outputs(acc.outputs, tool_outputs_from_result(tool_name, result))
 
           next_text_metadata =
             acc.text_metadata
@@ -189,9 +200,19 @@ defmodule Vibe.AI.StandaloneAgent do
   defp maybe_deliver(_agent, _chat_id, _outputs, "reply", _reply_to_id), do: {:ok, []}
 
   defp maybe_deliver(agent, chat_id, outputs, "send", reply_to_id) do
+    base_timestamp = :os.system_time(:millisecond)
+
     deliveries =
-      Enum.map(outputs, fn output ->
-        deliver_output_to_chat(agent, chat_id, output, reply_to_id)
+      outputs
+      |> Enum.with_index()
+      |> Enum.map(fn {output, part_index} ->
+        deliver_output_to_chat(
+          agent,
+          chat_id,
+          output,
+          reply_to_id,
+          base_timestamp + part_index
+        )
       end)
 
     if Enum.all?(deliveries, &match?({:ok, _}, &1)) do
@@ -201,9 +222,8 @@ defmodule Vibe.AI.StandaloneAgent do
     end
   end
 
-  defp deliver_output_to_chat(agent, chat_id, output, reply_to_id) do
+  defp deliver_output_to_chat(agent, chat_id, output, reply_to_id, timestamp) do
     message_id = Ecto.UUID.generate()
-    timestamp = :os.system_time(:millisecond)
     message_type = output_type(output)
     plain_text = output_text(output)
     media_url = output_media_url(output)
@@ -426,7 +446,7 @@ defmodule Vibe.AI.StandaloneAgent do
   end
 
   defp finalize_outputs(agent, final_text, tool_outputs, text_metadata, requested_output_mode) do
-    base_outputs =
+    rich_outputs =
       tool_outputs
       |> List.wrap()
       |> Enum.reject(&is_nil/1)
@@ -435,52 +455,38 @@ defmodule Vibe.AI.StandaloneAgent do
       final_text
       |> to_string()
       |> String.trim()
-
-    outputs =
-      case requested_output_mode do
-        "voice" ->
-          if normalized_text != "" and "voice" in (agent.output_modes || []) do
-            case TTS.synthesize(normalized_text, voice: agent.voice_profile || "alloy") do
-              {:ok, voice} ->
-                base_outputs ++
-                  [
-                    %{
-                      type: "voice",
-                      text: normalized_text,
-                      mediaUrl: voice.media_url,
-                      metadata: %{"duration" => voice.duration, "mimeType" => "audio/mpeg"}
-                    }
-                  ]
-
-              {:error, reason} ->
-                Logger.warning(
-                  "[StandaloneAgent] TTS failed, falling back to text: #{inspect(reason)}"
-                )
-
-                maybe_append_text_output(base_outputs, normalized_text, text_metadata)
-            end
-          else
-            maybe_append_text_output(base_outputs, normalized_text, text_metadata)
-          end
-
-        _ ->
-          maybe_append_text_output(base_outputs, normalized_text, text_metadata)
+      |> case do
+        "" -> question_fallback_text(rich_outputs) || ""
+        text -> text
       end
 
-    filter_outputs_by_modes(outputs, agent.output_modes || [])
-  end
+    text_outputs = maybe_append_text_output([], normalized_text, text_metadata)
 
-  defp filter_outputs_by_modes(outputs, modes) do
-    Enum.filter(outputs, fn output ->
-      mode =
-        case output_type(output) do
-          "voice" -> "voice"
-          "text" -> "text"
-          _ -> "media"
+    voice_outputs =
+      if requested_output_mode == "voice" and normalized_text != "" and
+           "voice" in (agent.output_modes || []) do
+        case TTS.synthesize(normalized_text, voice: agent.voice_profile || "alloy") do
+          {:ok, voice} ->
+            [
+              %{
+                type: "voice",
+                text: normalized_text,
+                mediaUrl: voice.media_url,
+                metadata: %{"duration" => voice.duration, "mimeType" => "audio/mpeg"}
+              }
+            ]
+
+          {:error, reason} ->
+            Logger.warning("[StandaloneAgent] TTS failed: #{inspect(reason)}")
+            []
         end
+      else
+        []
+      end
 
-      mode in modes
-    end)
+    # Tool artifacts were already authorized by the effective tool allowlist.
+    # Keep them even when older agent rows omitted the legacy "media" mode.
+    text_outputs ++ rich_outputs ++ voice_outputs
   end
 
   defp maybe_append_text_output(outputs, "", _metadata), do: outputs
@@ -490,9 +496,10 @@ defmodule Vibe.AI.StandaloneAgent do
     outputs ++ [%{type: "text", text: text, metadata: metadata || %{}}]
   end
 
-  defp tool_output_from_result(tool_name, result)
-       when tool_name in ["create_document", "edit_rows", "delete_rows", "export_rows"] and
-              is_map(result) do
+  @doc false
+  def tool_outputs_from_result(tool_name, result)
+      when tool_name in ["create_document", "edit_rows", "delete_rows", "export_rows"] and
+             is_map(result) do
     ok? = Map.get(result, :ok) || Map.get(result, "ok")
 
     file_url =
@@ -506,17 +513,225 @@ defmodule Vibe.AI.StandaloneAgent do
       mime_type = detect_mime_type(url)
       metadata = %{"fileName" => file_name_from_url(url), "mimeType" => mime_type}
 
+      [
+        %{
+          type: if(image_output?(url, mime_type), do: "image", else: "file"),
+          mediaUrl: url,
+          metadata: metadata
+        }
+      ]
+    else
+      _ -> []
+    end
+  end
+
+  def tool_outputs_from_result("search_music", result) when is_map(result) do
+    source = map_value(result, :source) || "music"
+
+    result
+    |> map_value(:tracks)
+    |> List.wrap()
+    |> Enum.map(&music_output(&1, source))
+    |> Enum.reject(&is_nil/1)
+  end
+
+  def tool_outputs_from_result("ask_user", result) when is_map(result) do
+    status = map_value(result, :status)
+    questions = map_value(result, :questions)
+    request_id = map_value(result, :requestId) || map_value(result, :request_id)
+    fallback = map_value(result, :fallbackText) || map_value(result, :fallback_text)
+
+    if status == "waiting_for_user" and is_binary(request_id) and is_list(questions) do
+      [
+        %{
+          type: "question",
+          text: normalize_string(fallback) || "Your input is needed to continue.",
+          requestId: request_id,
+          status: status,
+          questions: questions,
+          metadata: %{
+            "requestId" => request_id,
+            "status" => status,
+            "questions" => questions
+          }
+        }
+      ]
+    else
+      []
+    end
+  end
+
+  def tool_outputs_from_result(_tool_name, _result), do: []
+
+  @doc false
+  def finalize_batch(outputs, opts \\ []) do
+    agent_turn_id = Keyword.get(opts, :agent_turn_id) || Ecto.UUID.generate()
+    agent_batch_id = Keyword.get(opts, :agent_batch_id) || Ecto.UUID.generate()
+    base_timestamp = Keyword.get(opts, :base_timestamp) || :os.system_time(:millisecond)
+    outputs = List.wrap(outputs)
+    part_count = length(outputs)
+
+    outputs
+    |> Enum.with_index()
+    |> Enum.map(fn {output, part_index} ->
+      kind = output_type(output)
+
+      batch_metadata = %{
+        "agentTurnId" => agent_turn_id,
+        "agentBatchId" => agent_batch_id,
+        "agentPartId" => Ecto.UUID.generate(),
+        "agentPartIndex" => part_index,
+        "agentPartCount" => part_count,
+        "agentPartKind" => kind,
+        "agentFinalized" => true
+      }
+
+      output
+      |> Map.drop([:metadata, "metadata", :timestamp, "timestamp"])
+      |> Map.put(:metadata, Map.merge(output_metadata(output), batch_metadata))
+      |> Map.put(:timestamp, base_timestamp + part_index)
+    end)
+  end
+
+  @doc false
+  def finalized_rich_outputs(tool_results, final_text, opts \\ []) do
+    rich_outputs =
+      tool_results
+      |> List.wrap()
+      |> Enum.flat_map(fn item ->
+        tool = map_value(item, :tool)
+        result = map_value(item, :result)
+        tool_outputs_from_result(tool, result)
+      end)
+
+    if rich_outputs == [] do
+      []
+    else
+      text_output = %{type: "text", text: normalize_string(final_text) || ""}
+
+      [text_output | rich_outputs]
+      |> finalize_batch(opts)
+      |> Enum.reject(&(output_type(&1) == "text"))
+    end
+  end
+
+  @doc false
+  def final_text_with_tool_fallback(final_text, tool_results) do
+    case normalize_string(final_text) do
+      text when is_binary(text) ->
+        text
+
+      nil ->
+        tool_results
+        |> List.wrap()
+        |> Enum.flat_map(fn item ->
+          tool_outputs_from_result(map_value(item, :tool), map_value(item, :result))
+        end)
+        |> question_fallback_text()
+        |> case do
+          nil -> ""
+          text -> text
+        end
+    end
+  end
+
+  defp question_fallback_text(outputs) do
+    outputs
+    |> Enum.find(&(output_type(&1) == "question"))
+    |> case do
+      nil -> nil
+      output -> normalize_string(output_text(output))
+    end
+  end
+
+  defp response_status(outputs) do
+    if Enum.any?(outputs, fn output ->
+         map_value(output, :status) == "waiting_for_user" or
+           map_value(output_metadata(output), :status) == "waiting_for_user"
+       end) do
+      "waiting_for_user"
+    else
+      "completed"
+    end
+  end
+
+  defp music_output(track, source) when is_map(track) do
+    video_id = map_value(track, :video_id) || map_value(track, :videoId)
+    preview_url = map_value(track, :preview_url) || map_value(track, :previewUrl)
+
+    media_url =
+      normalize_string(preview_url) ||
+        if(is_binary(normalize_string(video_id)), do: public_music_stream_url(video_id))
+
+    if is_binary(media_url) do
+      duration = map_value(track, :duration)
+      track_id = map_value(track, :track_id) || map_value(track, :trackId) || video_id
+
+      metadata = %{
+        "trackId" => track_id,
+        "videoId" => video_id,
+        "title" => map_value(track, :title),
+        "artist" => map_value(track, :artist),
+        "album" => map_value(track, :album),
+        "duration" => duration,
+        "durationSeconds" => duration_seconds(duration),
+        "cover" => map_value(track, :cover),
+        "source" => source,
+        "links" => map_value(track, :links) || %{}
+      }
+
       %{
-        type: if(image_output?(url, mime_type), do: "image", else: "file"),
-        mediaUrl: url,
+        type: "music",
+        text: map_value(track, :title) || "Music",
+        mediaUrl: media_url,
         metadata: metadata
       }
-    else
+    end
+  end
+
+  defp music_output(_, _), do: nil
+
+  defp duration_seconds(value) when is_integer(value), do: value
+  defp duration_seconds(value) when is_float(value), do: round(value)
+
+  defp duration_seconds(value) when is_binary(value) do
+    case String.split(String.trim(value), ":") do
+      [minutes, seconds] ->
+        with {minutes, ""} <- Integer.parse(minutes),
+             {seconds, ""} <- Integer.parse(seconds) do
+          minutes * 60 + seconds
+        else
+          _ -> parse_duration_integer(value)
+        end
+
+      _ ->
+        parse_duration_integer(value)
+    end
+  end
+
+  defp duration_seconds(_), do: nil
+
+  defp parse_duration_integer(value) do
+    case Integer.parse(String.trim(value)) do
+      {seconds, ""} -> seconds
       _ -> nil
     end
   end
 
-  defp tool_output_from_result(_tool_name, _result), do: nil
+  defp public_music_stream_url(video_id) do
+    path = "/api/music/stream/#{URI.encode_www_form(to_string(video_id))}"
+
+    case System.get_env("PUBLIC_BASE_URL") || System.get_env("API_BASE_URL") do
+      base when is_binary(base) and base != "" -> String.trim_trailing(base, "/") <> path
+      _ -> path
+    end
+  end
+
+  defp map_value(map, key) when is_map(map) do
+    Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  end
+
+  defp map_value(_, _), do: nil
 
   defp text_metadata_from_result("query_event_inbox", result) when is_map(result) do
     related_message_ids =
@@ -542,10 +757,7 @@ defmodule Vibe.AI.StandaloneAgent do
   defp text_metadata_from_result(_tool_name, _result), do: %{}
 
   defp merge_outputs(existing, new_outputs) do
-    (List.wrap(existing) ++ List.wrap(new_outputs))
-    |> Enum.uniq_by(fn output ->
-      {output_type(output), output_media_url(output), output_text(output)}
-    end)
+    List.wrap(existing) ++ List.wrap(new_outputs)
   end
 
   defp recent_chat_history(chat_id, requester_user_id, agent_user_id)

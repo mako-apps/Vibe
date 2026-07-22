@@ -1,0 +1,318 @@
+defmodule Vibe.AgentTurnContractTest do
+  use ExUnit.Case, async: false
+
+  alias Vibe.Accounts.User
+  alias Vibe.Agent
+  alias Vibe.AI.Agent, as: ChatAgent
+  alias Vibe.AI.StandaloneAgent
+  alias Vibe.AI.ToolRegistry
+  alias Vibe.AI.Tools.Channel
+  alias Vibe.Chat
+  alias Vibe.Repo
+
+  setup context do
+    if context[:db] do
+      :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+
+      owner = insert_user("turn_owner")
+      subscriber = insert_user("turn_subscriber")
+      agent = insert_agent(owner)
+
+      %{owner: owner, subscriber: subscriber, agent: agent}
+    else
+      :ok
+    end
+  end
+
+  @tag :db
+  test "tool registry exposes effective and bounded testability state", %{
+    owner: owner,
+    subscriber: subscriber,
+    agent: agent
+  } do
+    assert ToolRegistry.get("search_music").testability == "live_readonly"
+    assert ToolRegistry.get("create_chat_space").testability == "dry_run"
+    assert ToolRegistry.get("post_to_channel").category == "chat_management"
+    assert ToolRegistry.get("schedule_channel_post").testability == "dry_run"
+
+    effective = ChatAgent.effective_tool_names(["search_music"])
+    assert "search_music" in effective
+    assert "ask_user" in effective
+    assert "inspect_current_agent_tools" in effective
+    refute "create_chat_space" in effective
+
+    inspected = ChatAgent.inspect_current_agent_tools(%{}, agent.id, owner.id)
+    assert inspected["ok"]
+    assert inspected["output_modes"]["supported"] == ["text", "media", "voice"]
+    assert Enum.find(inspected["tools"], &(&1["id"] == "ask_user"))["effective"]
+
+    denied = ChatAgent.inspect_current_agent_tools(%{}, agent.id, subscriber.id)
+    refute denied["ok"]
+
+    dry_run =
+      ChatAgent.test_current_agent_tool(
+        %{"tool_id" => "update_current_agent_config"},
+        agent.id,
+        owner.id
+      )
+
+    assert dry_run["ok"]
+    refute dry_run["executed"]
+    refute dry_run["capability"]["mutation_performed"]
+  end
+
+  @tag :db
+  test "current agent config tool normalizes lists and rejects a subscriber", %{
+    owner: owner,
+    subscriber: subscriber,
+    agent: agent
+  } do
+    updated =
+      ChatAgent.update_current_agent_config(
+        %{
+          "enabled_tools" => ["search_music", "create_chat_space", "search_music"],
+          "output_modes" => ["text", "media"]
+        },
+        agent.id,
+        owner.id
+      )
+
+    assert updated["ok"]
+    assert updated["agent"]["enabled_tools"] == ["search_music", "create_chat_space"]
+    assert updated["agent"]["output_modes"] == ["text", "media"]
+
+    denied =
+      ChatAgent.update_current_agent_config(
+        %{"enabled_tools" => ["search_google"]},
+        agent.id,
+        subscriber.id
+      )
+
+    refute denied["ok"]
+    assert Repo.get!(Agent, agent.id).enabled_tools == ["search_music", "create_chat_space"]
+  end
+
+  @tag :db
+  test "room tools attach only for the agent owner", %{
+    owner: owner,
+    subscriber: subscriber,
+    agent: agent
+  } do
+    created =
+      Channel.create_chat_space(
+        %{
+          "room_type" => "group",
+          "name" => "Agent room",
+          "member_ids" => [subscriber.id]
+        },
+        agent.id,
+        owner.id
+      )
+
+    assert created["ok"]
+    assert created["attached_current_agent"]
+    chat_id = created["room"]["chat_id"]
+    assert created["room"]["chat_link"] == "vibe://chat?chatId=#{chat_id}"
+    assert Chat.get_user_role(chat_id, owner.id) == "owner"
+    assert Chat.get_user_role(chat_id, agent.agent_user_id) == "member"
+
+    channel =
+      Channel.create_chat_space(
+        %{
+          "room_type" => "channel",
+          "name" => "Public updates",
+          "member_ids" => [subscriber.id],
+          "access_type" => "public",
+          "public_slug" => "agent-updates",
+          "attach_current_agent" => false
+        },
+        agent.id,
+        owner.id
+      )
+
+    assert channel["ok"]
+    refute channel["attached_current_agent"]
+    channel_id = channel["room"]["chat_id"]
+    assert Chat.get_user_role(channel_id, subscriber.id) == "subscriber"
+    assert Chat.get_user_role(channel_id, agent.agent_user_id) == nil
+
+    denied =
+      Channel.attach_current_agent_to_chat(
+        %{"chat_id" => channel_id},
+        agent.id,
+        subscriber.id
+      )
+
+    refute denied["ok"]
+
+    attached =
+      Channel.attach_current_agent_to_chat(%{"chat_id" => channel_id}, agent.id, owner.id)
+
+    assert attached["ok"]
+    assert attached["attachment"].role == "agent_admin"
+    assert Chat.get_user_role(channel_id, agent.agent_user_id) == "agent_admin"
+
+    posted =
+      Channel.post_to_channel(
+        %{"channel_id" => channel_id, "content" => "Agent-authored update"},
+        agent.id,
+        owner.id
+      )
+
+    assert posted["ok"]
+    assert posted["from_id"] == agent.agent_user_id
+
+    stored_message = Chat.get_message(channel_id, posted["message_id"], owner.id)
+    assert stored_message.from_id == agent.agent_user_id
+    assert stored_message.metadata["agentId"] == agent.id
+
+    denied_post =
+      Channel.post_to_channel(
+        %{"channel_id" => channel_id, "content" => "Not allowed"},
+        agent.id,
+        subscriber.id
+      )
+
+    refute denied_post["ok"]
+  end
+
+  test "music outputs preserve track order and receive stable batch indices" do
+    result = %{
+      source: "youtube",
+      tracks: [
+        %{
+          video_id: "first",
+          title: "First",
+          artist: "Artist One",
+          album: "Album One",
+          duration: "3:05",
+          preview_url: "https://cdn.example/first.mp3",
+          cover: "https://cdn.example/first.jpg",
+          links: %{youtube: "https://youtube.example/first"}
+        },
+        %{
+          video_id: "second",
+          title: "Second",
+          artist: "Artist Two",
+          album: nil,
+          duration: 242,
+          preview_url: nil,
+          cover: "https://cdn.example/second.jpg",
+          links: %{}
+        }
+      ]
+    }
+
+    outputs = StandaloneAgent.tool_outputs_from_result("search_music", result)
+    assert Enum.map(outputs, & &1.metadata["videoId"]) == ["first", "second"]
+    assert hd(outputs).mediaUrl == "https://cdn.example/first.mp3"
+    assert String.ends_with?(Enum.at(outputs, 1).mediaUrl, "/api/music/stream/second")
+    assert hd(outputs).metadata["durationSeconds"] == 185
+
+    batch =
+      StandaloneAgent.finalize_batch([%{type: "text", text: "Enjoy"} | outputs],
+        agent_turn_id: "turn-1",
+        agent_batch_id: "batch-1",
+        base_timestamp: 10_000
+      )
+
+    assert Enum.map(batch, & &1.type) == ["text", "music", "music"]
+    assert Enum.map(batch, & &1.metadata["agentPartIndex"]) == [0, 1, 2]
+    assert Enum.map(batch, & &1.timestamp) == [10_000, 10_001, 10_002]
+    assert Enum.all?(batch, &(&1.metadata["agentPartCount"] == 3))
+    assert Enum.all?(batch, & &1.metadata["agentFinalized"])
+  end
+
+  test "ask_user is normalized, terminal, and emitted as a question output" do
+    result =
+      ChatAgent.ask_user(%{
+        "questions" => [
+          %{
+            "question" => " Which destination should I use? ",
+            "header" => "Destination room",
+            "multiSelect" => false,
+            "options" => [
+              %{"label" => "General", "description" => "The main room"},
+              %{"label" => "General", "description" => "Duplicate"},
+              %{"label" => "Alerts", "description" => "Only alerts"}
+            ]
+          }
+        ]
+      })
+
+    assert result["ok"]
+    assert result["status"] == "waiting_for_user"
+    assert is_binary(result["requestId"])
+
+    assert result["questions"] == [
+             %{
+               "question" => "Which destination should I use?",
+               "header" => "Destination ",
+               "multiSelect" => false,
+               "options" => [
+                 %{"label" => "General", "description" => "The main room"},
+                 %{"label" => "Alerts", "description" => "Only alerts"}
+               ]
+             }
+           ]
+
+    [output] = StandaloneAgent.tool_outputs_from_result("ask_user", result)
+    assert output.type == "question"
+    assert output.status == "waiting_for_user"
+    assert output.text == "Which destination should I use?"
+    assert output.metadata["requestId"] == result["requestId"]
+
+    assert StandaloneAgent.final_text_with_tool_fallback(nil, [
+             %{tool: "ask_user", result: result}
+           ]) == "Which destination should I use?"
+
+    [text_part, question_part] =
+      StandaloneAgent.finalize_batch(
+        [
+          %{type: "text", text: output.text},
+          output
+        ],
+        agent_turn_id: "turn-question",
+        agent_batch_id: "batch-question"
+      )
+
+    assert text_part.metadata["agentPartIndex"] == 0
+    assert question_part.metadata["agentPartIndex"] == 1
+    assert question_part.metadata["status"] == "waiting_for_user"
+  end
+
+  defp insert_user(prefix) do
+    suffix = System.unique_integer([:positive])
+
+    Repo.insert!(%User{
+      id: Ecto.UUID.generate(),
+      username: "#{prefix}_#{suffix}",
+      password_hash: "hash",
+      public_key: "key",
+      device_id: "device-#{suffix}",
+      is_agent: false
+    })
+  end
+
+  defp insert_agent(owner) do
+    shadow = insert_user("turn_agent_shadow")
+
+    shadow
+    |> Ecto.Changeset.change(is_agent: true)
+    |> Repo.update!()
+
+    %Agent{
+      owner_user_id: owner.id,
+      agent_user_id: shadow.id,
+      status: "published",
+      display_name: "Turn Agent",
+      system_prompt: "Help the user.",
+      enabled_tools: ["search_music"],
+      output_modes: ["text"],
+      webhook_secret_hash: "hash",
+      secret_hint: "hint"
+    }
+    |> Repo.insert!()
+    |> Repo.preload(:agent_user)
+  end
+end

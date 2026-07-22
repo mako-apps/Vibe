@@ -15,6 +15,7 @@ defmodule Vibe.AI.Agent do
   alias Vibe.AI.AgentRuntime
   alias Vibe.AI.GroupAgent
   alias Vibe.AI.SubagentRegistry
+  alias Vibe.AI.ToolRegistry
   alias Vibe.Repo
 
   @claude_api "https://api.anthropic.com/v1/messages"
@@ -24,6 +25,9 @@ defmodule Vibe.AI.Agent do
     configure_event_inbox
     get_current_agent_config
     update_current_agent_config
+    inspect_current_agent_tools
+    test_current_agent_tool
+    ask_user
   ]
 
   # Tool definitions for Claude
@@ -104,7 +108,7 @@ defmodule Vibe.AI.Agent do
           content: %{type: "string", description: "The message content to post"},
           type: %{
             type: "string",
-            enum: ["text", "image", "media"],
+            enum: ["text", "image", "media", "music", "audio", "voice", "video", "file"],
             description: "Type of content"
           },
           media_url: %{type: "string", description: "URL of the media (for image/media types)"}
@@ -134,7 +138,7 @@ defmodule Vibe.AI.Agent do
           content: %{type: "string", description: "The message content to post"},
           type: %{
             type: "string",
-            enum: ["text", "image", "media"],
+            enum: ["text", "image", "media", "music", "audio", "voice", "video", "file"],
             description: "Type of content"
           },
           media_url: %{type: "string", description: "URL of the media (for image/media types)"},
@@ -278,8 +282,109 @@ defmodule Vibe.AI.Agent do
             type: "string",
             enum: ["draft", "published", "disabled"],
             description: "Optional status change for the current agent."
+          },
+          enabled_tools: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "Updated allowlisted tool ids for this agent."
+          },
+          output_modes: %{
+            type: "array",
+            items: %{type: "string", enum: ["text", "media", "voice"]},
+            description: "Updated output modes for this agent."
           }
         }
+      }
+    },
+    %{
+      name: "create_chat_space",
+      description:
+        "Create an owned group or channel and optionally attach the current agent. Channel creation supports private/public access, slug, approval, and saving restrictions.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          room_type: %{type: "string", enum: ["group", "channel"]},
+          name: %{type: "string"},
+          description: %{type: "string"},
+          avatar_url: %{type: "string"},
+          member_ids: %{type: "array", items: %{type: "string"}},
+          access_type: %{type: "string", enum: ["private", "public"]},
+          public_slug: %{type: "string"},
+          join_approval_required: %{type: "boolean"},
+          restrict_saving: %{type: "boolean"},
+          attach_current_agent: %{
+            type: "boolean",
+            description: "Attach this agent to the new room. Defaults to true."
+          }
+        },
+        required: ["room_type", "name"]
+      }
+    },
+    %{
+      name: "attach_current_agent_to_chat",
+      description: "Attach the current agent to a group or channel owned by the requester.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          chat_id: %{type: "string"},
+          allowed_tools: %{type: "array", items: %{type: "string"}},
+          allowed_output_modes: %{type: "array", items: %{type: "string"}},
+          permissions: %{type: "object", additionalProperties: true}
+        },
+        required: ["chat_id"]
+      }
+    },
+    %{
+      name: "inspect_current_agent_tools",
+      description:
+        "Inspect the current owned agent's complete tool registry, configured and effective state, output modes, and safe testability.",
+      input_schema: %{type: "object", properties: %{}}
+    },
+    %{
+      name: "test_current_agent_tool",
+      description:
+        "Boundedly test one registered current-agent tool. Web/music search may run with explicit sample input; mutation and destructive tools return dry-run capability validation only.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          tool_id: %{type: "string"},
+          sample_input: %{type: "object", additionalProperties: true}
+        },
+        required: ["tool_id"]
+      }
+    },
+    %{
+      name: "ask_user",
+      description:
+        "Finish this turn with one or more structured questions. Returns waiting_for_user immediately; never wait or call it recursively.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          questions: %{
+            type: "array",
+            items: %{
+              type: "object",
+              properties: %{
+                question: %{type: "string"},
+                header: %{type: "string"},
+                multiSelect: %{type: "boolean"},
+                options: %{
+                  type: "array",
+                  items: %{
+                    type: "object",
+                    properties: %{
+                      label: %{type: "string"},
+                      description: %{type: "string"}
+                    },
+                    required: ["label"]
+                  }
+                }
+              },
+              required: ["question", "header", "options"]
+            }
+          }
+        },
+        required: ["questions"]
       }
     },
     %{
@@ -398,7 +503,19 @@ defmodule Vibe.AI.Agent do
         * "switch your status to draft/published/disabled"
       - Prefer this over delegate_to_subagent when the request is a one-agent edit and you already have enough information.
 
-  14. delegate_to_subagent: Use when the request is better handled by an internal specialist.
+  14. create_chat_space / attach_current_agent_to_chat: Use these for explicit requests to create an owned group/channel or attach this agent to an existing owned room.
+      - Never claim that a subscriber owns a channel. The tools independently verify the current agent id and requester owner id.
+      - Public channels require a public_slug. attach_current_agent defaults to true on creation.
+
+  15. inspect_current_agent_tools / test_current_agent_tool: Use these to explain or validate this agent's tools.
+      - Tool tests are bounded: only explicit web/music sample searches may execute live. Mutating/destructive tools only report a dry-run capability result.
+      - Never use test_current_agent_tool to call itself or to dispatch an arbitrary tool.
+
+  16. ask_user: Use only when a real choice is required before a useful next turn.
+      - Supply normalized questions and options. The call finalizes this turn as waiting_for_user; it does not block or wait.
+      - The user's answer arrives as a new turn.
+
+  17. delegate_to_subagent: Use when the request is better handled by an internal specialist.
      - builder_assistant: multi-step agent creation, complex reconfiguration, agent deletion, or builder-style workflows spanning more than one step.
      - integration_advisor: invoke URLs, events URLs, secrets, attached vibe chat ids, and backend integration questions when the direct current-agent config tools are not enough.
      - music_specialist: focused music help when the request is mostly about discovery/playback.
@@ -417,6 +534,7 @@ defmodule Vibe.AI.Agent do
   - For music results: NEVER include URLs, track names, or album names in your response text.
   - If a user asks for live agent configuration, current inbox mode, or historical notification facts, use the live lookup/config tools first.
   - For simple current-agent prompt or name changes, use `update_current_agent_config` instead of delegating.
+  - Use `ask_user` for required structured choices; never simulate waiting inside a tool call.
   - For simple greetings, respond naturally WITHOUT tools.
   - Keep responses VERY short (1-2 sentences max) - this is mobile chat.
   """
@@ -554,7 +672,32 @@ defmodule Vibe.AI.Agent do
     requester_user_id = Map.get(state, :requester_user_id)
     chat_id = Map.get(state, :chat_id)
     agent_id = Map.get(state, :agent_id)
-    {execute_tools(tool_calls, callback, user_id, requester_user_id, chat_id, agent_id), state}
+    # A question is a terminal control item, equivalent to Codex yielding for
+    # user input. Do not execute sibling calls speculatively in that batch.
+    executable_calls =
+      case Enum.find(tool_calls, &(&1["name"] == "ask_user")) do
+        nil -> tool_calls
+        ask_call -> [ask_call]
+      end
+
+    results =
+      execute_tools(
+        executable_calls,
+        callback,
+        user_id,
+        requester_user_id,
+        chat_id,
+        agent_id
+      )
+
+    next_state =
+      if Enum.any?(results, &waiting_for_user_result?/1) do
+        Map.put(state, :terminal_status, "waiting_for_user")
+      else
+        state
+      end
+
+    {results, next_state}
   end
 
   defp execute_tools(tool_calls, callback, user_id, requester_user_id, chat_id, agent_id) do
@@ -619,6 +762,21 @@ defmodule Vibe.AI.Agent do
 
           "update_current_agent_config" ->
             "Updating this agent..."
+
+          "create_chat_space" ->
+            "Creating the chat space..."
+
+          "attach_current_agent_to_chat" ->
+            "Attaching this agent..."
+
+          "inspect_current_agent_tools" ->
+            "Inspecting this agent's tools..."
+
+          "test_current_agent_tool" ->
+            "Checking the tool safely..."
+
+          "ask_user" ->
+            "Preparing a question..."
 
           "delegate_to_subagent" ->
             SubagentRegistry.progress_label(
@@ -688,13 +846,21 @@ defmodule Vibe.AI.Agent do
           GroupAgent.execute_standalone_tool(tool_name, tool["input"], user_id, chat_id)
 
         tool_name == "post_to_channel" ->
-          Vibe.AI.Tools.Channel.post_to_channel(tool["input"], user_id)
+          if is_binary(agent_id) do
+            Vibe.AI.Tools.Channel.post_to_channel(tool_input, agent_id, requester_user_id)
+          else
+            Vibe.AI.Tools.Channel.post_to_channel(tool_input, user_id)
+          end
 
         tool_name == "get_channel_analytics" ->
           Vibe.AI.Tools.Channel.get_analytics(tool["input"], user_id)
 
         tool_name == "schedule_channel_post" ->
-          Vibe.AI.Tools.Channel.schedule_post(tool["input"], user_id)
+          if is_binary(agent_id) do
+            Vibe.AI.Tools.Channel.schedule_post(tool_input, agent_id, requester_user_id)
+          else
+            Vibe.AI.Tools.Channel.schedule_post(tool_input, user_id)
+          end
 
         tool_name == "query_event_inbox" ->
           query_event_inbox(tool_input, agent_id, requester_user_id)
@@ -710,6 +876,25 @@ defmodule Vibe.AI.Agent do
 
         tool_name == "update_current_agent_config" ->
           update_current_agent_config(tool_input, agent_id, requester_user_id)
+
+        tool_name == "create_chat_space" ->
+          Vibe.AI.Tools.Channel.create_chat_space(tool_input, agent_id, requester_user_id)
+
+        tool_name == "attach_current_agent_to_chat" ->
+          Vibe.AI.Tools.Channel.attach_current_agent_to_chat(
+            tool_input,
+            agent_id,
+            requester_user_id
+          )
+
+        tool_name == "inspect_current_agent_tools" ->
+          inspect_current_agent_tools(tool_input, agent_id, requester_user_id)
+
+        tool_name == "test_current_agent_tool" ->
+          test_current_agent_tool(tool_input, agent_id, requester_user_id)
+
+        tool_name == "ask_user" ->
+          ask_user(tool_input)
 
         tool_name == "delegate_to_subagent" ->
           case maybe_fast_delegate_current_agent(tool_input, agent_id, requester_user_id) do
@@ -754,6 +939,15 @@ defmodule Vibe.AI.Agent do
       content: Jason.encode!(result)
     }
   end
+
+  defp waiting_for_user_result?(%{content: content}) when is_binary(content) do
+    case Jason.decode(content) do
+      {:ok, %{"status" => "waiting_for_user"}} -> true
+      _ -> false
+    end
+  end
+
+  defp waiting_for_user_result?(_), do: false
 
   # Cap of events pulled into memory for payload-based aggregation (group_by /
   # metric sums). Exact totals and event_type/source breakdowns are computed in
@@ -1075,7 +1269,8 @@ defmodule Vibe.AI.Agent do
     end
   end
 
-  defp update_current_agent_config(input, agent_id, requester_user_id) do
+  @doc false
+  def update_current_agent_config(input, agent_id, requester_user_id) do
     with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id),
          {:ok, attrs} <- current_agent_update_attrs(input),
          {:ok, updated_agent} <- persist_current_agent_update(agent, attrs, requester_user_id) do
@@ -1091,10 +1286,212 @@ defmodule Vibe.AI.Agent do
       {:error, :empty_system_prompt} ->
         %{"ok" => false, "error" => "System prompt cannot be empty."}
 
+      {:error, :invalid_enabled_tools} ->
+        %{"ok" => false, "error" => "enabled_tools must contain only registered tool ids."}
+
+      {:error, :invalid_output_modes} ->
+        %{"ok" => false, "error" => "output_modes must contain only text, media, or voice."}
+
       {:error, reason} ->
         %{"ok" => false, "error" => inbox_error_message(reason)}
     end
   end
+
+  @doc false
+  def inspect_current_agent_tools(_input, agent_id, requester_user_id) do
+    with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id) do
+      configured = MapSet.new(agent.enabled_tools || [])
+
+      tools =
+        Enum.map(ToolRegistry.tools(), fn tool ->
+          enabled = MapSet.member?(configured, tool.id)
+
+          %{
+            "id" => tool.id,
+            "name" => tool.name,
+            "category" => tool.category,
+            "enabled" => enabled,
+            "always_on" => tool.always_on,
+            "effective" => enabled || tool.always_on,
+            "testability" => tool.testability
+          }
+        end)
+
+      %{
+        "ok" => true,
+        "agent_id" => agent.id,
+        "tools" => tools,
+        "enabled_tools" => agent.enabled_tools || [],
+        "effective_tools" => tools |> Enum.filter(& &1["effective"]) |> Enum.map(& &1["id"]),
+        "output_modes" => %{
+          "configured" => agent.output_modes || [],
+          "supported" => ~w[text media voice]
+        }
+      }
+    else
+      {:error, reason} -> %{"ok" => false, "error" => inbox_error_message(reason)}
+    end
+  end
+
+  @doc false
+  def test_current_agent_tool(input, agent_id, requester_user_id) when is_map(input) do
+    tool_id = normalize_tool_string(input["tool_id"] || input["toolId"])
+    sample_input = input["sample_input"] || input["sampleInput"] || %{}
+
+    with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id),
+         tool when not is_nil(tool) <- ToolRegistry.get(tool_id),
+         true <- tool.always_on || tool.id in (agent.enabled_tools || []) do
+      test_registered_tool(tool, sample_input)
+    else
+      nil -> %{"ok" => false, "error" => "Unknown tool id."}
+      false -> %{"ok" => false, "error" => "Tool is not enabled for this agent."}
+      {:error, reason} -> %{"ok" => false, "error" => inbox_error_message(reason)}
+    end
+  end
+
+  def test_current_agent_tool(_input, _agent_id, _requester_user_id),
+    do: %{"ok" => false, "error" => "Invalid tool test input."}
+
+  @doc false
+  def ask_user(input) when is_map(input) do
+    questions =
+      input
+      |> Map.get("questions", [])
+      |> normalize_questions()
+
+    if questions == [] do
+      %{"ok" => false, "error" => "At least one valid question is required."}
+    else
+      fallback = Enum.map_join(questions, "\n", & &1["question"])
+
+      %{
+        "ok" => true,
+        "requestId" => Ecto.UUID.generate(),
+        "status" => "waiting_for_user",
+        "fallbackText" => fallback,
+        "questions" => questions
+      }
+    end
+  end
+
+  def ask_user(_input),
+    do: %{"ok" => false, "error" => "At least one valid question is required."}
+
+  defp test_registered_tool(%{id: tool_id, testability: "live_readonly"}, sample_input)
+       when tool_id in ["search_google", "search_music"] and is_map(sample_input) do
+    case normalize_tool_string(sample_input["query"]) do
+      nil ->
+        %{
+          "ok" => false,
+          "tool_id" => tool_id,
+          "error" => "An explicit sample_input.query is required for a live read-only test."
+        }
+
+      query ->
+        result =
+          case tool_id do
+            "search_google" -> Vibe.AI.Tools.Search.google(%{"query" => query})
+            "search_music" -> Vibe.AI.Tools.Music.search(%{"query" => query, "type" => "track"})
+          end
+
+        %{
+          "ok" => not tool_result_error?(result),
+          "tool_id" => tool_id,
+          "testability" => "live_readonly",
+          "executed" => true,
+          "result" => result
+        }
+    end
+  end
+
+  defp test_registered_tool(tool, _sample_input) do
+    %{
+      "ok" => true,
+      "tool_id" => tool.id,
+      "testability" => "dry_run",
+      "executed" => false,
+      "capability" => %{
+        "registered" => true,
+        "effective" => true,
+        "mutation_performed" => false
+      }
+    }
+  end
+
+  defp tool_result_error?(result) when is_map(result),
+    do: is_binary(result[:error] || result["error"])
+
+  defp tool_result_error?(_), do: false
+
+  defp normalize_questions(value) when is_list(value) do
+    value
+    |> Enum.map(&normalize_question/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.take(3)
+  end
+
+  defp normalize_questions(_), do: []
+
+  defp normalize_question(question) when is_map(question) do
+    text = normalize_display_string(question["question"] || question[:question], 500)
+    header = normalize_display_string(question["header"] || question[:header], 12)
+
+    options =
+      question
+      |> then(&(Map.get(&1, "options") || Map.get(&1, :options) || []))
+      |> normalize_question_options()
+
+    if is_binary(text) and is_binary(header) and options != [] do
+      %{
+        "question" => text,
+        "header" => header,
+        "multiSelect" =>
+          normalize_tool_boolean(
+            question["multiSelect"] || question[:multiSelect] ||
+              question["multi_select"] || question[:multi_select]
+          ),
+        "options" => options
+      }
+    end
+  end
+
+  defp normalize_question(_), do: nil
+
+  defp normalize_question_options(value) when is_list(value) do
+    value
+    |> Enum.map(fn
+      option when is_map(option) ->
+        label = normalize_display_string(option["label"] || option[:label], 80)
+
+        if is_binary(label) do
+          %{
+            "label" => label,
+            "description" =>
+              normalize_display_string(option["description"] || option[:description], 240) || ""
+          }
+        end
+
+      _ ->
+        nil
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq_by(& &1["label"])
+    |> Enum.take(4)
+  end
+
+  defp normalize_question_options(_), do: []
+
+  defp normalize_display_string(value, max_length) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> String.slice(trimmed, 0, max_length)
+    end
+  end
+
+  defp normalize_display_string(_, _), do: nil
+
+  defp normalize_tool_boolean(value) when value in [true, "true", "1", 1], do: true
+  defp normalize_tool_boolean(_), do: false
 
   defp maybe_fast_delegate_current_agent(input, agent_id, requester_user_id) when is_map(input) do
     subagent_id = normalize_tool_string(input["subagent_id"])
@@ -1232,7 +1629,7 @@ defmodule Vibe.AI.Agent do
   end
 
   defp current_agent_update_attrs(input) when is_map(input) do
-    attrs =
+    base_attrs =
       %{}
       |> maybe_put_trimmed(input, "display_name")
       |> maybe_put_trimmed(input, "persona")
@@ -1241,6 +1638,54 @@ defmodule Vibe.AI.Agent do
       |> maybe_put_trimmed(input, "voice_profile")
       |> maybe_put_status(input)
 
+    with {:ok, attrs} <- maybe_put_tool_list(base_attrs, input),
+         {:ok, attrs} <- maybe_put_output_modes(attrs, input),
+         {:ok, attrs} <- maybe_put_system_prompt(attrs, input) do
+      if map_size(attrs) == 0, do: {:error, :no_changes_requested}, else: {:ok, attrs}
+    end
+  end
+
+  defp current_agent_update_attrs(_input), do: {:error, :no_changes_requested}
+
+  defp maybe_put_tool_list(attrs, input) do
+    case Map.fetch(input, "enabled_tools") do
+      :error ->
+        {:ok, attrs}
+
+      {:ok, tools} when is_list(tools) ->
+        normalized_input = Enum.map(tools, &normalize_tool_string/1) |> Enum.reject(&is_nil/1)
+
+        if Enum.all?(normalized_input, &(&1 in ToolRegistry.tool_ids())) do
+          {:ok, Map.put(attrs, "enabled_tools", Agents.normalize_enabled_tools(normalized_input))}
+        else
+          {:error, :invalid_enabled_tools}
+        end
+
+      _ ->
+        {:error, :invalid_enabled_tools}
+    end
+  end
+
+  defp maybe_put_output_modes(attrs, input) do
+    case Map.fetch(input, "output_modes") do
+      :error ->
+        {:ok, attrs}
+
+      {:ok, modes} when is_list(modes) ->
+        normalized_input = Enum.map(modes, &normalize_tool_string/1) |> Enum.reject(&is_nil/1)
+
+        if Enum.all?(normalized_input, &(&1 in ~w[text media voice])) do
+          {:ok, Map.put(attrs, "output_modes", Agents.normalize_output_modes(normalized_input))}
+        else
+          {:error, :invalid_output_modes}
+        end
+
+      _ ->
+        {:error, :invalid_output_modes}
+    end
+  end
+
+  defp maybe_put_system_prompt(attrs, input) do
     case Map.fetch(input, "system_prompt") do
       {:ok, prompt} when is_binary(prompt) ->
         case String.trim(prompt) do
@@ -1252,11 +1697,9 @@ defmodule Vibe.AI.Agent do
         {:error, :empty_system_prompt}
 
       :error ->
-        if map_size(attrs) == 0, do: {:error, :no_changes_requested}, else: {:ok, attrs}
+        {:ok, attrs}
     end
   end
-
-  defp current_agent_update_attrs(_input), do: {:error, :no_changes_requested}
 
   defp maybe_put_trimmed(attrs, input, key) do
     case Map.fetch(input, key) do
@@ -1616,5 +2059,12 @@ defmodule Vibe.AI.Agent do
     Enum.filter(available_tools(), fn tool ->
       MapSet.member?(allowed, tool.name) or tool.name in @always_available_tool_names
     end)
+  end
+
+  @doc false
+  def effective_tool_names(enabled_tools) do
+    enabled_tools
+    |> filter_tools()
+    |> Enum.map(& &1.name)
   end
 end

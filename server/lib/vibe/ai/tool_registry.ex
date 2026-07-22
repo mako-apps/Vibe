@@ -18,14 +18,16 @@ defmodule Vibe.AI.ToolRegistry do
       name: "Web Search",
       description: "Search the web for up-to-date information.",
       category: "research",
-      always_on: false
+      always_on: false,
+      testability: "live_readonly"
     },
     %{
       id: "search_music",
       name: "Music Search",
       description: "Find tracks, albums, or artists with streaming links.",
       category: "research",
-      always_on: false
+      always_on: false,
+      testability: "live_readonly"
     },
     %{
       id: "analyze_image",
@@ -84,6 +86,30 @@ defmodule Vibe.AI.ToolRegistry do
       always_on: false
     },
     %{
+      id: "post_to_channel",
+      name: "Post to Channel",
+      description: "Publish text or rich media to an attached channel as this agent.",
+      category: "chat_management",
+      always_on: false,
+      testability: "dry_run"
+    },
+    %{
+      id: "get_channel_analytics",
+      name: "Channel Analytics",
+      description: "Read subscriber and message analytics for a managed channel.",
+      category: "chat_management",
+      always_on: false,
+      testability: "dry_run"
+    },
+    %{
+      id: "schedule_channel_post",
+      name: "Schedule Channel Post",
+      description: "Schedule content to publish to an attached channel as this agent.",
+      category: "chat_management",
+      always_on: false,
+      testability: "dry_run"
+    },
+    %{
       id: "call_connected_app",
       name: "Connected App & Live Data",
       description:
@@ -102,11 +128,71 @@ defmodule Vibe.AI.ToolRegistry do
     %{
       id: "configure_event_inbox",
       name: "Inbox Delivery Settings",
-      description: "Set how incoming events are delivered: per event or batched summaries (4h / daily).",
+      description:
+        "Set how incoming events are delivered: per event or batched summaries (4h / daily).",
       category: "analytics",
-      always_on: true
+      always_on: true,
+      testability: "dry_run"
+    },
+    %{
+      id: "get_current_agent_config",
+      name: "Current Agent Config",
+      description: "Inspect the current owned agent's saved configuration.",
+      category: "agent_management",
+      always_on: true,
+      testability: "dry_run"
+    },
+    %{
+      id: "update_current_agent_config",
+      name: "Update Current Agent",
+      description: "Update allowlisted fields on the current owned agent.",
+      category: "agent_management",
+      always_on: true,
+      testability: "dry_run"
+    },
+    %{
+      id: "create_chat_space",
+      name: "Create Chat Space",
+      description: "Create a group or channel for the current agent owner.",
+      category: "chat_management",
+      always_on: false,
+      testability: "dry_run"
+    },
+    %{
+      id: "attach_current_agent_to_chat",
+      name: "Attach Current Agent",
+      description: "Attach the current agent to an owned group or channel.",
+      category: "chat_management",
+      always_on: false,
+      testability: "dry_run"
+    },
+    %{
+      id: "inspect_current_agent_tools",
+      name: "Inspect Current Agent Tools",
+      description: "Show registry, configured, effective, output-mode, and testability state.",
+      category: "agent_management",
+      always_on: true,
+      testability: "dry_run"
+    },
+    %{
+      id: "test_current_agent_tool",
+      name: "Test Current Agent Tool",
+      description: "Run a bounded read-only tool check or validate a dry-run capability.",
+      category: "agent_management",
+      always_on: true,
+      testability: "dry_run"
+    },
+    %{
+      id: "ask_user",
+      name: "Ask User",
+      description: "Finish the turn with normalized questions for the user.",
+      category: "interaction",
+      always_on: true,
+      testability: "dry_run"
     }
   ]
+
+  @tools Enum.map(@tools, fn tool -> Map.put_new(tool, :testability, "dry_run") end)
 
   @doc "Full catalog including always-on tools (for display/config)."
   def tools, do: @tools
@@ -121,6 +207,10 @@ defmodule Vibe.AI.ToolRegistry do
 
   @doc "All known tool ids (toggleable + always-on)."
   def tool_ids, do: Enum.map(@tools, & &1.id)
+
+  @doc "Looks up one registry entry by id."
+  def get(tool_id) when is_binary(tool_id), do: Enum.find(@tools, &(&1.id == tool_id))
+  def get(_tool_id), do: nil
 
   @doc "Toggleable tool ids only."
   def toggleable_tool_ids, do: Enum.map(toggleable_tools(), & &1.id)

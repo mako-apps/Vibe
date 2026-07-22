@@ -32,7 +32,13 @@ defmodule Vibe.AI.AgentRuntime do
     end
   end
 
-  defp do_run(_messages, %Config{max_depth: max_depth} = config, _api_key, depth, _accumulated_text)
+  defp do_run(
+         _messages,
+         %Config{max_depth: max_depth} = config,
+         _api_key,
+         depth,
+         _accumulated_text
+       )
        when depth > max_depth do
     {:error, config.depth_error}
   end
@@ -46,16 +52,21 @@ defmodule Vibe.AI.AgentRuntime do
         callback = config.callback || fn _event -> :ok end
         {tool_results, next_state} = config.execute_tools.(tool_calls, config.state, callback)
 
-        do_run(
-          messages ++ [
-            %{role: "assistant", content: partial_response},
-            %{role: "user", content: tool_results}
-          ],
-          %{config | state: next_state},
-          api_key,
-          depth + 1,
-          accumulated_text <> partial_text
-        )
+        if Map.get(next_state, :terminal_status) == "waiting_for_user" do
+          {:ok, accumulated_text <> partial_text, next_state}
+        else
+          do_run(
+            messages ++
+              [
+                %{role: "assistant", content: partial_response},
+                %{role: "user", content: tool_results}
+              ],
+            %{config | state: next_state},
+            api_key,
+            depth + 1,
+            accumulated_text <> partial_text
+          )
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -100,7 +111,10 @@ defmodule Vibe.AI.AgentRuntime do
 
             Enum.reduce(events, acc, fn event, inner_acc ->
               case event do
-                %{"type" => "content_block_delta", "delta" => %{"type" => "text_delta", "text" => text}} ->
+                %{
+                  "type" => "content_block_delta",
+                  "delta" => %{"type" => "text_delta", "text" => text}
+                } ->
                   if config.stream_text? do
                     callback.(%{type: :text, content: text})
                   end
@@ -149,7 +163,10 @@ defmodule Vibe.AI.AgentRuntime do
       {:ok, final_acc} ->
         case final_acc.status do
           status when is_integer(status) and status != 200 ->
-            Logger.error("[#{config.request_label}] Claude streaming request failed with status #{status}")
+            Logger.error(
+              "[#{config.request_label}] Claude streaming request failed with status #{status}"
+            )
+
             {:error, "API error: #{status}"}
 
           _ ->
@@ -174,7 +191,10 @@ defmodule Vibe.AI.AgentRuntime do
         end
 
       {:error, reason} ->
-        Logger.error("[#{config.request_label}] Claude streaming request failed: #{inspect(reason)}")
+        Logger.error(
+          "[#{config.request_label}] Claude streaming request failed: #{inspect(reason)}"
+        )
+
         {:error, "AI request failed."}
     end
   end
@@ -236,8 +256,12 @@ defmodule Vibe.AI.AgentRuntime do
       |> Enum.join("\n")
 
     cond do
-      payload == "" -> nil
-      payload == "[DONE]" -> nil
+      payload == "" ->
+        nil
+
+      payload == "[DONE]" ->
+        nil
+
       true ->
         case Jason.decode(payload) do
           {:ok, parsed} -> parsed
