@@ -104,11 +104,22 @@ defmodule VibeWeb.BridgeStatusPushTest do
     send(pid, :stop)
   end
 
-  test "an unknown user reports disconnected rather than raising" do
-    status = AgentBridge.status_for_push(unique_user_id())
+  test "an unknown user with no computer reports disconnected and unpaired" do
+    status = AgentBridge.status_for_push(Ecto.UUID.generate())
 
     refute status.connected
+    refute status.paired
     assert status.runningTasks == []
     assert status.repositories == []
+  end
+
+  # `status_for_push` runs inside UserChannel on every bridge Presence change, so it
+  # must never raise: an exception there kills the phone's channel and disconnects it.
+  # A non-UUID id cannot be cast to :binary_id and used to blow up the `paired?` query.
+  test "a malformed user id degrades to disconnected instead of crashing the channel" do
+    status = AgentBridge.status_for_push("not-a-uuid")
+
+    refute status.connected
+    refute status.paired
   end
 end

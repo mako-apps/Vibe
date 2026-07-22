@@ -333,6 +333,13 @@ defmodule Vibe.AgentBridge do
   @doc "Whether the user has any non-revoked paired computer on record."
   def paired?(user_id) when is_binary(user_id) do
     Repo.exists?(from(c in Connection, where: c.user_id == ^user_id and is_nil(c.revoked_at)))
+  rescue
+    # A malformed user id casts to nothing (`:binary_id`), and a DB blip raises.
+    # Neither is worth an exception: this is now reached from `UserChannel` on every
+    # bridge Presence change, where raising would take down the phone's channel and
+    # disconnect it. "Not provably paired" is the safe answer, and the surrounding
+    # `status` callers already treat it as a plain boolean.
+    _ -> false
   end
 
   def paired?(_), do: false
