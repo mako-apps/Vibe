@@ -7528,10 +7528,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let resolveTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
       let displayText = bubbleDisplayAttributedString(
         for: row, font: messageFont, textColor: resolveTextColor)
-      // Telegram: RTL body is always right-aligned inside the plate (reading edge),
-      // independent of bubble side. LTR stays natural/left.
+      // Telegram places an RTL body at the LEADING edge of the plate with the meta row
+      // trailing beneath it — measured off the reference screenshot: the text starts near
+      // the bubble's left inset while the ✓ sits at the right. Right-aligning the body
+      // (and mirroring the meta to the left) produced the opposite of that, which read as
+      // "the order is wrong". Writing direction stays RTL; only the paragraph alignment
+      // is leading, so mixed content still shapes correctly.
+      // Absolute .left, not .natural: the label below is forced RTL, and .natural under
+      // forceRightToLeft resolves back to the right — the change would be a no-op.
       let rtlBody = isRTL(displayText.string)
-      messageLabel.textAlignment = rtlBody ? .right : .natural
+      messageLabel.textAlignment = rtlBody ? .left : .natural
       messageLabel.semanticContentAttribute = rtlBody ? .forceRightToLeft : .unspecified
       if messageLabel.isHidden {
         messageLabel.resetStreamingState()
@@ -8412,13 +8418,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         let metaTop = metrics.hasLinkPreview
           ? linkPreviewView.frame.maxY + bubbleMetaTopSpacing
           : textBottom + bubbleMetaTopSpacing
-        // Meta (time / sent) stays trailing for LTR. RTL bodies mirror it to the
-        // bubble's LEADING edge like Telegram: text reads from the right, the time
-        // tucks bottom-left. Expand/collapse is a list-level glass chip.
-        let metaX =
-          usesRTLColumnLayout(row)
-          ? bubbleFrame.minX + bubbleHorizontalPadding
-          : bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
+        // Meta (time / sent) is ALWAYS trailing — RTL included. Telegram keeps the ✓ at
+        // the bubble's right edge and leads the body instead; mirroring the meta to the
+        // left put the two rows on opposite edges and looked misordered.
+        let metaX = bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
         let metaFrame = pixelAlignedRect(
           CGRect(
             x: metaX,

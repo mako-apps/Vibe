@@ -1255,7 +1255,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var debugOffsetLabel: UILabel?
   private var debugStatsLabel: UILabel?
 
-  private static var wallpaperSnapshotCache: [String: CGImage] = [:]
+  /// Full-screen wallpaper rasters, one per (theme, scroll-phase bucket, size). Each is a
+  /// 3x screenful — ~15MB — and there are 9 buckets per size, so the old unbounded
+  /// dictionary could sit on >130MB for the life of the process and never give it back.
+  /// NSCache bounds it and purges under memory pressure; the live snapshot is retained
+  /// separately by `wallpaperSnapshot`, so an eviction can never blank the wallpaper —
+  /// worst case is one re-render (~45ms) at a scroll settle, off the drag.
+  private static let wallpaperSnapshotCache: NSCache<NSString, UIImage> = {
+    let cache = NSCache<NSString, UIImage>()
+    cache.countLimit = 6
+    cache.totalCostLimit = 96 * 1024 * 1024
+    return cache
+  }()
   private static let cachedThemeIdDefaultsKey = "vibe.chat.native.themeId.v1"
   private static let cachedThemeIsDarkDefaultsKey = "vibe.chat.native.themeIsDark.v1"
   private static let documentPreviewSession: URLSession = {
@@ -1541,6 +1552,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// Resolve the referenced author's banner palette for the compact reply preview only.
   /// Order: denormalized `replyPreviewUserId` → loaded row by `replyToId` → exact
   /// directory-name fallback. No reply preview means no palette.
+  /// Sticky reply palettes, keyed by row. Cleared with the chat (see chat-switch reset).
+  private var replyAccentMemoByRowKey: [String: (UIColor, UIColor)] = [:]
+
   private func replyPreviewAccentColors(for row: ChatListRow) -> (UIColor, UIColor)? {
     // Mirrors hasReplyPreview / replyPreviewTitle in ChatListViewCells (file-private there).
     guard row.kind == .message, row.visualKind == .text else { return nil }
@@ -1557,19 +1571,53 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // A reply palette is identity-owned. Do not synthesize a user color from the
     // display title when the referenced author cannot be resolved; the reply view's
     // normal theme accent is a safer fallback than coloring two same-named members alike.
+    // Identity for a reply arrives in stages — denormalized replyPreviewUserId at parse,
+    // the referenced row once the window covers it, the sender directory when the roster
+    // lands. Each stage repainted the banner in a DIFFERENT tint, which is the reported
+    // "the reply banner colour keeps shifting". A palette is therefore sticky per row:
+    // resolved once, reused forever, never allowed to fall back to the theme accent.
     guard let resolvedId = resolvedReplyPreviewUserId(for: row, title: title) else {
-      return nil
+      return replyAccentMemoByRowKey[row.key]
     }
-    return ChatProfileAppearanceStore.bannerColors(
+    let colors = ChatProfileAppearanceStore.bannerColors(
       title: title,
       peerUserId: resolvedId,
       chatId: nil
     )
+    if let previous = replyAccentMemoByRowKey[row.key] {
+      // Same row resolving to a DIFFERENT identity is a data bug, not a repaint: keep the
+      // first answer (no visible shift) and say so, rather than flip the tint under the user.
+      if previous.0 != colors.0 || previous.1 != colors.1 {
+        NSLog(
+          "[ReplyTint] chat=%@ key=%@ palette changed after first resolve (id=%@) — keeping first",
+          String(engineChatId.prefix(12)), String(row.key.suffix(12)),
+          String(resolvedId.prefix(8)))
+      }
+      return previous
+    }
+    replyAccentMemoByRowKey[row.key] = colors
+    return colors
   }
 
   private func resolvedReplyPreviewUserId(for row: ChatListRow, title: String) -> String? {
     if let id = groupNonEmpty(row.replyPreviewUserId) {
       return id
+    }
+    // `replyPreviewUserId` is only denormalized when the REFERENCED message happens to sit
+    // in the same payload (see rowsByResolvingReplyPreviews). Reply to something older than
+    // the mounted window and identity is simply absent at first paint — the cell then draws
+    // its theme fallback, and the real palette lands once history widens. That repaint is
+    // the reported tint shift. These two cases need no referenced row at all:
+    //   - "You" is the denormalizer's own title for a self-authored reference.
+    //   - a 1:1 chat has exactly two possible authors, so not-me means the peer.
+    let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if normalized == "you", let me = groupNonEmpty(engineMyUserId) {
+      return me
+    }
+    if !isGroupOrChannel, normalized != "reply", !normalized.isEmpty,
+      let peer = groupNonEmpty(enginePeerUserId)
+    {
+      return peer
     }
     if let replyToId = groupNonEmpty(row.replyToId) {
       if let referenced = rows.first(where: {
@@ -2098,6 +2146,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return NSString(string: "\(chatId)|w\(width)|\(theme)|v2")
   }
 
+  /// Anchor-keyed twin of the reopen raster for chats left MID-HISTORY. Keyed by the same
+  /// (messageId, screenY) pair the viewport record restores, so a hit is by construction a
+  /// picture of the exact landing. Memory-only — see captureReopenSnapshot.
+  private func reopenSnapshotMidKey(messageId: String, screenY: CGFloat) -> NSString? {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty, !messageId.isEmpty else { return nil }
+    let width = Int(UIScreen.main.bounds.width.rounded())
+    let theme = appearance.isDark ? "dark" : "light"
+    return NSString(
+      string: "\(chatId)|w\(width)|\(theme)|v2|mid:\(messageId)@\(Int(screenY.rounded()))")
+  }
+
   // userInitiated, not utility: the per-open disk decode races the shell commit
   // (~30-50ms) — at utility it lost essentially every first-open race and the chat
   // showed the spinner despite a valid raster sitting on disk.
@@ -2204,9 +2264,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // bottom-pinned honestly; a mid-history close simply keeps whatever bottom raster it
     // already had (or none — the seed mounts in ~85ms anyway).
     guard capturedAtBottom else {
+      // A mid-history close is not hopeless: the next open RESTORES this exact anchor
+      // (viewport RESTORE-AT-SEED), so a raster keyed by that anchor maps onto the
+      // landing 1:1. Without it, every reopen of a chat left scrolled up ran uncovered
+      // — the "empty until the push completes" report. Memory only: mid-history scroll
+      // memory is same-run (bootToken), so a disk twin could never be honored.
+      guard let anchor = topVisibleMessageAnchor(),
+        let midKey = reopenSnapshotMidKey(messageId: anchor.messageId, screenY: anchor.screenY)
+      else {
+        NSLog(
+          "[ChatOpen] reopen-snapshot CAPTURE-SKIP chat=%@ — mid-history with no anchor",
+          String(engineChatId.prefix(12)))
+        return
+      }
+      Self.reopenSnapshotCache.setObject(image, forKey: midKey)
       NSLog(
-        "[ChatOpen] reopen-snapshot CAPTURE-SKIP chat=%@ — captured mid-history (bottom-pinned overlay would shift)",
-        String(engineChatId.prefix(12)))
+        "[ChatOpen] reopen-snapshot CAPTURE-MID chat=%@ anchor=%@ screenY=%.0f luma=%d",
+        String(engineChatId.prefix(12)), String(anchor.messageId.prefix(8)), anchor.screenY,
+        lumaRange)
       return
     }
     Self.reopenSnapshotCache.setObject(image, forKey: key)
@@ -2300,24 +2375,32 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // bottom-anchored screenshot on top of the LIVE transcript until the next rows
     // flush peeled it off (a full second of wrong-position cover + two extra swaps).
     guard rows.isEmpty else { return }
-    guard reopenSnapshotOverlay == nil,
-      let key = reopenSnapshotKey(),
-      let image = Self.reopenSnapshotCache.object(forKey: key)
-    else { return }
+    guard reopenSnapshotOverlay == nil else { return }
     // An unread landing scrolls to the first-unread anchor, not the captured viewport —
     // the raster would flash the wrong rows. Let the shell show instead.
     guard openingUnreadCount == 0 else { return }
-    // Same rule on the read side: rasters are only ever captured at the bottom, so an
-    // open that will restore a MID-HISTORY viewport must not be covered by one — the
-    // bottom-pinned image would show the newest rows and then hand off to a list sitting
-    // somewhere else. That handoff is the "slight shift when I open the chat".
-    guard persistedOpeningViewport?.atBottom != false else {
-      // The jump-to-bottom control used to be painted as part of this raster; keep it on
-      // screen from the first frame now that a mid-history open has no raster at all.
-      setJumpButtonVisible(true)
-      NSLog(
-        "[ChatOpen] reopen-snapshot SKIP chat=%@ — this open restores a mid-history viewport",
-        String(engineChatId.prefix(12)))
+    // A bottom raster may only cover a bottom landing: bottom-pinned over a mid-history
+    // restore, it shows the newest rows and then hands off to a list sitting elsewhere
+    // (the "slight shift when I open the chat"). A mid-history open instead looks for the
+    // anchor-keyed twin, which is a picture of precisely the viewport being restored.
+    let restoresMidHistory = persistedOpeningViewport?.atBottom == false
+    let resolvedKey: NSString? =
+      restoresMidHistory
+      ? persistedOpeningViewport?.messageId.flatMap {
+        reopenSnapshotMidKey(messageId: $0, screenY: CGFloat(persistedOpeningViewport?.screenY ?? 0))
+      }
+      : reopenSnapshotKey()
+    guard let key = resolvedKey,
+      let image = Self.reopenSnapshotCache.object(forKey: key)
+    else {
+      if restoresMidHistory {
+        // The jump-to-bottom control used to be painted as part of this raster; keep it on
+        // screen from the first frame when a mid-history open has no cover to show.
+        setJumpButtonVisible(true)
+        NSLog(
+          "[ChatOpen] reopen-snapshot SKIP chat=%@ — mid-history open with no anchor twin",
+          String(engineChatId.prefix(12)))
+      }
       return
     }
     // Size sanity: a snapshot whose point width disagrees with the live list would
@@ -2345,6 +2428,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // high, wallpaper below it, then a jump when the live list mounts at full height).
     overlay.frame = collectionView.frame.height > 1 ? collectionView.frame : bounds
     overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    // Bottom captures cover a bottom landing, so they pin to the bottom; an anchor twin
+    // is the viewport as measured from its TOP anchor and pins there instead.
+    overlay.contentMode = restoresMidHistory ? .top : .bottom
     // Bottom-anchored: if the reopened viewport height differs slightly (banner,
     // inset settle) the newest messages stay pinned exactly like the real list.
     overlay.contentMode = .bottom
@@ -5843,7 +5929,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Share the non-glass safe-area slot used by the scrolling date pill. Keeping this
     // viewport-only control out of the collection's content origin prevents it from
     // appearing behind the Dynamic Island/header or moving with prepended rows.
-    let y = max(8.0, safeAreaInsets.top + 63.0)
+    let y = scrollingDatePillSlotY()
     cachedHistoryPullIndicator.frame = CGRect(
       x: pixelAlignedValue((bounds.width - side) / 2.0),
       y: y,
@@ -8733,6 +8819,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     deferredPresentationSeedPreferredRows = nil
     removeReopenSnapshotOverlay(reason: "chat-switch", animated: false)
     removeSeedLoadingIndicator(reason: "chat-switch")
+    replyAccentMemoByRowKey.removeAll(keepingCapacity: true)
     deltaStreamCoalesceWorkItem?.cancel()
     deltaStreamCoalesceWorkItem = nil
     engineDeltaRefreshPending = false
@@ -9369,11 +9456,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     scrollToBottom(animated: true, force: true)
   }
 
-  /// The sticky date pill's fixed slot, just under the header chrome. In-list day
-  /// separators hand off to this slot as they scroll behind the header.
+  /// Where a day separator STICKS once it has ridden up to the header. `contentPaddingTop`
+  /// is what the host reserves for the header band, i.e. the header's bottom edge in list
+  /// coordinates — so parking 8pt under it is the only value that cannot tuck the capsule
+  /// behind the header's masking edge (the old fixed `safeTop + 63` did exactly that).
+  /// Clamped on both sides so an unusually large reserved inset can't drop it mid-screen.
   private func scrollingDatePillSlotY() -> CGFloat {
-    max(8.0, safeAreaInsets.top + 63.0)
+    max(safeAreaInsets.top + 71.0, min(contentPaddingTop + 8.0, safeAreaInsets.top + 132.0))
   }
+
+  /// Y the pill is currently drawn at: its owning separator's own position while it is
+  /// still riding up through the list, the sticky slot once it has arrived.
+  private var scrollingDatePillRideY: CGFloat?
 
   private func layoutScrollingDatePill() {
     guard !scrollingDatePill.isHidden else { return }
@@ -9387,7 +9481,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let height = ceil(textSize.height) + (dayPillVerticalPadding * 2.0)
     scrollingDatePill.frame = CGRect(
       x: floor((bounds.width - width) * 0.5),
-      y: scrollingDatePillSlotY(),
+      y: scrollingDatePillRideY ?? scrollingDatePillSlotY(),
       width: width,
       height: height)
     scrollingDatePill.layer.cornerRadius = height / 2.0
@@ -9405,27 +9499,71 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     scrollingDatePillHideWorkItem = nil
   }
 
-  /// Scroll settled. The date is a PINNED element now — it stays attached under the
-  /// header instead of fading out a beat after the finger lifts, which is what made it
-  /// read as "a date sitting in the list" rather than a floating header attachment. The
-  /// only thing that removes it is having no dated row at the top (handled in
-  /// `updateScrollingDatePill`), and the hand-off to an in-list separator parked in the
-  /// slot. Kept as a hook so the call sites still describe the settle moment.
+  /// Scroll settled: hold the stuck date a beat, then hand the day back to the list and
+  /// fade out. The floating capsule exists only while the list is MOVING — at rest (and on
+  /// open, which is the same thing) the in-list separators own their dates, so nothing is
+  /// attached to the header. Keeping it pinned permanently is what made it read as a
+  /// second, separate pill bolted to the header from the moment a chat opened.
   private func scheduleScrollingDatePillLinger() {
     cancelScrollingDatePillLinger()
     // Re-assert against the settled viewport: a fling can end between updates.
     updateScrollingDatePill(visible: true)
+    guard !scrollingDatePill.isHidden else { return }
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, !self.scrollingDatePill.isHidden else { return }
+      self.scrollingDatePillHideWorkItem = nil
+      UIView.animate(
+        withDuration: 0.22, delay: 0.0, options: [.beginFromCurrentState, .curveEaseOut]
+      ) {
+        self.scrollingDatePill.alpha = 0.0
+      } completion: { finished in
+        guard finished, self.scrollingDatePill.alpha <= 0.01 else { return }
+        self.scrollingDatePill.isHidden = true
+        self.scrollingDatePill.alpha = 1.0
+        self.scrollingDatePillRideY = nil
+        // The day is the list's again.
+        self.releaseDaySeparatorRepresentation()
+      }
+    }
+    scrollingDatePillHideWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
+  }
+
+  /// Restore every visible in-list day capsule (nothing is represented by a floating pill).
+  private func releaseDaySeparatorRepresentation() {
+    for candidate in collectionView.indexPathsForVisibleItems {
+      guard candidate.item < rows.count, rows[candidate.item].kind == .day,
+        let cell = collectionView.cellForItem(at: candidate) as? ChatListCell
+      else { continue }
+      cell.setDaySeparatorRepresentedByPinnedDate(false)
+    }
+  }
+
+  /// Put the day back in the list and take the floating capsule off screen at once.
+  private func hideScrollingDatePill() {
+    cancelScrollingDatePillLinger()
+    scrollingDatePill.layer.removeAllAnimations()
+    if !scrollingDatePill.isHidden { releaseDaySeparatorRepresentation() }
+    scrollingDatePill.isHidden = true
+    scrollingDatePill.alpha = 1.0
+    scrollingDatePill.transform = .identity
+    scrollingDatePillRideY = nil
   }
 
   private func updateScrollingDatePill(visible: Bool) {
     // The history progress control and date use one viewport-pinned safe-area slot.
     // Showing both would read as a warped double material while pulling toward history.
     guard visible, !rows.isEmpty, cachedHistoryPullIndicator.alpha <= 0.01 else {
-      cancelScrollingDatePillLinger()
-      scrollingDatePill.isHidden = true
-      scrollingDatePill.alpha = 1.0
+      hideScrollingDatePill()
       return
     }
+    // The floating capsule is a SCROLL affordance: it is promoted out of the list when the
+    // list moves and handed back when it settles. Opening a chat is not a scroll, so an
+    // untouched list shows only its own in-list separators — never a capsule bolted to the
+    // header. Once engaged it keeps updating until the settle linger retires it.
+    let listIsMoving =
+      collectionView.isTracking || collectionView.isDragging || collectionView.isDecelerating
+    guard listIsMoving || !scrollingDatePill.isHidden else { return }
     let visibleItems = collectionView.indexPathsForVisibleItems.sorted { lhs, rhs in
       guard
         let left = collectionView.layoutAttributesForItem(at: lhs),
@@ -9434,36 +9572,78 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return left.frame.minY < right.frame.minY
     }
     guard let indexPath = visibleItems.first(where: { $0.item < rows.count }) else {
-      cancelScrollingDatePillLinger()
-      scrollingDatePill.isHidden = true
-      scrollingDatePill.alpha = 1.0
+      hideScrollingDatePill()
       return
     }
     let row = rows[indexPath.item]
-    let label =
-      scrollingDateLabelsByRowKey[row.key]
-      ?? (row.kind == .day ? row.label : nil)
+    func dateLabel(for candidate: ChatListRow) -> String? {
+      if let mapped = scrollingDateLabelsByRowKey[candidate.key], !mapped.isEmpty {
+        return mapped
+      }
+      if candidate.kind == .day {
+        let own = candidate.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !own.isEmpty { return own }
+      }
+      return nil
+    }
+    // Resolving from the topmost row ALONE hid the whole pill whenever that row was
+    // missing from the map (rows appended by a live delta, agent/system rows) — the
+    // reported "date never sticks under the header, it only exists in the list". Fall
+    // back to the next dated visible row: any of them names the same viewport day.
+    var resolvedLabel: String? = dateLabel(for: row)
+    if resolvedLabel == nil {
+      for candidate in visibleItems where candidate.item < rows.count {
+        if let fallback = dateLabel(for: rows[candidate.item]) {
+          resolvedLabel = fallback
+          break
+        }
+      }
+    }
+    let label = resolvedLabel
     guard let label, !label.isEmpty else {
-      cancelScrollingDatePillLinger()
-      scrollingDatePill.isHidden = true
-      scrollingDatePill.alpha = 1.0
+      // Never silent: a hidden pill is a bug report, so say which row starved it.
+      let reason = "no-label|top=\(String(row.key.suffix(12)))|kind=\(row.kind)"
+      if reason != lastScrollingDatePillLogSignature {
+        lastScrollingDatePillLogSignature = reason
+        NSLog(
+          "[ChatOpen] date-pin HIDDEN chat=%@ reason=%@ visible=%d mapped=%d",
+          String(engineChatId.prefix(12)), reason, visibleItems.count,
+          scrollingDateLabelsByRowKey.count)
+      }
+      hideScrollingDatePill()
       return
     }
 
-    // ONE capsule, and it lives under the header. The pinned pill always shows the current
-    // date; the in-list separator it represents fades out (alpha only — the row keeps its
-    // height, so nothing moves). Previously this branch did the opposite: whenever that
-    // separator was anywhere on screen below the slot, the PINNED pill hid and the date
-    // scrolled away with the list — which is exactly "the date is stuck in the list
-    // instead of attached to the header". The next day's separator keeps its capsule as it
-    // rises, so you watch it travel up, shove this one behind the header, and take over.
+    // ONE capsule, and it is the LIST'S OWN separator, promoted. The floating pill is drawn
+    // at that separator's real position while it is still travelling, and only clamps to the
+    // sticky slot once it has actually reached the header — so you watch a single element
+    // ride up out of the list, stick, get shoved out by the next day, and (scrolling the
+    // other way) come unstuck and rejoin the list. Pinning it at the slot unconditionally is
+    // what made it teleport: the in-list capsule vanished mid-list and a "separate" one
+    // appeared under the header without ever travelling there.
     let slotY = scrollingDatePillSlotY()
     let offsetY = collectionView.contentOffset.y
+    let listTop = collectionView.frame.minY
+    let pillHeightEstimate = max(scrollingDatePill.bounds.height, 22.0)
+    var ownerNaturalY: CGFloat?
+    for candidate in visibleItems {
+      guard candidate.item < rows.count, rows[candidate.item].kind == .day,
+        dateLabel(for: rows[candidate.item]) == label,
+        let attrs = collectionView.layoutAttributesForItem(at: candidate)
+      else { continue }
+      ownerNaturalY = attrs.frame.midY - offsetY + listTop - (pillHeightEstimate / 2.0)
+      break
+    }
+    // Above the slot (or scrolled off entirely) means arrived: stick. Below means it is
+    // still in the list and the pill simply stands in for it, pixel-for-pixel.
+    let rideY = max(slotY, ownerNaturalY ?? slotY)
+    scrollingDatePillRideY = rideY
+    let isStuck = rideY <= slotY + 0.5
     for candidate in visibleItems {
       guard candidate.item < rows.count, rows[candidate.item].kind == .day,
         let cell = collectionView.cellForItem(at: candidate) as? ChatListCell
       else { continue }
-      cell.setDaySeparatorRepresentedByPinnedDate(rows[candidate.item].label == label)
+      cell.setDaySeparatorRepresentedByPinnedDate(dateLabel(for: rows[candidate.item]) == label)
     }
 
     cancelScrollingDatePillLinger()
@@ -9472,7 +9652,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if scrollingDateLabel.text != label {
       // Day boundary crossed while stuck: the incoming date pushes the old one out the
       // way the in-list separator is travelling (up toward now, down toward history).
-      if wasVisible {
+      // While RIDING the capsule is already moving with the list, so a push here would be
+      // a second, contradictory motion.
+      if wasVisible, isStuck {
         let push = CATransition()
         push.type = .push
         push.subtype = lastScrollDeltaY < 0.0 ? .fromTop : .fromBottom
@@ -9494,7 +9676,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // rather than a fixed pill that only cross-fades its text in place.
     let pillHeight = scrollingDatePill.bounds.height
     var shoveUp: CGFloat = 0.0
-    if pillHeight > 0.0 {
+    if pillHeight > 0.0, isStuck {
       for candidate in visibleItems {
         guard candidate.item < rows.count, rows[candidate.item].kind == .day,
           rows[candidate.item].label != label,
@@ -9517,12 +9699,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     // One line per state change (label / shown-ness / slot), so "the date isn't sticking"
     // is answerable from a log instead of from the screen.
-    let stateSignature = "\(label)|\(Int(slotY))|\(Int(shoveUp))"
+    let stateSignature = "\(label)|\(Int(slotY))|\(Int(shoveUp))|\(isStuck)"
     if stateSignature != lastScrollingDatePillLogSignature {
       lastScrollingDatePillLogSignature = stateSignature
       NSLog(
-        "[ChatOpen] date-pin chat=%@ label=%@ slotY=%.0f pillY=%.0f shove=%.0f safeTop=%.0f padTop=%.0f",
-        String(engineChatId.prefix(12)), label, slotY, scrollingDatePill.frame.minY, shoveUp,
+        "[ChatOpen] date-pin chat=%@ label=%@ state=%@ slotY=%.0f pillY=%.0f own=%.0f shove=%.0f safeTop=%.0f padTop=%.0f",
+        String(engineChatId.prefix(12)), label, isStuck ? "STUCK" : "riding", slotY,
+        scrollingDatePill.frame.minY, ownerNaturalY ?? -1.0, shoveUp,
         safeAreaInsets.top, contentPaddingTop)
     }
   }
@@ -11106,6 +11289,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   public func scrollViewDidScroll(_ scrollView: UIScrollView) {
     let offsetY = scrollView.contentOffset.y
+    // Per-event hitch attribution. A scroll event has ~8ms of frame budget at 120Hz;
+    // anything slower IS the felt lag, and guessing which of the dozen updaters below
+    // ate it has cost us several rounds. Only slow events log (never a per-frame flood).
+    let scrollTickStartedAt = ProcessInfo.processInfo.systemUptime
+    var scrollMark = scrollTickStartedAt
+    func scrollPhaseMs() -> Double {
+      let now = ProcessInfo.processInfo.systemUptime
+      defer { scrollMark = now }
+      return (now - scrollMark) * 1000.0
+    }
 
     var wallpaperFrame = bounds
     wallpaperFrame.origin.y = offsetY
@@ -11120,6 +11313,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     updateScrollToneOverlay(offsetY: offsetY)
     refreshWallpaperSnapshotIfNeeded()
     updateVisibleWallpaperBackdropLayouts()
+    let wallpaperMs = scrollPhaseMs()
 
     if let activeSendTransition {
       if skipNextTransitionScrollCorrection {
@@ -11147,6 +11341,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         agentPinUserDetached = true
       }
     }
+    let autoScrollMs = scrollPhaseMs()
     scheduleVisibleAutoDownloads()
     maybeStartPendingSendTransition()
     maybeLoadOlderBridgeHistoryIfNeeded(offsetY: offsetY)
@@ -11154,6 +11349,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // the actual prepend waits until UIKit has completely released the active gesture.
     updateCachedHistoryPullIndicator(offsetY: offsetY)
     maybeRevealOlderTranscriptRows(offsetY: offsetY)
+    let historyMs = scrollPhaseMs()
     // Keep the avatar overlay frame-exact with the cells. The previous next-runloop
     // coalescing made avatars visibly trail a fling and then pop/shift into place.
     // EXCEPT while a rows batch is mid-commit: the collection's layout attributes are
@@ -11167,17 +11363,28 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if !isApplyingRowsUpdate, !isTallMorphInFlight {
       updateFloatingSenderAvatars()
     }
+    let avatarsMs = scrollPhaseMs()
     if !isTallMorphInFlight {
       updateTallBubbleGlassToggles(animatedIcons: false)
     }
+    let togglesMs = scrollPhaseMs()
     // Only user-driven scrolling refreshes/shows the pill. Internal offset adjustments
     // (anchored prepends, keyboard) must not blink it out — the post-scroll linger fade
     // owns hiding now.
     if collectionView.isTracking || collectionView.isDragging || collectionView.isDecelerating {
       updateScrollingDatePill(visible: true)
     }
+    let pillMs = scrollPhaseMs()
     emitViewport()
     updateJumpToBottomButtonVisibility()
+    let emitMs = scrollPhaseMs()
+    let scrollTickMs = (ProcessInfo.processInfo.systemUptime - scrollTickStartedAt) * 1000.0
+    if scrollTickMs >= 8.0 {
+      NSLog(
+        "[ScrollHitch] %.0fms wallpaper=%.0f auto=%.0f history=%.0f avatars=%.0f toggles=%.0f pill=%.0f emit=%.0f cells=%d off=%.0f",
+        scrollTickMs, wallpaperMs, autoScrollMs, historyMs, avatarsMs, togglesMs, pillMs,
+        emitMs, collectionView.indexPathsForVisibleItems.count, offsetY)
+    }
   }
 
   /// Place outer glass expand/collapse chips OUTSIDE the bubble plate:
@@ -13739,7 +13946,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
-    if let cached = Self.wallpaperSnapshotCache[cacheKey] {
+    if let cached = Self.wallpaperSnapshotCache.object(forKey: cacheKey as NSString)?.cgImage {
       wallpaperSnapshot = cached
       wallpaperSnapshotSize = bounds.size
       wallpaperSnapshotCacheKey = cacheKey
@@ -13751,7 +13958,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // lands in a new scroll-phase bucket, and the re-raster ran synchronously inside
     // setContentOffset. During any internal adjustment, keep the (one-bucket-stale,
     // visually indistinguishable) snapshot and re-raster after the push settles.
-    if !force, isInternalScrollAdjustment {
+    // Same reasoning applies to a FINGER on the list, which is where it hurts most: a
+    // phase-bucket crossing mid-drag re-rasterized the full-screen pattern inline and
+    // dropped ~3 frames (41-55ms measured, ~200ms worst case) — the reported scroll lag.
+    // The stale bucket is visually indistinguishable, so hold it and re-raster once the
+    // scroll settles (scrollViewDidEndDragging/EndDecelerating flush this).
+    let userIsScrolling =
+      collectionView.isTracking || collectionView.isDragging || collectionView.isDecelerating
+    if !force, isInternalScrollAdjustment || userIsScrolling {
       pendingWallpaperSnapshotRefresh = true
       return
     }
@@ -13774,7 +13988,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         renderMs, cacheKey, isInternalScrollAdjustment ? "Y" : "N")
     }
     guard let cgImage = image.cgImage else { return }
-    Self.wallpaperSnapshotCache[cacheKey] = cgImage
+    Self.wallpaperSnapshotCache.setObject(
+      UIImage(cgImage: cgImage, scale: scale, orientation: .up),
+      forKey: cacheKey as NSString,
+      cost: cgImage.bytesPerRow * cgImage.height)
     wallpaperSnapshot = cgImage
     wallpaperSnapshotSize = bounds.size
     wallpaperSnapshotCacheKey = cacheKey
