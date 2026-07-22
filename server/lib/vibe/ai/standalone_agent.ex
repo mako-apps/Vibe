@@ -38,9 +38,10 @@ defmodule Vibe.AI.StandaloneAgent do
         {:error, :chat_not_attached}
 
       true ->
-        with {:ok, outputs} <-
+        with {:ok, scoped_agent} <- delivery_scoped_agent(agent, response_mode, vibe_chat_id),
+             {:ok, outputs} <-
                generate_outputs(
-                 agent,
+                 scoped_agent,
                  message,
                  attachments,
                  requested_output_mode,
@@ -53,7 +54,7 @@ defmodule Vibe.AI.StandaloneAgent do
           outputs = put_provider_content_on_outputs(outputs, provider_content)
 
           with {:ok, deliveries} <-
-                 maybe_deliver(agent, vibe_chat_id, outputs, response_mode, reply_to_id) do
+                 maybe_deliver(scoped_agent, vibe_chat_id, outputs, response_mode, reply_to_id) do
             {:ok, %{outputs: outputs, vibe_deliveries: deliveries}}
           end
         end
@@ -72,6 +73,36 @@ defmodule Vibe.AI.StandaloneAgent do
     }
 
     invoke(agent, params)
+  end
+
+  defp delivery_scoped_agent(agent, "send", chat_id) do
+    with {:ok, policy} <- Chat.channel_agent_policy(chat_id, agent) do
+      {:ok,
+       %{
+         agent
+         | enabled_tools: policy.enabled_tools || [],
+           output_modes: policy.output_modes || [],
+           system_prompt: scoped_system_prompt(agent.system_prompt, policy.permissions || %{})
+       }}
+    end
+  end
+
+  defp delivery_scoped_agent(agent, _response_mode, _chat_id), do: {:ok, agent}
+
+  defp scoped_system_prompt(base_prompt, permissions) do
+    channel_instructions =
+      normalize_string(permissions["instructions"] || permissions[:instructions])
+
+    [
+      base_prompt,
+      channel_instructions && "Channel-specific instructions: #{channel_instructions}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n\n")
+    |> case do
+      "" -> nil
+      prompt -> prompt
+    end
   end
 
   defp generate_outputs(
@@ -176,6 +207,7 @@ defmodule Vibe.AI.StandaloneAgent do
     message_type = output_type(output)
     plain_text = output_text(output)
     media_url = output_media_url(output)
+
     agent_username =
       case agent.agent_user do
         %{username: username} when is_binary(username) -> username
@@ -404,35 +436,51 @@ defmodule Vibe.AI.StandaloneAgent do
       |> to_string()
       |> String.trim()
 
-    case requested_output_mode do
-      "voice" ->
-        if normalized_text != "" and "voice" in (agent.output_modes || []) do
-          case TTS.synthesize(normalized_text, voice: agent.voice_profile || "alloy") do
-            {:ok, voice} ->
-              base_outputs ++
-                [
-                  %{
-                    type: "voice",
-                    text: normalized_text,
-                    mediaUrl: voice.media_url,
-                    metadata: %{"duration" => voice.duration, "mimeType" => "audio/mpeg"}
-                  }
-                ]
+    outputs =
+      case requested_output_mode do
+        "voice" ->
+          if normalized_text != "" and "voice" in (agent.output_modes || []) do
+            case TTS.synthesize(normalized_text, voice: agent.voice_profile || "alloy") do
+              {:ok, voice} ->
+                base_outputs ++
+                  [
+                    %{
+                      type: "voice",
+                      text: normalized_text,
+                      mediaUrl: voice.media_url,
+                      metadata: %{"duration" => voice.duration, "mimeType" => "audio/mpeg"}
+                    }
+                  ]
 
-            {:error, reason} ->
-              Logger.warning(
-                "[StandaloneAgent] TTS failed, falling back to text: #{inspect(reason)}"
-              )
+              {:error, reason} ->
+                Logger.warning(
+                  "[StandaloneAgent] TTS failed, falling back to text: #{inspect(reason)}"
+                )
 
-              maybe_append_text_output(base_outputs, normalized_text, text_metadata)
+                maybe_append_text_output(base_outputs, normalized_text, text_metadata)
+            end
+          else
+            maybe_append_text_output(base_outputs, normalized_text, text_metadata)
           end
-        else
+
+        _ ->
           maybe_append_text_output(base_outputs, normalized_text, text_metadata)
+      end
+
+    filter_outputs_by_modes(outputs, agent.output_modes || [])
+  end
+
+  defp filter_outputs_by_modes(outputs, modes) do
+    Enum.filter(outputs, fn output ->
+      mode =
+        case output_type(output) do
+          "voice" -> "voice"
+          "text" -> "text"
+          _ -> "media"
         end
 
-      _ ->
-        maybe_append_text_output(base_outputs, normalized_text, text_metadata)
-    end
+      mode in modes
+    end)
   end
 
   defp maybe_append_text_output(outputs, "", _metadata), do: outputs

@@ -122,113 +122,124 @@ defmodule VibeWeb.ChatChannel do
         broadcast_payload = strip_inline_agent_attachments(enforce_sender_identity(data, user_id))
         message_metadata = message_metadata_for_persistence(data, standalone_agent)
 
-        # Prefer top-level mediaUrl; fall back to metadata (some clients only set meta).
-        # Never persist file:// / local device paths — those die on reopen.
-        resolved_media_url =
-          durable_media_url(data["mediaUrl"] || data["media_url"] || message_metadata["mediaUrl"])
+        if Chat.content_copy_restricted?(message_metadata) do
+          {:reply,
+           {:error,
+            %{
+              reason: "content_saving_restricted",
+              message: "Forwarding is disabled for this channel"
+            }}, socket}
+        else
+          # Prefer top-level mediaUrl; fall back to metadata (some clients only set meta).
+          # Never persist file:// / local device paths — those die on reopen.
+          resolved_media_url =
+            durable_media_url(
+              data["mediaUrl"] || data["media_url"] || message_metadata["mediaUrl"]
+            )
 
-        message_attrs = %{
-          chat_id: chat_id,
-          from_id: user_id,
-          id: data["id"],
-          encrypted_content: data["encryptedContent"],
-          type: data["type"] || "text",
-          timestamp: data["timestamp"] || :os.system_time(:millisecond),
-          reply_to_id: data["replyToId"],
-          media_url: resolved_media_url,
-          metadata: message_metadata
-        }
+          message_attrs = %{
+            chat_id: chat_id,
+            from_id: user_id,
+            id: data["id"],
+            encrypted_content: data["encryptedContent"],
+            type: data["type"] || "text",
+            timestamp: data["timestamp"] || :os.system_time(:millisecond),
+            reply_to_id: data["replyToId"],
+            media_url: resolved_media_url,
+            metadata: message_metadata
+          }
 
-        Logger.info(
-          "[MediaDrop] persist chat=#{chat_id} mid=#{data["id"]} type=#{message_attrs.type} media=#{if(is_binary(resolved_media_url), do: "REMOTE", else: "nil")} meta_thumbs=#{inspect(is_list(message_metadata["attachmentThumbnailsB64"]))} meta_thumb?=#{is_binary(message_metadata["thumbnailBase64"])} stripped_blobs=true"
-        )
+          Logger.info(
+            "[MediaDrop] persist chat=#{chat_id} mid=#{data["id"]} type=#{message_attrs.type} media=#{if(is_binary(resolved_media_url), do: "REMOTE", else: "nil")} meta_thumbs=#{inspect(is_list(message_metadata["attachmentThumbnailsB64"]))} meta_thumb?=#{is_binary(message_metadata["thumbnailBase64"])} stripped_blobs=true"
+          )
 
-        # BROADCAST IMMEDIATELY for instant message delivery
-        broadcast!(socket, "message", broadcast_payload)
+          # BROADCAST IMMEDIATELY for instant message delivery
+          broadcast!(socket, "message", broadcast_payload)
 
-        # Mirror a lightweight ping to the sender's OWN other devices. The chat-topic
-        # broadcast above only reaches devices that currently have THIS chat open, so
-        # a message typed on the phone never reached the same user's laptop sitting on
-        # the chat list. This `new_message` on the sender's user topic lets those other
-        # devices refresh in real time (no push — it's the sender's own device).
-        VibeWeb.Endpoint.broadcast!("user:#{user_id}", "new_message", %{
-          chat_id: chat_id,
-          from_id: user_id,
-          message_id: data["id"],
-          timestamp: data["timestamp"],
-          self_echo: true
-        })
+          # Mirror a lightweight ping to the sender's OWN other devices. The chat-topic
+          # broadcast above only reaches devices that currently have THIS chat open, so
+          # a message typed on the phone never reached the same user's laptop sitting on
+          # the chat list. This `new_message` on the sender's user topic lets those other
+          # devices refresh in real time (no push — it's the sender's own device).
+          VibeWeb.Endpoint.broadcast!("user:#{user_id}", "new_message", %{
+            chat_id: chat_id,
+            from_id: user_id,
+            message_id: data["id"],
+            timestamp: data["timestamp"],
+            self_echo: true
+          })
 
-        # Check for @vibe agent mention and dispatch to group agent.
-        # Run async: resolution does several synchronous DB reads (room type,
-        # participant ids ×2, shadow-agent lookup, local-worker + attachment
-        # context) that previously blocked the sender's "sent" ack by ~2s even
-        # for a plain no-agent DM. It's pure fire-and-forget fan-out (spawns
-        # workers / logs) with an unused return value, so defer it past the reply.
-        Task.start(fn -> maybe_dispatch_agent(chat_id, data, user_id) end)
+          # Check for @vibe agent mention and dispatch to group agent.
+          # Run async: resolution does several synchronous DB reads (room type,
+          # participant ids ×2, shadow-agent lookup, local-worker + attachment
+          # context) that previously blocked the sender's "sent" ack by ~2s even
+          # for a plain no-agent DM. It's pure fire-and-forget fan-out (spawns
+          # workers / logs) with an unused return value, so defer it past the reply.
+          Task.start(fn -> maybe_dispatch_agent(chat_id, data, user_id) end)
 
-        # Persist to database asynchronously (don't block message delivery)
-        Task.start(fn ->
-          case Chat.add_message(message_attrs, acting_user_id: user_id) do
-            {:ok, _msg} ->
-              # Batch-fetch all participants with settings in ONE query (no N+1)
-              participants = Chat.get_all_participant_settings(chat_id)
+          # Persist to database asynchronously (don't block message delivery)
+          Task.start(fn ->
+            case Chat.add_message(message_attrs, acting_user_id: user_id) do
+              {:ok, _msg} ->
+                # Batch-fetch all participants with settings in ONE query (no N+1)
+                participants = Chat.get_all_participant_settings(chat_id)
 
-              Logger.info(
-                "[ChatChannel] message persisted chat_id=#{chat_id} sender=#{user_id} participants=#{length(participants)} message_id=#{data["id"]}"
-              )
+                Logger.info(
+                  "[ChatChannel] message persisted chat_id=#{chat_id} sender=#{user_id} participants=#{length(participants)} message_id=#{data["id"]}"
+                )
 
-              Enum.each(participants, fn p ->
-                if p.user_id != user_id do
-                  if p.deleted, do: Chat.restore_if_deleted(chat_id, p.user_id)
+                Enum.each(participants, fn p ->
+                  if p.user_id != user_id do
+                    if p.deleted, do: Chat.restore_if_deleted(chat_id, p.user_id)
 
-                  VibeWeb.Endpoint.broadcast!("user:#{p.user_id}", "new_message", %{
-                    chat_id: chat_id,
-                    from_id: user_id,
-                    message_id: data["id"],
-                    timestamp: data["timestamp"],
-                    muted: p.muted || false
-                  })
+                    VibeWeb.Endpoint.broadcast!("user:#{p.user_id}", "new_message", %{
+                      chat_id: chat_id,
+                      from_id: user_id,
+                      message_id: data["id"],
+                      timestamp: data["timestamp"],
+                      muted: p.muted || false
+                    })
 
-                  if p.muted do
-                    Logger.info(
-                      "[ChatChannel] push skipped (muted chat) recipient=#{p.user_id} chat_id=#{chat_id} message_id=#{data["id"]}"
-                    )
-                  else
-                    push_body =
-                      case data["pushPreview"] || data["push_preview"] || data["textPreview"] ||
-                             data["text_preview"] do
-                        value when is_binary(value) and value != "" -> value
-                        _ -> nil
-                      end
+                    if p.muted do
+                      Logger.info(
+                        "[ChatChannel] push skipped (muted chat) recipient=#{p.user_id} chat_id=#{chat_id} message_id=#{data["id"]}"
+                      )
+                    else
+                      push_body =
+                        case data["pushPreview"] || data["push_preview"] || data["textPreview"] ||
+                               data["text_preview"] do
+                          value when is_binary(value) and value != "" -> value
+                          _ -> nil
+                        end
 
-                    _ =
-                      Notifications.send_message_push(p.user_id, %{
-                        "chat_id" => chat_id,
-                        "message_id" => data["id"],
-                        "from_id" => user_id,
-                        "type" => data["type"],
-                        "body" => push_body,
-                        "media_url" => data["mediaUrl"] || data["media_url"]
-                      })
+                      _ =
+                        Notifications.send_message_push(p.user_id, %{
+                          "chat_id" => chat_id,
+                          "message_id" => data["id"],
+                          "from_id" => user_id,
+                          "type" => data["type"],
+                          "body" => push_body,
+                          "media_url" => data["mediaUrl"] || data["media_url"]
+                        })
+                    end
                   end
-                end
-              end)
+                end)
 
-            {:error, changeset} ->
-              # Log persistence failure but don't crash
-              Logger.error("Message persistence failed: #{inspect(changeset)}")
-          end
-        end)
+              {:error, changeset} ->
+                # Log persistence failure but don't crash
+                Logger.error("Message persistence failed: #{inspect(changeset)}")
+            end
+          end)
 
-        # Reply immediately - don't wait for DB
-        ack_held_us = System.monotonic_time(:microsecond) - ack_started_at
+          # Reply immediately - don't wait for DB
+          ack_held_us = System.monotonic_time(:microsecond) - ack_started_at
 
-        Logger.info(
-          "[ChatChannel] ⏱️ ack held #{ack_held_us}µs chat_id=#{chat_id} message_id=#{data["id"]}"
-        )
+          Logger.info(
+            "[ChatChannel] ⏱️ ack held #{ack_held_us}µs chat_id=#{chat_id} message_id=#{data["id"]}"
+          )
 
-        {:reply, :ok, socket}
+          {:reply, :ok, socket}
+        end
       end
     end
   end
@@ -1855,10 +1866,18 @@ defmodule VibeWeb.ChatChannel do
     trimmed = String.trim(url)
 
     cond do
-      trimmed == "" -> nil
-      String.starts_with?(trimmed, "file:") -> nil
-      String.starts_with?(trimmed, "/") -> nil
-      String.starts_with?(trimmed, "http://") or String.starts_with?(trimmed, "https://") -> trimmed
+      trimmed == "" ->
+        nil
+
+      String.starts_with?(trimmed, "file:") ->
+        nil
+
+      String.starts_with?(trimmed, "/") ->
+        nil
+
+      String.starts_with?(trimmed, "http://") or String.starts_with?(trimmed, "https://") ->
+        trimmed
+
       true ->
         Logger.info("[MediaDrop] reject non-http media_url=#{String.slice(trimmed, 0, 80)}")
         nil

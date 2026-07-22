@@ -588,9 +588,27 @@ struct ChatHomeListRow {
   /// visible message, else room creation). Drives newest-first home ordering.
   /// Mirrors the server's `lastMessageAt`.
   let lastMessageAt: Double
+  /// Room creation epoch-ms when present (`createdAt`).
+  let createdAt: Double
+  /// Optional room description (group/channel).
+  let roomDescription: String?
+  /// Channel access: `private` or `public`.
+  let accessType: String?
+  /// Public channel slug identity.
+  let publicSlug: String?
+  /// Shareable invite / public link when known.
+  let shareLink: String?
+  /// Channel join-approval policy.
+  let joinApprovalRequired: Bool
+  /// Channel restrict-saving-content policy.
+  let restrictSavingContent: Bool
+  /// Server member count when provided.
+  let memberCount: Int?
+  /// Server subscriber count for channels when provided.
+  let subscriberCount: Int?
 
   /// Explicit initializer (replaces the synthesized memberwise init) so
-  /// `lastMessageAt` can default — every pre-existing `ChatHomeListRow(...)` call
+  /// additive fields can default — every pre-existing `ChatHomeListRow(...)` call
   /// site keeps compiling and only the recency-aware paths pass a real value.
   init(
     chatId: String,
@@ -623,7 +641,16 @@ struct ChatHomeListRow {
     previewRows: [[String: Any]],
     initialMessages: [[String: Any]],
     members: [[String: Any]],
-    lastMessageAt: Double = 0
+    lastMessageAt: Double = 0,
+    createdAt: Double = 0,
+    roomDescription: String? = nil,
+    accessType: String? = nil,
+    publicSlug: String? = nil,
+    shareLink: String? = nil,
+    joinApprovalRequired: Bool = false,
+    restrictSavingContent: Bool = false,
+    memberCount: Int? = nil,
+    subscriberCount: Int? = nil
   ) {
     self.chatId = chatId
     self.title = title
@@ -656,6 +683,15 @@ struct ChatHomeListRow {
     self.initialMessages = initialMessages
     self.members = members
     self.lastMessageAt = lastMessageAt
+    self.createdAt = createdAt
+    self.roomDescription = roomDescription
+    self.accessType = accessType
+    self.publicSlug = publicSlug
+    self.shareLink = shareLink
+    self.joinApprovalRequired = joinApprovalRequired
+    self.restrictSavingContent = restrictSavingContent
+    self.memberCount = memberCount
+    self.subscriberCount = subscriberCount
   }
 
   var isBuiltInAgentSurface: Bool {
@@ -759,6 +795,15 @@ struct ChatHomeListRow {
     if !members.isEmpty {
       payload["members"] = members
     }
+    if createdAt > 0 { payload["createdAt"] = createdAt }
+    if let roomDescription { payload["description"] = roomDescription }
+    if let accessType { payload["accessType"] = accessType }
+    if let publicSlug { payload["publicSlug"] = publicSlug }
+    if let shareLink { payload["shareLink"] = shareLink }
+    if joinApprovalRequired { payload["joinApprovalRequired"] = true }
+    if restrictSavingContent { payload["restrictSavingContent"] = true }
+    if let memberCount { payload["memberCount"] = memberCount }
+    if let subscriberCount { payload["subscriberCount"] = subscriberCount }
     return payload
   }
 
@@ -794,7 +839,16 @@ struct ChatHomeListRow {
       previewRows: previewRows,
       initialMessages: initialMessages,
       members: members,
-      lastMessageAt: lastMessageAt
+      lastMessageAt: lastMessageAt,
+      createdAt: createdAt,
+      roomDescription: roomDescription,
+      accessType: accessType,
+      publicSlug: publicSlug,
+      shareLink: shareLink,
+      joinApprovalRequired: joinApprovalRequired,
+      restrictSavingContent: restrictSavingContent,
+      memberCount: memberCount,
+      subscriberCount: subscriberCount
     )
   }
 
@@ -823,10 +877,6 @@ struct ChatHomeListRow {
 
     let previewRaw = firstSafeDisplayText(raw["preview"], raw["subtitle"])
     let previewMessage = serverMessages.last.map(homePreviewText(from:))
-    let timeLabel =
-      normalizedString(raw["timeLabel"] ?? raw["time_label"] ?? raw["time"])
-      ?? serverMessages.last.map(homeTimeLabel(from:))
-      ?? ""
     let unreadCount = parseInt(raw["unreadCount"] ?? raw["unread_count"]) ?? 0
     let markedUnread = parseBool(raw["markedUnread"] ?? raw["marked_unread"]) ?? false
     let muted = parseBool(raw["muted"]) ?? false
@@ -845,6 +895,8 @@ struct ChatHomeListRow {
       if type == "group" || type == "channel" { return true }
       return parseBool(raw["isGroup"] ?? raw["is_group"]) ?? false
     }()
+    let isChannelRow =
+      (type ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "channel"
     // Per-user role for this room (owner/admin/member). Stabilizes admin chrome
     // without re-deriving only from the members array (which can arrive incomplete).
     let myRole = normalizedString(
@@ -920,22 +972,67 @@ struct ChatHomeListRow {
         ?? raw["tier"] ?? raw["badge"] ?? raw["badgeTier"] ?? raw["badge_tier"])
     // Do not erase real bridge-agent activity. The server supplies the newest
     // transcript row, which is the source of truth for Home's preview and order.
-    let preview = previewRaw ?? previewMessage ?? ""
+    // Empty multi-party rooms with no messages get localized create copy.
+    let preview: String = {
+      if let previewRaw { return previewRaw }
+      if let previewMessage { return previewMessage }
+      if serverMessages.isEmpty {
+        if isChannelRow { return "Channel created" }
+        if isGroup { return "Group created" }
+      }
+      return ""
+    }()
     let initialMessages = serverMessages
     let previewRows = parsePreviewRows(raw["previewRows"] ?? raw["preview_rows"])
 
-    let lastMessageAt: Double = {
-      if let value = raw["lastMessageAt"] as? NSNumber { return value.doubleValue }
-      if let value = raw["last_message_at"] as? NSNumber { return value.doubleValue }
-      if let text = normalizedString(raw["lastMessageAt"] ?? raw["last_message_at"]),
-        let parsed = Double(text)
-      {
-        return parsed
-      }
-      // Cache/legacy payloads without the field: derive from the newest message.
-      if let newest = serverMessages.last { return Double(parseTimestamp(newest)) }
+    let createdAt: Double = {
+      if let value = parseEpochMillis(raw["createdAt"] ?? raw["created_at"]) { return value }
       return 0
     }()
+
+    let lastMessageAt: Double = {
+      if let value = parseEpochMillis(raw["lastMessageAt"] ?? raw["last_message_at"]) {
+        return value
+      }
+      // Cache/legacy payloads without the field: derive from the newest message.
+      if let newest = serverMessages.last {
+        let ts = Double(parseTimestamp(newest))
+        if ts > 0 { return ts }
+      }
+      // Empty rooms: fall back to createdAt so ordering/time still work.
+      if createdAt > 0 { return createdAt }
+      return 0
+    }()
+
+    // Explicit time text first, then message time, then lastMessageAt/createdAt.
+    let timeLabel: String = {
+      if let explicit = normalizedString(raw["timeLabel"] ?? raw["time_label"] ?? raw["time"]) {
+        return explicit
+      }
+      if let fromMessage = serverMessages.last.map(homeTimeLabel(from:)), !fromMessage.isEmpty {
+        return fromMessage
+      }
+      if lastMessageAt > 0 {
+        return homeTimeLabel(fromEpochMillis: lastMessageAt)
+      }
+      if createdAt > 0 {
+        return homeTimeLabel(fromEpochMillis: createdAt)
+      }
+      return ""
+    }()
+
+    let roomDescription = normalizedString(
+      raw["description"] ?? raw["roomDescription"] ?? raw["room_description"])
+    let accessType = normalizedString(raw["accessType"] ?? raw["access_type"])?.lowercased()
+    let publicSlug = normalizedString(raw["publicSlug"] ?? raw["public_slug"])
+    let shareLink = normalizedString(
+      raw["shareLink"] ?? raw["share_link"] ?? raw["inviteLink"] ?? raw["invite_link"])
+    let joinApprovalRequired =
+      parseBool(raw["joinApprovalRequired"] ?? raw["join_approval_required"]) ?? false
+    let restrictSavingContent =
+      parseBool(raw["restrictSavingContent"] ?? raw["restrict_saving_content"]) ?? false
+    let memberCount = parseInt(raw["memberCount"] ?? raw["member_count"])
+    let subscriberCount = parseInt(raw["subscriberCount"] ?? raw["subscriber_count"])
 
     return ChatHomeListRow(
       chatId: chatId,
@@ -968,7 +1065,16 @@ struct ChatHomeListRow {
       previewRows: previewRows,
       initialMessages: initialMessages,
       members: parsePreviewRows(raw["members"]),
-      lastMessageAt: lastMessageAt
+      lastMessageAt: lastMessageAt,
+      createdAt: createdAt,
+      roomDescription: roomDescription,
+      accessType: accessType,
+      publicSlug: publicSlug,
+      shareLink: shareLink,
+      joinApprovalRequired: joinApprovalRequired,
+      restrictSavingContent: restrictSavingContent,
+      memberCount: memberCount,
+      subscriberCount: subscriberCount
     )
   }
 
@@ -1040,7 +1146,17 @@ struct ChatHomeListRow {
   static func homeTimeLabel(from raw: [String: Any]) -> String {
     let timestamp = parseTimestamp(raw)
     guard timestamp > 0 else { return "" }
-    let date = Date(timeIntervalSince1970: TimeInterval(timestamp) / 1000.0)
+    return homeTimeLabel(fromEpochMillis: Double(timestamp))
+  }
+
+  /// Format an epoch-millisecond activity/create timestamp for the home list.
+  static func homeTimeLabel(fromEpochMillis millis: Double) -> String {
+    guard millis > 0 else { return "" }
+    // Accept seconds if a server ever sends them (pre-2001 ms values).
+    let seconds: TimeInterval = millis > 1_000_000_000_000
+      ? millis / 1000.0
+      : millis
+    let date = Date(timeIntervalSince1970: seconds)
     let calendar = Calendar.current
     if calendar.isDateInToday(date) {
       return HomeTimeFormatters.time.string(from: date)
@@ -1049,6 +1165,17 @@ struct ChatHomeListRow {
       return HomeTimeFormatters.day.string(from: date)
     }
     return HomeTimeFormatters.shortDate.string(from: date)
+  }
+
+  private static func parseEpochMillis(_ value: Any?) -> Double? {
+    if let number = value as? NSNumber {
+      let d = number.doubleValue
+      return d > 0 ? d : nil
+    }
+    if let text = normalizedString(value), let parsed = Double(text), parsed > 0 {
+      return parsed
+    }
+    return nil
   }
 
   private static func resolveAvatarURI(

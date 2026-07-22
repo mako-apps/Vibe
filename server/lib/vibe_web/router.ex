@@ -209,9 +209,25 @@ defmodule VibeWeb.Router do
     # Channels
     post "/channel", ChannelController, :create
     get "/channels", ChannelController, :index
+    post "/channel/links/resolve", ChannelController, :resolve_link
+    post "/channel/links/join", ChannelController, :join_link
+    get "/channel/:id", ChannelController, :show
+    put "/channel/:id", ChannelController, :update
     post "/channel/:id/join", ChannelController, :join
     post "/channel/:id/leave", ChannelController, :leave
     get "/channel/:id/analytics", ChannelController, :analytics
+    post "/channel/:id/invite-link", ChannelController, :rotate_invite
+    post "/channel/:id/invite-links", ChannelController, :create_invite
+    get "/channel/:id/join-requests", ChannelController, :join_requests
+
+    post "/channel/:id/join-requests/:request_id/decision",
+         ChannelController,
+         :decide_join_request
+
+    get "/channel/:id/agents", ChannelController, :agents
+    post "/channel/:id/agents", ChannelController, :attach_agent
+    put "/channel/:id/agents/:agent_id", ChannelController, :update_agent
+    delete "/channel/:id/agents/:agent_id", ChannelController, :detach_agent
 
     # Scheduled Posts
     post "/channel/:id/schedule", ScheduleController, :create
@@ -298,6 +314,8 @@ defmodule VibeWeb.Router do
 
   # Serve React SPA for all other routes
   scope "/", VibeWeb do
+    get "/r/:slug", RoomLinkController, :public
+    get "/j/:token", RoomLinkController, :private
     get "/*path", ApiController, :index
   end
 end

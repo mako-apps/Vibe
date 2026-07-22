@@ -503,6 +503,10 @@ public final class ChatMainView: UIView,
     chatListView.setEngineSurfaceId(value)
   }
 
+  func setRestrictSavingContent(_ restricted: Bool) {
+    chatListView.setRestrictSavingContent(restricted)
+  }
+
   func setDefersEngineStateRefreshes(_ value: Bool) {
     if defersEngineStateRefreshes == value { return }
     defersEngineStateRefreshes = value
@@ -4077,10 +4081,20 @@ public final class ChatMainView: UIView,
         || subtitleLower == "offline")
     {
       resolvedSubtitle = "online"
+    } else if isGroupOrChannel {
+      // At rest: singular/plural member/subscriber count. Typing + connection
+      // already took precedence above.
+      let countSubtitle = resolvedGroupMemberCountSubtitle()
+      if !trimmedSubtitle.isEmpty,
+        !Self.isGenericGroupRestSubtitle(trimmedSubtitle, isChannel: isChannel)
+      {
+        resolvedSubtitle = trimmedSubtitle
+      } else {
+        resolvedSubtitle = countSubtitle
+      }
     } else if trimmedSubtitle.isEmpty
       && headerMode != .savedMessages
       && bridgeProvider.isEmpty
-      && !isGroupOrChannel
       && !enginePeerUserId.isEmpty
     {
       // shouldShowDirectPresence() stays closed until the peer has actually replied — that
@@ -4427,15 +4441,7 @@ public final class ChatMainView: UIView,
     let resolvedTitle = chatTitleText.isEmpty ? "Chat" : chatTitleText
     profileNameLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
     if isGroupOrChannel {
-      let fallbackGroupHandle: String = {
-        let count = resolvedGroupMemberCount()
-        if isChannel {
-          if count > 0 { return "\(count) subscribers" }
-          return "channel"
-        }
-        if count > 0 { return "\(count) members" }
-        return "group chat"
-      }()
+      let fallbackGroupHandle = resolvedGroupMemberCountSubtitle()
       profileHandleLabel.text = profileHandleText.isEmpty ? fallbackGroupHandle : profileHandleText
     } else {
       let fallbackHandle =
@@ -4543,6 +4549,27 @@ public final class ChatMainView: UIView,
   private func resolvedGroupMemberCount() -> Int {
     if let groupMemberCount, groupMemberCount > 0 { return groupMemberCount }
     return Set(groupMemberOrder + groupTypingUserIds.map { $0.uppercased() }).count
+  }
+
+  /// Singular/plural rest subtitle for groups/channels.
+  private func resolvedGroupMemberCountSubtitle() -> String {
+    let count = resolvedGroupMemberCount()
+    if isChannel {
+      if count == 1 { return "1 subscriber" }
+      return "\(count) subscribers"
+    }
+    if count == 1 { return "1 member" }
+    return "\(count) members"
+  }
+
+  /// Host may seed a generic "channel"/"group" label; prefer live count instead.
+  private static func isGenericGroupRestSubtitle(_ text: String, isChannel: Bool) -> Bool {
+    let lower = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if lower.isEmpty { return true }
+    if isChannel {
+      return lower == "channel" || lower == "subscribers" || lower == "0 subscribers"
+    }
+    return lower == "group" || lower == "group chat" || lower == "members" || lower == "0 members"
   }
 
   private func resolvedGroupMemberDisplayName(_ normalizedUserId: String) -> String {
@@ -4661,14 +4688,19 @@ public final class ChatMainView: UIView,
     }
     let labels = orderedUserIds.map { resolvedGroupMemberDisplayName($0) }
     let totalCount = max(resolvedGroupMemberCount(), labels.count)
-    let noun = isChannel ? "subscribers" : "members"
-    let emptyNoun = isChannel ? "subscribers" : "members"
+    let countLabel: String = {
+      if isChannel {
+        return totalCount == 1 ? "1 subscriber" : "\(totalCount) subscribers"
+      }
+      return totalCount == 1 ? "1 member" : "\(totalCount) members"
+    }()
     guard !labels.isEmpty else {
-      return totalCount > 0 ? "\(totalCount) \(noun)" : "No \(emptyNoun)"
+      if totalCount > 0 { return countLabel }
+      return isChannel ? "No subscribers" : "No members"
     }
     let shown = labels.prefix(5)
     let suffix = labels.count > shown.count ? " +\(labels.count - shown.count)" : ""
-    return "\(totalCount) \(noun): \(shown.joined(separator: ", "))\(suffix)"
+    return "\(countLabel): \(shown.joined(separator: ", "))\(suffix)"
   }
 
   private func shouldShowDirectPresence() -> Bool {

@@ -99,7 +99,8 @@ public final class ChatContextMenuOverlay: UIView {
     appearance: ChatListAppearance,
     showResendAction: Bool,
     showRegenerateAction: Bool = false,
-    showEditAction: Bool = false
+    showEditAction: Bool = false,
+    restrictSavingContent: Bool = false
   ) {
     self.messageId = messageId
     self.bubbleSnapshot = bubbleSnapshot
@@ -137,7 +138,8 @@ public final class ChatContextMenuOverlay: UIView {
       messageId: messageId,
       showResendAction: showResendAction,
       showRegenerateAction: showRegenerateAction,
-      showEditAction: showEditAction
+      showEditAction: showEditAction,
+      restrictSavingContent: restrictSavingContent
     )
 
     super.init(frame: .zero)
@@ -747,7 +749,8 @@ final class ContextMenuView: UIView {
     messageId: String,
     showResendAction: Bool,
     showRegenerateAction: Bool = false,
-    showEditAction: Bool = false
+    showEditAction: Bool = false,
+    restrictSavingContent: Bool = false
   ) {
     self.messageId = messageId
     var resolvedActions: [ActionItem] = [
@@ -789,6 +792,9 @@ final class ContextMenuView: UIView {
         ),
         at: 0
       )
+    }
+    if restrictSavingContent {
+      resolvedActions.removeAll { $0.id == "copy" || $0.id == "select" }
     }
     self.actions = resolvedActions
     self.glassView = makeChatContextLiquidGlassView(

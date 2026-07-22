@@ -1,10 +1,12 @@
 import AudioToolbox
+import ObjectiveC
 import UIKit
 import SwiftUI
 
 private let swipeReplyTrigger: CGFloat = 56.0
 private let swipeReplyMaxOffset: CGFloat = 80.0
 private let chatHoldDebugLogs = true
+private var chatRestrictSavingContentKey: UInt8 = 0
 
 /// Telegram-style circular reply indicator. Soft blur disc, thin outline arrow,
 /// no colour tint. It emerges from the right edge as the bubble slides, scaling
@@ -189,6 +191,20 @@ private final class ChatKeyboardWindowObserver: NSObject {
 }
 
 extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDelegate {
+  func setRestrictSavingContent(_ restricted: Bool) {
+    objc_setAssociatedObject(
+      self,
+      &chatRestrictSavingContentKey,
+      NSNumber(value: restricted),
+      .OBJC_ASSOCIATION_RETAIN_NONATOMIC
+    )
+  }
+
+  var restrictSavingContent: Bool {
+    (objc_getAssociatedObject(self, &chatRestrictSavingContentKey) as? NSNumber)?.boolValue
+      ?? false
+  }
+
   private func holdDebugLog(_ message: String) {
     guard chatHoldDebugLogs else { return }
     NSLog("[ChatHold] %@", message)
@@ -561,7 +577,8 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       appearance: self.resolvedAppearance(),
       showResendAction: showResendAction,
       showRegenerateAction: showRegenerateAction,
-      showEditAction: showEditAction
+      showEditAction: showEditAction,
+      restrictSavingContent: restrictSavingContent
     )
     overlay.delegate = self
 
@@ -748,6 +765,12 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
   public func contextMenuDidSelectAction(_ actionId: String, messageId _: String) {
     guard let overlay = customContextMenuOverlay else { return }
     let mid = overlay.messageId
+
+    if restrictSavingContent, (actionId == "copy" || actionId == "select") {
+      overlay.animateOut(reason: "content-protected", completion: nil)
+      onNativeEvent(["type": "agentToast", "message": "Content protection is enabled"])
+      return
+    }
 
     if actionId == "delete" {
       if let row = rows.first(where: { $0.messageId == mid }),

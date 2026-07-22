@@ -18321,6 +18321,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
 extension ChatListView: ChatInputBarDelegate {
   func inputBarDidRequestSelectionAction(_ action: String, payload: [String: Any]?) {
+    if restrictSavingContent, (action == "shareOutside" || action == "shareInside") {
+      clearMessageSelection()
+      onNativeEvent([
+        "type": "agentToast",
+        "message": "Forwarding is disabled for this channel",
+      ])
+      return
+    }
+
     if action == "shareOutside" {
       let selectedRows = rows.filter { selectedMessageIds.contains($0.messageId ?? "") }
       let textToShare = selectedRows.map { $0.text }.filter { !$0.isEmpty }.joined(separator: "\n\n")

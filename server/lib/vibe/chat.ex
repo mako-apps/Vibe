@@ -3,6 +3,7 @@ defmodule Vibe.Chat do
   require Logger
   alias Vibe.ChatHomeCache
   alias Vibe.Accounts
+  alias Vibe.Accounts.User
   alias Vibe.Agent
   alias Vibe.Repo
   alias Vibe.RepoRLS
@@ -12,6 +13,9 @@ defmodule Vibe.Chat do
     Room,
     Message,
     Participant,
+    ChannelInviteLink,
+    ChannelJoinRequest,
+    ChannelAgentAssignment,
     MessageRead,
     SavedMessage,
     ScheduledPost,
@@ -36,10 +40,38 @@ defmodule Vibe.Chat do
   @history_max_limit 100
 
   def save_message(attrs) do
-    %SavedMessage{}
-    |> SavedMessage.changeset(attrs)
-    |> Repo.insert(on_conflict: :nothing)
+    if content_copy_restricted?(attrs) do
+      {:error, :content_saving_restricted}
+    else
+      %SavedMessage{}
+      |> SavedMessage.changeset(attrs)
+      |> Repo.insert(on_conflict: :nothing)
+    end
   end
+
+  @doc "Returns true when a save/forward payload names a protected source channel."
+  def content_copy_restricted?(attrs) when is_map(attrs) do
+    source_chat_id =
+      attrs["sourceChatId"] || attrs["source_chat_id"] || attrs["forwardedFromChatId"] ||
+        attrs["forwarded_from_chat_id"] || attrs[:source_chat_id] ||
+        attrs[:forwarded_from_chat_id]
+
+    case present_string(source_chat_id) do
+      nil ->
+        false
+
+      chat_id ->
+        Repo.exists?(
+          from(room in Room,
+            where:
+              room.id == ^chat_id and room.type == "channel" and
+                room.restrict_saving_content == true
+          )
+        )
+    end
+  end
+
+  def content_copy_restricted?(_), do: false
 
   def unsave_message(user_id, original_message_id) do
     from(sm in SavedMessage,
@@ -61,7 +93,9 @@ defmodule Vibe.Chat do
   def is_participant?(chat_id, user_id) do
     Repo.exists?(
       from(p in Participant,
-        where: p.chat_id == ^chat_id and p.user_id == ^user_id
+        where:
+          p.chat_id == ^chat_id and p.user_id == ^user_id and
+            (is_nil(p.deleted) or p.deleted == false)
       )
     )
   end
@@ -216,19 +250,6 @@ defmodule Vibe.Chat do
             room && room.type in ["group", "channel"]
           end)
 
-        member_counts =
-          if group_channel_ids != [] do
-            from(p in Participant,
-              where: p.chat_id in ^group_channel_ids,
-              group_by: p.chat_id,
-              select: {p.chat_id, count(p.id)}
-            )
-            |> Repo.all()
-            |> Map.new()
-          else
-            %{}
-          end
-
         group_members =
           if group_channel_ids != [] do
             from(p in Participant,
@@ -316,6 +337,23 @@ defmodule Vibe.Chat do
                 end
             end
 
+          created_at =
+            if room && room.inserted_at do
+              room.inserted_at
+              |> DateTime.from_naive!("Etc/UTC")
+              |> DateTime.to_unix(:millisecond)
+            else
+              0
+            end
+
+          room_members = Map.get(group_members, chat_id, [])
+          member_count = if room_type in ["group", "channel"], do: length(room_members), else: nil
+
+          subscriber_count =
+            if room_type == "channel" do
+              Enum.count(room_members, &(&1.role != "agent_admin"))
+            end
+
           %{
             chatId: chat_id,
             type: room_type,
@@ -326,11 +364,20 @@ defmodule Vibe.Chat do
             # when type is missing from a stale cache row.
             isChannel: room_type == "channel",
             lastMessageAt: last_activity_at,
+            createdAt: created_at,
             name: if(room, do: room.name, else: nil),
             description: if(room, do: room.description, else: nil),
             avatarUrl: if(room, do: room.avatar_url, else: nil),
             creatorId: if(room, do: room.creator_id, else: nil),
-            memberCount: Map.get(member_counts, chat_id),
+            memberCount: member_count,
+            subscriberCount: subscriber_count,
+            accessType: if(room_type == "channel", do: room.access_type || "private", else: nil),
+            publicSlug: if(room_type == "channel", do: room.public_slug, else: nil),
+            shareLink: nil,
+            joinApprovalRequired:
+              if(room_type == "channel", do: room.join_approval_required || false, else: nil),
+            restrictSavingContent:
+              if(room_type == "channel", do: room.restrict_saving_content || false, else: nil),
             role: my_settings.role,
             friendId: if(friend_p, do: friend_p.user_id, else: nil),
             friendName:
@@ -1026,7 +1073,9 @@ defmodule Vibe.Chat do
 
         true ->
           now = NaiveDateTime.utc_now()
-          target_user_ids = if delete_for_everyone, do: get_participant_ids(chat_id), else: [user_id]
+
+          target_user_ids =
+            if delete_for_everyone, do: get_participant_ids(chat_id), else: [user_id]
 
           target_query =
             if delete_for_everyone do
@@ -1088,7 +1137,7 @@ defmodule Vibe.Chat do
 
   # ── Groups ──────────────────────────────────────────────────────
 
-  def create_group(creator_id, name, member_ids, avatar_url \\ nil) do
+  def create_group(creator_id, name, member_ids, avatar_url \\ nil, description \\ nil) do
     id = Ecto.UUID.generate() |> String.slice(0, 12)
     all_member_ids = Enum.uniq([creator_id | member_ids])
 
@@ -1100,6 +1149,7 @@ defmodule Vibe.Chat do
             is_group: true,
             type: "group",
             name: name,
+            description: present_string(description),
             avatar_url: avatar_url,
             creator_id: creator_id
           })
@@ -1120,6 +1170,39 @@ defmodule Vibe.Chat do
       other ->
         other
     end
+  end
+
+  def canonical_room_summary(%Room{} = room, opts \\ []) do
+    members = channel_member_payloads(room.id)
+    member_count = length(members)
+
+    %{
+      chatId: room.id,
+      type: room.type || if(room.is_group, do: "group", else: "dm"),
+      isGroup: room.type in ["group", "channel"] or room.is_group == true,
+      isChannel: room.type == "channel",
+      name: room.name,
+      description: room.description,
+      avatarUrl: room.avatar_url,
+      creatorId: room.creator_id,
+      role: Keyword.get(opts, :role),
+      members: members,
+      memberCount: member_count,
+      subscriberCount:
+        if(room.type == "channel",
+          do: Enum.count(members, &(&1.role != "agent_admin")),
+          else: nil
+        ),
+      createdAt: room_created_at_ms(room),
+      lastMessageAt: room_last_activity_ms(room),
+      accessType: if(room.type == "channel", do: room.access_type || "private", else: nil),
+      publicSlug: if(room.type == "channel", do: room.public_slug, else: nil),
+      shareLink: Keyword.get(opts, :share_link),
+      joinApprovalRequired:
+        if(room.type == "channel", do: room.join_approval_required || false, else: nil),
+      restrictSavingContent:
+        if(room.type == "channel", do: room.restrict_saving_content || false, else: nil)
+    }
   end
 
   def add_member(chat_id, user_id, role \\ "member", opts \\ []) do
@@ -1230,6 +1313,9 @@ defmodule Vibe.Chat do
 
       target.role == "owner" ->
         {:error, :cannot_change_owner}
+
+      target.role == "agent_admin" ->
+        {:error, :invalid_role}
 
       true ->
         case target |> Participant.changeset(%{role: role}) |> Repo.update() do
@@ -1417,63 +1503,106 @@ defmodule Vibe.Chat do
 
   # ── Channels ────────────────────────────────────────────────────
 
-  def create_channel(creator_id, name, description \\ nil, avatar_url \\ nil) do
-    trimmed_name =
-      name
-      |> to_string()
-      |> String.trim()
+  def create_channel(creator_id, attrs) when is_map(attrs),
+    do: create_channel_from_attrs(creator_id, attrs)
 
-    if trimmed_name == "" do
-      {:error, :invalid_name}
-    else
-      id = Ecto.UUID.generate() |> String.slice(0, 12)
+  def create_channel(creator_id, name) when not is_map(name),
+    do: create_channel(creator_id, name, nil, nil)
 
-      result =
-        Repo.transaction(fn ->
-          room =
-            Repo.insert!(%Room{
-              id: id,
-              # Multi-party room flag (shared with groups). Type "channel" is the
-              # broadcast discriminator for permissions / UI.
-              is_group: true,
-              type: "channel",
-              name: trimmed_name,
-              description: present_string(description),
-              avatar_url: present_string(avatar_url),
-              creator_id: creator_id
-            })
+  def create_channel(creator_id, name, description),
+    do: create_channel(creator_id, name, description, nil)
 
-          Repo.insert!(%Participant{chat_id: id, user_id: creator_id, role: "owner"})
+  def create_channel(creator_id, name, description, avatar_url) do
+    with {:ok, payload} <-
+           create_channel(creator_id, %{
+             "name" => name,
+             "description" => description,
+             "avatarUrl" => avatar_url
+           }) do
+      {:ok, Repo.get!(Room, payload.chatId)}
+    end
+  end
 
-          room
-        end)
+  defp create_channel_from_attrs(creator_id, attrs) do
+    with {:ok, normalized} <- normalize_channel_attrs(attrs),
+         {:ok, member_ids} <- validate_human_member_ids(normalized.member_ids, creator_id),
+         {:ok, agents} <- owned_channel_agents(creator_id, normalized.agent_admin_ids) do
+      participant_ids =
+        [creator_id | member_ids ++ Enum.map(agents, & &1.agent_user_id)]
+        |> Enum.uniq()
 
-      case result do
-        {:ok, room} ->
-          ChatHomeCache.invalidate_user(creator_id)
-          {:ok, room}
+      case Repo.transaction(fn ->
+             id = Ecto.UUID.generate() |> String.slice(0, 12)
 
-        other ->
-          other
+             room_changeset =
+               Room.changeset(%Room{}, %{
+                 id: id,
+                 is_group: true,
+                 type: "channel",
+                 name: normalized.name,
+                 description: normalized.description,
+                 avatar_url: normalized.avatar_url,
+                 creator_id: creator_id,
+                 access_type: normalized.access_type,
+                 public_slug: normalized.public_slug,
+                 join_approval_required: normalized.join_approval_required,
+                 restrict_saving_content: normalized.restrict_saving_content
+               })
+
+             room =
+               case Repo.insert(room_changeset) do
+                 {:ok, inserted} -> inserted
+                 {:error, changeset} -> Repo.rollback(changeset)
+               end
+
+             Repo.insert!(%Participant{chat_id: id, user_id: creator_id, role: "owner"})
+
+             Enum.each(member_ids, fn user_id ->
+               Repo.insert!(%Participant{chat_id: id, user_id: user_id, role: "subscriber"})
+             end)
+
+             Enum.each(agents, fn agent ->
+               attach_channel_agent_in_transaction!(room, agent, creator_id, %{})
+             end)
+
+             {share_link, _link} =
+               if normalized.access_type == "private" do
+                 create_invite_link_in_transaction!(room.id, creator_id, %{})
+               else
+                 {"/r/#{room.public_slug}", nil}
+               end
+
+             {room, share_link}
+           end) do
+        {:ok, {room, share_link}} ->
+          ChatHomeCache.invalidate_users(participant_ids)
+          {:ok, canonical_room_summary(room, role: "owner", share_link: share_link)}
+
+        {:error, %Ecto.Changeset{} = changeset} ->
+          {:error, changeset}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end
   end
 
+  # Kept for backwards compatibility. New callers should join through a public
+  # slug or private invite token so channel access policy is always enforced.
   def join_channel(channel_id, user_id) do
-    # Verify it's a channel
     case Repo.get(Room, channel_id) do
-      %Room{type: "channel"} ->
-        result =
-          %Participant{}
-          |> Participant.changeset(%{chat_id: channel_id, user_id: user_id, role: "subscriber"})
-          |> Repo.insert(on_conflict: :nothing)
+      %Room{type: "channel", access_type: "public", join_approval_required: false} = room ->
+        with {:ok, _} <- insert_channel_subscriber(room.id, user_id) do
+          invalidate_chat_home_cache(room.id)
+          ChatHomeCache.invalidate_user(user_id)
+          {:ok, canonical_room_summary(room, role: "subscriber")}
+        end
 
-        invalidate_chat_home_cache(channel_id)
-        ChatHomeCache.invalidate_user(user_id)
-        result
+      %Room{type: "channel"} ->
+        {:error, :link_required}
 
       _ ->
-        {:error, "Not a channel"}
+        {:error, :not_a_channel}
     end
   end
 
@@ -1501,30 +1630,1263 @@ defmodule Vibe.Chat do
   def list_channels do
     Repo.all(
       from(r in Room,
-        where: r.type == "channel",
+        where: r.type == "channel" and r.access_type == "public",
         order_by: [desc: r.inserted_at],
         preload: [:creator]
       )
     )
     |> Enum.map(fn room ->
-      subscriber_count =
-        Repo.aggregate(
-          from(p in Participant, where: p.chat_id == ^room.id),
-          :count
+      canonical_room_summary(room)
+      |> Map.put(:creatorName, if(room.creator, do: room.creator.username, else: nil))
+    end)
+  end
+
+  @doc """
+  Full channel profile for a participant: identity, settings, roster split into
+  administrators vs subscribers, and recent actions from durable messages.
+  """
+  def get_channel_profile(channel_id, user_id) do
+    case Repo.get(Room, channel_id) do
+      %Room{type: "channel"} = room ->
+        role = get_user_role(channel_id, user_id)
+
+        if is_nil(role) do
+          {:error, :not_member}
+        else
+          summary = canonical_room_summary(room, role: role)
+          members = summary.members
+
+          {:ok,
+           Map.merge(summary, %{
+             myRole: role,
+             administrators: Enum.filter(members, fn m -> m.role in ["owner", "admin"] end),
+             subscribers: Enum.filter(members, fn m -> m.role == "subscriber" end),
+             agentAdministrators: Enum.filter(members, fn m -> m.role == "agent_admin" end),
+             settings: channel_settings(room),
+             recentActions: list_channel_recent_actions(channel_id, 40)
+           })}
+        end
+
+      %Room{} ->
+        {:error, :not_a_channel}
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
+
+  @doc """
+  Owner/admin update of channel identity, access policy, or additive legacy settings.
+  """
+  def update_channel(channel_id, actor_id, attrs) when is_map(attrs) do
+    room = Repo.get(Room, channel_id)
+
+    cond do
+      is_nil(room) or room.type != "channel" ->
+        {:error, :not_found}
+
+      not human_admin?(channel_id, actor_id) ->
+        {:error, :not_authorized}
+
+      true ->
+        with {:ok, changes} <- channel_update_changes(room, attrs),
+             {:ok, updated} <- room |> Room.changeset(changes) |> Repo.update() do
+          ChatHomeCache.invalidate_users(group_member_ids(channel_id))
+          {:ok, updated}
+        end
+    end
+  end
+
+  def create_channel_invite_link(channel_id, actor_id, attrs \\ %{}) do
+    room = Repo.get(Room, channel_id)
+
+    cond do
+      is_nil(room) or room.type != "channel" ->
+        {:error, :not_found}
+
+      not human_admin?(channel_id, actor_id) ->
+        {:error, :not_authorized}
+
+      room.access_type != "private" ->
+        {:error, :public_channel}
+
+      true ->
+        case Repo.transaction(fn ->
+               now = DateTime.utc_now() |> DateTime.truncate(:second)
+               updated_at = DateTime.to_naive(now)
+
+               from(link in ChannelInviteLink,
+                 where: link.chat_id == ^channel_id and is_nil(link.revoked_at)
+               )
+               |> Repo.update_all(set: [revoked_at: now, updated_at: updated_at])
+
+               create_invite_link_in_transaction!(channel_id, actor_id, attrs)
+             end) do
+          {:ok, {share_link, link}} -> {:ok, invite_link_payload(link, share_link)}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  def rotate_channel_invite_link(channel_id, actor_id),
+    do: create_channel_invite_link(channel_id, actor_id, %{})
+
+  def channel_settings(%Room{} = room) do
+    raw =
+      room.channel_settings
+      |> normalize_map()
+      |> Map.drop(["inviteLink", "shareLink", "token"])
+
+    defaults = %{
+      "channelType" => room.access_type || "private",
+      "accessType" => room.access_type || "private",
+      "publicSlug" => room.public_slug,
+      "joinApprovalRequired" => room.join_approval_required || false,
+      "restrictSavingContent" => room.restrict_saving_content || false,
+      "discussionsEnabled" => false,
+      "reactionsEnabled" => true,
+      "allowDirectMessages" => false,
+      "autoTranslateEnabled" => false
+    }
+
+    Map.merge(defaults, raw)
+  end
+
+  def channel_settings(_), do: channel_settings(%Room{channel_settings: %{}})
+
+  def resolve_channel_link(input) when is_binary(input) do
+    with {:ok, reference} <- parse_room_link(input),
+         {:ok, room, _link} <- resolve_room_reference(reference) do
+      {:ok, link_room_summary(room)}
+    end
+  end
+
+  def resolve_channel_link(_), do: {:error, :invalid_link}
+
+  def join_channel_link(user_id, input) when is_binary(user_id) and is_binary(input) do
+    with {:ok, reference} <- parse_room_link(input),
+         {:ok, room, link} <- resolve_room_reference(reference) do
+      cond do
+        is_participant?(room.id, user_id) ->
+          {:ok,
+           %{
+             status: "joined",
+             room: canonical_room_summary(room, role: get_user_role(room.id, user_id))
+           }}
+
+        room.join_approval_required ->
+          with {:ok, request} <- create_channel_join_request(room, user_id, link) do
+            {:ok,
+             %{
+               status: "pending",
+               request: join_request_payload(request),
+               room: link_room_summary(room)
+             }}
+          end
+
+        true ->
+          join_channel_immediately(room, user_id, link)
+      end
+    end
+  end
+
+  def list_channel_join_requests(channel_id, actor_id) do
+    if human_admin?(channel_id, actor_id) do
+      requests =
+        from(request in ChannelJoinRequest,
+          where: request.chat_id == ^channel_id and request.status == "pending",
+          preload: [:user],
+          order_by: [asc: request.inserted_at]
+        )
+        |> Repo.all()
+        |> Enum.map(&join_request_payload/1)
+
+      {:ok, requests}
+    else
+      {:error, :not_authorized}
+    end
+  end
+
+  def decide_channel_join_request(channel_id, request_id, actor_id, decision)
+      when decision in ["approve", "reject"] do
+    if human_admin?(channel_id, actor_id) do
+      case Repo.transaction(fn ->
+             request =
+               from(request in ChannelJoinRequest,
+                 where: request.id == ^request_id and request.chat_id == ^channel_id,
+                 lock: "FOR UPDATE"
+               )
+               |> Repo.one()
+
+             cond do
+               is_nil(request) ->
+                 Repo.rollback(:not_found)
+
+               request.status != "pending" ->
+                 Repo.rollback(:already_decided)
+
+               decision == "reject" ->
+                 review_join_request!(request, actor_id, "rejected")
+
+               true ->
+                 if request.invite_link_id, do: claim_invite_link!(request.invite_link_id)
+                 insert_channel_subscriber!(channel_id, request.user_id)
+                 review_join_request!(request, actor_id, "approved")
+             end
+           end) do
+        {:ok, request} ->
+          if request.status == "approved" do
+            invalidate_chat_home_cache(channel_id)
+            ChatHomeCache.invalidate_user(request.user_id)
+          end
+
+          {:ok, join_request_payload(request)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, :not_authorized}
+    end
+  end
+
+  def decide_channel_join_request(_, _, _, _), do: {:error, :invalid_decision}
+
+  def list_channel_agents(channel_id, actor_id) do
+    if human_admin?(channel_id, actor_id) do
+      assignments =
+        from(assignment in ChannelAgentAssignment,
+          where: assignment.chat_id == ^channel_id,
+          preload: [agent: :agent_user],
+          order_by: [asc: assignment.inserted_at]
+        )
+        |> Repo.all()
+        |> Enum.map(&channel_agent_payload/1)
+
+      {:ok, assignments}
+    else
+      {:error, :not_authorized}
+    end
+  end
+
+  def attach_channel_agent(channel_id, actor_id, agent_id, attrs \\ %{}) do
+    room = Repo.get(Room, channel_id)
+    agent = if is_binary(agent_id), do: Vibe.Agents.get_agent(agent_id, actor_id)
+
+    cond do
+      is_nil(room) or room.type != "channel" ->
+        {:error, :not_found}
+
+      not human_admin?(channel_id, actor_id) ->
+        {:error, :not_authorized}
+
+      is_nil(agent) or agent.status == "archived" ->
+        {:error, :agent_not_owned}
+
+      true ->
+        case Repo.transaction(fn ->
+               attach_channel_agent_in_transaction!(room, agent, actor_id, attrs)
+             end) do
+          {:ok, assignment} ->
+            invalidate_chat_home_cache(channel_id)
+            ChatHomeCache.invalidate_user(agent.agent_user_id)
+            {:ok, channel_agent_payload(Repo.preload(assignment, agent: :agent_user))}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  def update_channel_agent(channel_id, actor_id, agent_id, attrs) do
+    assignment = Repo.get_by(ChannelAgentAssignment, chat_id: channel_id, agent_id: agent_id)
+    agent = if is_binary(agent_id), do: Vibe.Agents.get_agent(agent_id, actor_id)
+
+    cond do
+      not human_admin?(channel_id, actor_id) ->
+        {:error, :not_authorized}
+
+      is_nil(assignment) ->
+        {:error, :not_found}
+
+      is_nil(agent) ->
+        {:error, :agent_not_owned}
+
+      true ->
+        changes = assignment_policy_patch(assignment, attrs)
+
+        with {:ok, updated} <-
+               assignment |> ChannelAgentAssignment.changeset(changes) |> Repo.update() do
+          {:ok, channel_agent_payload(Repo.preload(updated, agent: :agent_user))}
+        end
+    end
+  end
+
+  def detach_channel_agent(channel_id, actor_id, agent_id) do
+    assignment = Repo.get_by(ChannelAgentAssignment, chat_id: channel_id, agent_id: agent_id)
+
+    cond do
+      not human_admin?(channel_id, actor_id) ->
+        {:error, :not_authorized}
+
+      is_nil(assignment) ->
+        {:error, :not_found}
+
+      true ->
+        case Repo.transaction(fn ->
+               agent = Repo.get!(Agent, agent_id)
+               Repo.delete!(assignment)
+
+               from(participant in Participant,
+                 where:
+                   participant.chat_id == ^channel_id and
+                     participant.user_id == ^agent.agent_user_id and
+                     participant.role == "agent_admin"
+               )
+               |> Repo.delete_all()
+
+               if agent.default_destination_chat_id == channel_id do
+                 agent |> Agent.changeset(%{default_destination_chat_id: nil}) |> Repo.update!()
+               end
+
+               agent.agent_user_id
+             end) do
+          {:ok, agent_user_id} ->
+            invalidate_chat_home_cache(channel_id)
+            ChatHomeCache.invalidate_user(agent_user_id)
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  @doc """
+  Returns the room-scoped effective agent policy. Assignment allowlists are always
+  intersected with the standalone agent configuration, so a room can narrow (or
+  completely disable) capabilities but can never grant new ones.
+  """
+  def channel_agent_policy(channel_id, %Agent{} = agent) do
+    assignment =
+      Repo.one(
+        from(assignment in ChannelAgentAssignment,
+          join: participant in Participant,
+          on:
+            participant.chat_id == assignment.chat_id and
+              participant.user_id == ^agent.agent_user_id,
+          where:
+            assignment.chat_id == ^channel_id and assignment.agent_id == ^agent.id and
+              assignment.status == "active" and participant.role == "agent_admin" and
+              (is_nil(participant.deleted) or participant.deleted == false)
+        )
+      )
+
+    case {Repo.get(Room, channel_id), assignment} do
+      {%Room{type: "channel"}, %ChannelAgentAssignment{} = scoped} ->
+        {:ok,
+         %{
+           enabled_tools: intersect_policy(agent.enabled_tools, scoped.allowed_tools),
+           output_modes: intersect_policy(agent.output_modes, scoped.allowed_output_modes),
+           trigger_config: scoped.trigger_config || %{},
+           permissions: scoped.permissions || %{}
+         }}
+
+      {%Room{type: "channel"}, nil} ->
+        {:error, :chat_not_attached}
+
+      {%Room{}, _} ->
+        if is_participant?(channel_id, agent.agent_user_id) do
+          {:ok,
+           %{enabled_tools: agent.enabled_tools || [], output_modes: agent.output_modes || []}}
+        else
+          {:error, :chat_not_attached}
+        end
+
+      _ ->
+        {:error, :chat_not_attached}
+    end
+  end
+
+  def channel_agent_event_enabled?(channel_id, %Agent{} = agent) do
+    case Repo.get(Room, channel_id) do
+      %Room{type: "channel"} ->
+        case channel_agent_policy(channel_id, agent) do
+          {:ok, %{trigger_config: config}} -> normalize_map(config)["type"] == "event"
+          _ -> false
+        end
+
+      %Room{} ->
+        true
+
+      nil ->
+        false
+    end
+  end
+
+  @doc "Atomically claims due interval assignments and advances their next run."
+  def claim_due_channel_agent_assignments(limit \\ 10) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    limit = limit |> max(1) |> min(50)
+
+    case Repo.transaction(fn ->
+           assignments =
+             Repo.all(
+               from(assignment in ChannelAgentAssignment,
+                 where:
+                   assignment.status == "active" and
+                     not is_nil(assignment.next_trigger_at) and
+                     assignment.next_trigger_at <= ^now,
+                 order_by: [asc: assignment.next_trigger_at],
+                 limit: ^limit,
+                 lock: "FOR UPDATE SKIP LOCKED"
+               )
+             )
+
+           Enum.map(assignments, fn assignment ->
+             next_trigger_at = interval_next_trigger_at(assignment.trigger_config, now)
+
+             assignment
+             |> ChannelAgentAssignment.changeset(%{
+               next_trigger_at: next_trigger_at,
+               last_triggered_at: now,
+               last_trigger_status: "running",
+               last_trigger_error: nil
+             })
+             |> Repo.update!()
+             |> Map.fetch!(:id)
+           end)
+         end) do
+      {:ok, []} ->
+        {:ok, []}
+
+      {:ok, ids} ->
+        claimed =
+          Repo.all(
+            from(assignment in ChannelAgentAssignment,
+              where: assignment.id in ^ids,
+              preload: [agent: :agent_user]
+            )
+          )
+
+        {:ok, claimed}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def complete_channel_agent_trigger(assignment_id, status, error \\ nil)
+      when status in ["completed", "failed"] do
+    case Repo.get(ChannelAgentAssignment, assignment_id) do
+      nil ->
+        {:error, :not_found}
+
+      assignment ->
+        assignment
+        |> ChannelAgentAssignment.changeset(%{
+          last_trigger_status: status,
+          last_trigger_error: error |> present_string() |> truncate_string(1_000)
+        })
+        |> Repo.update()
+    end
+  end
+
+  defp normalize_channel_attrs(attrs) do
+    name = attrs |> channel_attr("name") |> present_string()
+    settings = normalize_map(channel_attr(attrs, "settings"))
+
+    access_type =
+      (channel_attr(attrs, "accessType") || channel_attr(attrs, "access_type") ||
+         channel_attr(attrs, "channelType") || settings["accessType"] ||
+         settings["channelType"] || "private")
+      |> to_string()
+
+    public_slug =
+      normalize_public_slug(
+        channel_attr(attrs, "publicSlug") || channel_attr(attrs, "public_slug") ||
+          settings["publicSlug"]
+      )
+
+    cond do
+      is_nil(name) ->
+        {:error, :invalid_name}
+
+      access_type not in ["private", "public"] ->
+        {:error, :invalid_access_type}
+
+      access_type == "public" and is_nil(public_slug) ->
+        {:error, :invalid_public_slug}
+
+      access_type == "public" and not valid_public_slug?(public_slug) ->
+        {:error, :invalid_public_slug}
+
+      true ->
+        {:ok,
+         %{
+           name: name,
+           description: present_string(channel_attr(attrs, "description")),
+           avatar_url:
+             present_string(channel_attr(attrs, "avatarUrl") || channel_attr(attrs, "avatar_url")),
+           access_type: access_type,
+           public_slug: if(access_type == "public", do: public_slug),
+           join_approval_required:
+             truthy?(
+               channel_attr(attrs, "joinApprovalRequired") ||
+                 channel_attr(attrs, "join_approval_required")
+             ),
+           restrict_saving_content:
+             truthy?(
+               channel_attr(attrs, "restrictSavingContent") ||
+                 channel_attr(attrs, "restrict_saving_content")
+             ),
+           member_ids:
+             normalize_id_list(
+               channel_attr(attrs, "memberIds") || channel_attr(attrs, "member_ids")
+             ),
+           agent_admin_ids:
+             normalize_id_list(
+               channel_attr(attrs, "agentAdminIds") || channel_attr(attrs, "agent_admin_ids")
+             )
+         }}
+    end
+  end
+
+  defp channel_update_changes(room, attrs) do
+    settings = normalize_map(channel_attr(attrs, "settings"))
+
+    requested_access =
+      channel_attr(attrs, "accessType") || channel_attr(attrs, "access_type") ||
+        channel_attr(attrs, "channelType") || settings["accessType"] || settings["channelType"] ||
+        room.access_type || "private"
+
+    access_type = to_string(requested_access)
+
+    requested_slug =
+      if Map.has_key?(attrs, "publicSlug") or Map.has_key?(attrs, "public_slug") or
+           Map.has_key?(attrs, :publicSlug) or Map.has_key?(attrs, :public_slug) do
+        normalize_public_slug(
+          channel_attr(attrs, "publicSlug") || channel_attr(attrs, "public_slug")
+        )
+      else
+        normalize_public_slug(settings["publicSlug"]) || room.public_slug
+      end
+
+    cond do
+      access_type not in ["private", "public"] ->
+        {:error, :invalid_access_type}
+
+      access_type == "public" and not valid_public_slug?(requested_slug) ->
+        {:error, :invalid_public_slug}
+
+      true ->
+        identity =
+          %{}
+          |> put_present_change(:name, channel_attr(attrs, "name"))
+          |> put_nullable_change(:description, attrs, ["description", :description])
+          |> put_nullable_change(:avatar_url, attrs, [
+            "avatarUrl",
+            "avatar_url",
+            :avatarUrl,
+            :avatar_url
+          ])
+
+        policy = %{
+          access_type: access_type,
+          public_slug: if(access_type == "public", do: requested_slug),
+          join_approval_required:
+            boolean_or_existing(
+              attrs,
+              [
+                "joinApprovalRequired",
+                "join_approval_required",
+                :joinApprovalRequired,
+                :join_approval_required
+              ],
+              room.join_approval_required
+            ),
+          restrict_saving_content:
+            boolean_or_existing(
+              attrs,
+              [
+                "restrictSavingContent",
+                "restrict_saving_content",
+                :restrictSavingContent,
+                :restrict_saving_content
+              ],
+              room.restrict_saving_content
+            ),
+          channel_settings: legacy_channel_settings_patch(room, attrs)
+        }
+
+        {:ok, Map.merge(identity, policy)}
+    end
+  end
+
+  defp validate_human_member_ids(member_ids, creator_id) do
+    ids = member_ids |> Enum.reject(&(&1 == creator_id)) |> Enum.uniq()
+
+    if Enum.all?(ids, &match?({:ok, _}, Ecto.UUID.cast(&1))) do
+      users =
+        if ids == [] do
+          []
+        else
+          Repo.all(from(user in User, where: user.id in ^ids))
+        end
+
+      if length(users) == length(ids) and Enum.all?(users, &(&1.is_agent != true)) do
+        {:ok, ids}
+      else
+        {:error, :invalid_member_ids}
+      end
+    else
+      {:error, :invalid_member_ids}
+    end
+  end
+
+  defp owned_channel_agents(_owner_id, []), do: {:ok, []}
+
+  defp owned_channel_agents(owner_id, agent_ids) do
+    ids = Enum.uniq(agent_ids)
+
+    if Enum.all?(ids, &match?({:ok, _}, Ecto.UUID.cast(&1))) do
+      agents =
+        Repo.all(
+          from(agent in Agent,
+            where:
+              agent.id in ^ids and agent.owner_user_id == ^owner_id and
+                agent.status != "archived",
+            preload: [:agent_user]
+          )
         )
 
+      if length(agents) == length(ids), do: {:ok, agents}, else: {:error, :agent_not_owned}
+    else
+      {:error, :agent_not_owned}
+    end
+  end
+
+  defp create_invite_link_in_transaction!(channel_id, actor_id, attrs) do
+    token = :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
+
+    expires_at =
+      normalize_expiry(channel_attr(attrs, "expiresAt") || channel_attr(attrs, "expires_at"))
+
+    max_uses =
+      normalize_positive_integer(
+        channel_attr(attrs, "maxUses") || channel_attr(attrs, "max_uses")
+      )
+
+    link =
+      %ChannelInviteLink{}
+      |> ChannelInviteLink.changeset(%{
+        chat_id: channel_id,
+        token_digest: token_digest(token),
+        token_hint: String.slice(token, -6, 6),
+        created_by: actor_id,
+        expires_at: expires_at,
+        max_uses: max_uses
+      })
+      |> Repo.insert!()
+
+    {"/j/#{token}", link}
+  end
+
+  defp invite_link_payload(link, share_link) do
+    %{
+      id: link.id,
+      chatId: link.chat_id,
+      tokenHint: link.token_hint,
+      expiresAt: link.expires_at,
+      maxUses: link.max_uses,
+      useCount: link.use_count,
+      revokedAt: link.revoked_at,
+      shareLink: share_link
+    }
+  end
+
+  defp parse_room_link(input) do
+    value = String.trim(input)
+
+    cond do
+      value == "" ->
+        {:error, :invalid_link}
+
+      String.starts_with?(value, "vibe://") ->
+        parse_room_link_uri(URI.parse(value))
+
+      String.contains?(value, "://") ->
+        parse_room_link_uri(URI.parse(value))
+
+      String.starts_with?(value, "/r/") ->
+        {:ok, {:slug, value |> String.trim_leading("/r/") |> URI.decode()}}
+
+      String.starts_with?(value, "/j/") ->
+        {:ok, {:token, value |> String.trim_leading("/j/") |> URI.decode()}}
+
+      true ->
+        {:ok, {:raw, value}}
+    end
+  rescue
+    _ -> {:error, :invalid_link}
+  end
+
+  defp parse_room_link_uri(%URI{scheme: "vibe", host: "room-link", query: query}) do
+    params = URI.decode_query(query || "")
+
+    cond do
+      present_string(params["token"]) -> {:ok, {:token, params["token"]}}
+      present_string(params["slug"]) -> {:ok, {:slug, params["slug"]}}
+      true -> {:error, :invalid_link}
+    end
+  end
+
+  defp parse_room_link_uri(%URI{path: path}) when is_binary(path), do: parse_room_link(path)
+  defp parse_room_link_uri(_), do: {:error, :invalid_link}
+
+  defp resolve_room_reference({:slug, slug}), do: resolve_public_slug(slug)
+  defp resolve_room_reference({:token, token}), do: resolve_private_token(token)
+
+  defp resolve_room_reference({:raw, value}) do
+    case resolve_public_slug(value) do
+      {:ok, _, _} = ok -> ok
+      _ -> resolve_private_token(value)
+    end
+  end
+
+  defp resolve_public_slug(slug) do
+    normalized = normalize_public_slug(slug)
+
+    case Repo.one(
+           from(room in Room,
+             where:
+               room.type == "channel" and room.access_type == "public" and
+                 room.public_slug == ^normalized
+           )
+         ) do
+      %Room{} = room -> {:ok, room, nil}
+      nil -> {:error, :link_not_found}
+    end
+  end
+
+  defp resolve_private_token(token) do
+    link = Repo.get_by(ChannelInviteLink, token_digest: token_digest(token))
+
+    with %ChannelInviteLink{} = link <- link,
+         :ok <- validate_invite_link(link),
+         %Room{type: "channel", access_type: "private"} = room <- Repo.get(Room, link.chat_id) do
+      {:ok, room, link}
+    else
+      nil -> {:error, :link_not_found}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :link_not_found}
+    end
+  end
+
+  defp validate_invite_link(%ChannelInviteLink{} = link) do
+    now = DateTime.utc_now()
+
+    cond do
+      not is_nil(link.revoked_at) -> {:error, :link_revoked}
+      link.expires_at && DateTime.compare(link.expires_at, now) != :gt -> {:error, :link_expired}
+      link.max_uses && link.use_count >= link.max_uses -> {:error, :link_exhausted}
+      true -> :ok
+    end
+  end
+
+  defp join_channel_immediately(room, user_id, nil) do
+    with {:ok, _} <- insert_channel_subscriber(room.id, user_id) do
+      invalidate_chat_home_cache(room.id)
+      ChatHomeCache.invalidate_user(user_id)
+      {:ok, %{status: "joined", room: canonical_room_summary(room, role: "subscriber")}}
+    end
+  end
+
+  defp join_channel_immediately(room, user_id, %ChannelInviteLink{} = link) do
+    case Repo.transaction(fn ->
+           if is_participant?(room.id, user_id) do
+             :already_joined
+           else
+             claim_invite_link!(link.id)
+             insert_channel_subscriber!(room.id, user_id)
+             :joined
+           end
+         end) do
+      {:ok, _} ->
+        invalidate_chat_home_cache(room.id)
+        ChatHomeCache.invalidate_user(user_id)
+        {:ok, %{status: "joined", room: canonical_room_summary(room, role: "subscriber")}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp claim_invite_link!(link_id) do
+    link =
+      from(link in ChannelInviteLink, where: link.id == ^link_id, lock: "FOR UPDATE")
+      |> Repo.one()
+
+    case link && validate_invite_link(link) do
+      :ok ->
+        link
+        |> ChannelInviteLink.changeset(%{use_count: link.use_count + 1})
+        |> Repo.update!()
+
+      {:error, reason} ->
+        Repo.rollback(reason)
+
+      nil ->
+        Repo.rollback(:link_not_found)
+    end
+  end
+
+  defp create_channel_join_request(room, user_id, link) do
+    attrs = %{
+      chat_id: room.id,
+      user_id: user_id,
+      invite_link_id: link && link.id,
+      status: "pending"
+    }
+
+    case %ChannelJoinRequest{} |> ChannelJoinRequest.changeset(attrs) |> Repo.insert() do
+      {:ok, request} ->
+        {:ok, request}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        request =
+          Repo.one(
+            from(request in ChannelJoinRequest,
+              where:
+                request.chat_id == ^room.id and request.user_id == ^user_id and
+                  request.status == "pending"
+            )
+          )
+
+        if request, do: {:ok, request}, else: {:error, changeset}
+    end
+  end
+
+  defp review_join_request!(request, actor_id, status) do
+    request
+    |> ChannelJoinRequest.changeset(%{
+      status: status,
+      reviewer_id: actor_id,
+      reviewed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+    })
+    |> Repo.update!()
+  end
+
+  defp join_request_payload(request) do
+    user = if Ecto.assoc_loaded?(request.user), do: request.user
+
+    %{
+      id: request.id,
+      chatId: request.chat_id,
+      userId: request.user_id,
+      userName: user && (present_string(user.name) || present_string(user.username)),
+      userAvatarUrl: user && present_string(user.profile_image),
+      status: request.status,
+      reviewerId: request.reviewer_id,
+      reviewedAt: request.reviewed_at,
+      createdAt: naive_datetime_ms(request.inserted_at)
+    }
+  end
+
+  defp insert_channel_subscriber(chat_id, user_id) do
+    %Participant{}
+    |> Participant.changeset(%{chat_id: chat_id, user_id: user_id, role: "subscriber"})
+    |> Repo.insert(on_conflict: :nothing, conflict_target: [:chat_id, :user_id])
+  end
+
+  defp insert_channel_subscriber!(chat_id, user_id) do
+    case insert_channel_subscriber(chat_id, user_id) do
+      {:ok, participant} -> participant
+      {:error, changeset} -> Repo.rollback(changeset)
+    end
+  end
+
+  defp attach_channel_agent_in_transaction!(room, agent, actor_id, attrs) do
+    case Repo.get_by(Participant, chat_id: room.id, user_id: agent.agent_user_id) do
+      nil ->
+        Repo.insert!(%Participant{
+          chat_id: room.id,
+          user_id: agent.agent_user_id,
+          role: "agent_admin"
+        })
+
+      %Participant{role: "agent_admin"} ->
+        :ok
+
+      _ ->
+        Repo.rollback(:agent_already_member)
+    end
+
+    assignment_attrs =
+      assignment_policy_attrs(attrs, agent)
+      |> Map.merge(%{
+        chat_id: room.id,
+        agent_id: agent.id,
+        created_by: actor_id
+      })
+
+    assignment =
+      case Repo.get_by(ChannelAgentAssignment, chat_id: room.id, agent_id: agent.id) do
+        nil ->
+          %ChannelAgentAssignment{}
+          |> ChannelAgentAssignment.changeset(assignment_attrs)
+          |> Repo.insert!()
+
+        existing ->
+          existing
+          |> ChannelAgentAssignment.changeset(Map.put(assignment_attrs, :status, "active"))
+          |> Repo.update!()
+      end
+
+    if is_nil(present_string(agent.default_destination_chat_id)) do
+      agent |> Agent.changeset(%{default_destination_chat_id: room.id}) |> Repo.update!()
+    end
+
+    assignment
+  end
+
+  defp assignment_policy_attrs(attrs, agent \\ nil) do
+    trigger_config =
+      normalize_map(channel_attr(attrs, "triggerConfig") || channel_attr(attrs, "trigger_config"))
+
+    status = present_string(channel_attr(attrs, "status")) || "active"
+
+    %{
+      allowed_tools:
+        assignment_allowlist(
+          attrs,
+          ["allowedTools", "allowed_tools", :allowedTools, :allowed_tools],
+          agent && agent.enabled_tools
+        ),
+      allowed_output_modes:
+        assignment_allowlist(
+          attrs,
+          [
+            "allowedOutputModes",
+            "allowed_output_modes",
+            :allowedOutputModes,
+            :allowed_output_modes
+          ],
+          agent && agent.output_modes
+        ),
+      trigger_config: trigger_config,
+      permissions: normalize_map(channel_attr(attrs, "permissions")),
+      status: status,
+      next_trigger_at: assignment_next_trigger_at(trigger_config, status)
+    }
+  end
+
+  defp assignment_policy_patch(assignment, attrs) do
+    defaults = assignment_policy_attrs(attrs)
+
+    %{}
+    |> maybe_put_assignment_patch(
+      :allowed_tools,
+      attrs,
+      ["allowedTools", "allowed_tools", :allowedTools, :allowed_tools],
+      defaults.allowed_tools
+    )
+    |> maybe_put_assignment_patch(
+      :allowed_output_modes,
+      attrs,
+      ["allowedOutputModes", "allowed_output_modes", :allowedOutputModes, :allowed_output_modes],
+      defaults.allowed_output_modes
+    )
+    |> maybe_put_assignment_patch(
+      :trigger_config,
+      attrs,
+      ["triggerConfig", "trigger_config", :triggerConfig, :trigger_config],
+      defaults.trigger_config
+    )
+    |> maybe_put_assignment_patch(
+      :permissions,
+      attrs,
+      ["permissions", :permissions],
+      defaults.permissions
+    )
+    |> maybe_put_assignment_patch(
+      :status,
+      attrs,
+      ["status", :status],
+      defaults.status
+    )
+    |> put_assignment_trigger_schedule(assignment)
+  end
+
+  defp maybe_put_assignment_patch(patch, key, attrs, keys, value) do
+    if Enum.any?(keys, &Map.has_key?(attrs, &1)), do: Map.put(patch, key, value), else: patch
+  end
+
+  defp assignment_allowlist(attrs, keys, fallback) do
+    if Enum.any?(keys, &Map.has_key?(attrs, &1)) do
+      keys
+      |> Enum.find_value(fn key -> Map.get(attrs, key) end)
+      |> normalize_string_list()
+    else
+      normalize_string_list(fallback)
+    end
+  end
+
+  defp put_assignment_trigger_schedule(patch, assignment) do
+    trigger_config = Map.get(patch, :trigger_config, assignment.trigger_config || %{})
+    status = Map.get(patch, :status, assignment.status)
+
+    if Map.has_key?(patch, :trigger_config) or Map.has_key?(patch, :status) do
+      Map.put(patch, :next_trigger_at, assignment_next_trigger_at(trigger_config, status))
+    else
+      patch
+    end
+  end
+
+  defp assignment_next_trigger_at(trigger_config, "active") do
+    interval_next_trigger_at(
+      trigger_config,
+      DateTime.utc_now() |> DateTime.truncate(:second)
+    )
+  end
+
+  defp assignment_next_trigger_at(_trigger_config, _status), do: nil
+
+  defp interval_next_trigger_at(trigger_config, from) do
+    trigger_config = normalize_map(trigger_config)
+
+    if trigger_config["type"] == "interval" do
+      minutes = normalize_positive_integer(trigger_config["everyMinutes"]) || 60
+      DateTime.add(from, min(minutes, 10_080) * 60, :second)
+    end
+  end
+
+  defp truncate_string(nil, _limit), do: nil
+  defp truncate_string(value, limit), do: value |> to_string() |> String.slice(0, limit)
+
+  defp channel_agent_payload(assignment) do
+    agent = assignment.agent
+
+    %{
+      id: assignment.id,
+      chatId: assignment.chat_id,
+      agentId: assignment.agent_id,
+      agentUserId: agent.agent_user_id,
+      displayName: agent.display_name,
+      avatarUrl: agent.avatar_url,
+      role: "agent_admin",
+      roleLabel: "Agent admin",
+      status: assignment.status,
+      allowedTools: assignment.allowed_tools || [],
+      allowedOutputModes: assignment.allowed_output_modes || [],
+      triggerConfig: assignment.trigger_config || %{},
+      permissions: assignment.permissions || %{},
+      nextTriggerAt: assignment.next_trigger_at,
+      lastTriggeredAt: assignment.last_triggered_at,
+      lastTriggerStatus: assignment.last_trigger_status,
+      lastTriggerError: assignment.last_trigger_error,
+      effectiveTools: intersect_policy(agent.enabled_tools, assignment.allowed_tools),
+      effectiveOutputModes: intersect_policy(agent.output_modes, assignment.allowed_output_modes)
+    }
+  end
+
+  defp intersect_policy(base, nil), do: normalize_string_list(base)
+
+  defp intersect_policy(base, allowed) do
+    allowed_set = MapSet.new(normalize_string_list(allowed))
+    base |> normalize_string_list() |> Enum.filter(&MapSet.member?(allowed_set, &1))
+  end
+
+  defp human_admin?(chat_id, user_id), do: get_user_role(chat_id, user_id) in ["owner", "admin"]
+
+  defp link_room_summary(room) do
+    canonical_room_summary(room)
+    |> Map.drop([:members])
+  end
+
+  defp normalize_public_slug(nil), do: nil
+
+  defp normalize_public_slug(value) do
+    value
+    |> to_string()
+    |> String.trim()
+    |> String.downcase()
+    |> String.replace(~r/[\s_]+/u, "-")
+    |> String.replace(~r/-+/, "-")
+    |> String.trim("-")
+    |> present_string()
+  end
+
+  defp valid_public_slug?(slug) when is_binary(slug),
+    do: String.match?(slug, ~r/^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$/)
+
+  defp valid_public_slug?(_), do: false
+
+  defp token_digest(token), do: :crypto.hash(:sha256, to_string(token))
+
+  defp channel_attr(attrs, key) do
+    attrs[key] || attrs[String.to_atom(key)]
+  end
+
+  defp normalize_id_list(value), do: normalize_string_list(value)
+
+  defp normalize_string_list(value) do
+    value
+    |> List.wrap()
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp normalize_map(value) when is_map(value), do: stringify_keys(value)
+  defp normalize_map(_), do: %{}
+
+  defp normalize_positive_integer(nil), do: nil
+  defp normalize_positive_integer(value) when is_integer(value) and value > 0, do: value
+
+  defp normalize_positive_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed > 0 -> parsed
+      _ -> nil
+    end
+  end
+
+  defp normalize_positive_integer(_), do: nil
+
+  defp normalize_expiry(%DateTime{} = value), do: DateTime.truncate(value, :second)
+
+  defp normalize_expiry(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _} -> DateTime.truncate(datetime, :second)
+      _ -> nil
+    end
+  end
+
+  defp normalize_expiry(_), do: nil
+
+  defp truthy?(value), do: value in [true, "true", 1, "1"]
+
+  defp boolean_or_existing(attrs, keys, existing) do
+    case Enum.find(keys, &Map.has_key?(attrs, &1)) do
+      nil -> existing || false
+      key -> truthy?(attrs[key])
+    end
+  end
+
+  defp put_present_change(changes, _key, nil), do: changes
+
+  defp put_present_change(changes, key, value) do
+    case present_string(value) do
+      nil -> changes
+      normalized -> Map.put(changes, key, normalized)
+    end
+  end
+
+  defp put_nullable_change(changes, key, attrs, keys) do
+    case Enum.find(keys, &Map.has_key?(attrs, &1)) do
+      nil -> changes
+      source_key -> Map.put(changes, key, present_string(attrs[source_key]))
+    end
+  end
+
+  defp legacy_channel_settings_patch(room, attrs) do
+    settings_input = normalize_map(channel_attr(attrs, "settings"))
+    allowed = ~w[discussionsEnabled reactionsEnabled allowDirectMessages autoTranslateEnabled]
+
+    flat =
+      Enum.reduce(allowed, %{}, fn key, acc ->
+        snake = Macro.underscore(key)
+
+        cond do
+          Map.has_key?(attrs, key) -> Map.put(acc, key, attrs[key])
+          Map.has_key?(attrs, snake) -> Map.put(acc, key, attrs[snake])
+          true -> acc
+        end
+      end)
+
+    safe_settings = Map.take(settings_input, allowed)
+    room.channel_settings |> normalize_map() |> Map.merge(safe_settings) |> Map.merge(flat)
+  end
+
+  defp room_created_at_ms(%Room{inserted_at: inserted_at}), do: naive_datetime_ms(inserted_at)
+
+  defp room_last_activity_ms(%Room{} = room) do
+    Repo.one(
+      from(message in Message, where: message.chat_id == ^room.id, select: max(message.timestamp))
+    ) ||
+      room_created_at_ms(room)
+  end
+
+  defp naive_datetime_ms(%NaiveDateTime{} = value) do
+    value |> DateTime.from_naive!("Etc/UTC") |> DateTime.to_unix(:millisecond)
+  end
+
+  defp naive_datetime_ms(%DateTime{} = value), do: DateTime.to_unix(value, :millisecond)
+  defp naive_datetime_ms(_), do: 0
+
+  defp channel_member_payloads(channel_id) do
+    from(p in Participant,
+      where: p.chat_id == ^channel_id and (is_nil(p.deleted) or p.deleted == false),
+      preload: [:user],
+      order_by: [asc: p.inserted_at]
+    )
+    |> Repo.all()
+    |> Enum.map(fn member ->
       %{
-        id: room.id,
-        name: room.name,
-        description: room.description,
-        avatar_url: room.avatar_url,
-        creator_id: room.creator_id,
-        creator_name: if(room.creator, do: room.creator.username, else: nil),
-        subscriber_count: subscriber_count,
-        created_at: room.inserted_at
+        userId: member.user_id,
+        name:
+          present_string(member.user && member.user.name) ||
+            present_string(member.user && member.user.username),
+        username: present_string(member.user && member.user.username),
+        avatarUrl: present_string(member.user && member.user.profile_image),
+        role: member.role || "member"
       }
     end)
   end
+
+  defp list_channel_recent_actions(channel_id, limit) when is_integer(limit) and limit > 0 do
+    from(m in Message,
+      where: m.chat_id == ^channel_id,
+      order_by: [desc: m.timestamp],
+      limit: ^limit,
+      preload: [:from]
+    )
+    |> Repo.all()
+    |> Enum.map(fn m ->
+      body =
+        present_string(m.encrypted_content) ||
+          present_string(m.type) ||
+          "message"
+
+      %{
+        id: m.id,
+        type: m.type || "text",
+        text: String.slice(body, 0, 240),
+        fromId: m.from_id,
+        fromName:
+          present_string(m.from && m.from.name) ||
+            present_string(m.from && m.from.username),
+        timestampMs: m.timestamp,
+        isSystem: m.type == "system"
+      }
+    end)
+  end
+
+  defp stringify_keys(map) when is_map(map) do
+    Enum.reduce(map, %{}, fn {k, v}, acc ->
+      key =
+        cond do
+          is_binary(k) -> k
+          is_atom(k) -> Atom.to_string(k)
+          true -> to_string(k)
+        end
+
+      Map.put(acc, key, v)
+    end)
+  end
+
+  defp stringify_keys(_), do: %{}
 
   def get_channel_analytics(channel_id, user_id \\ nil) do
     RepoRLS.with_user(user_id, fn ->
@@ -1564,12 +2926,17 @@ defmodule Vibe.Chat do
   def can_send?(chat_id, user_id) do
     case Repo.get(Room, chat_id) do
       %Room{type: "channel"} ->
-        # Only owner/admin can send in channels
         Repo.exists?(
           from(p in Participant,
+            left_join: assignment in ChannelAgentAssignment,
+            on: assignment.chat_id == p.chat_id and assignment.status == "active",
+            left_join: agent in Agent,
+            on: agent.id == assignment.agent_id and agent.agent_user_id == p.user_id,
             where:
               p.chat_id == ^chat_id and p.user_id == ^user_id and
-                p.role in ["owner", "admin"]
+                (is_nil(p.deleted) or p.deleted == false) and
+                (p.role in ["owner", "admin"] or
+                   (p.role == "agent_admin" and not is_nil(agent.id)))
           )
         )
 
@@ -1585,7 +2952,9 @@ defmodule Vibe.Chat do
   def get_user_role(chat_id, user_id) do
     Repo.one(
       from(p in Participant,
-        where: p.chat_id == ^chat_id and p.user_id == ^user_id,
+        where:
+          p.chat_id == ^chat_id and p.user_id == ^user_id and
+            (is_nil(p.deleted) or p.deleted == false),
         select: p.role
       )
     )

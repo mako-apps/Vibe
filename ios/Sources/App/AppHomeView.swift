@@ -371,9 +371,32 @@ struct ChatRoute: Identifiable, Hashable {
   /// Group/channel participant list, carried straight from `ChatHomeListRow.members`.
   /// Empty for DMs and for routes built before that data was available.
   let members: [[String: Any]]
+  /// Canonical room metadata returned by create/list. Keeping it on the route means
+  /// the very first chat/profile frame never waits for a Home refresh to learn it.
+  let roomDescription: String?
+  let accessType: String
+  let publicSlug: String?
+  let shareLink: String?
+  let joinApprovalRequired: Bool
+  let restrictSavingContent: Bool
+  let memberCount: Int?
+  let createdAt: Double
 
   /// Groups expose a Members list; channels do not.
   var showsMemberList: Bool { isGroup && !isChannel }
+
+  var roomParticipantCount: Int {
+    max(memberCount ?? 0, members.count)
+  }
+
+  var roomParticipantSubtitle: String {
+    guard isGroup else { return "" }
+    let count = roomParticipantCount
+    if isChannel {
+      return count == 1 ? "1 subscriber" : "\(count) subscribers"
+    }
+    return count == 1 ? "1 member" : "\(count) members"
+  }
 
   var id: String { chatId }
 
@@ -523,7 +546,15 @@ struct ChatRoute: Identifiable, Hashable {
     initialRows: [[String: Any]],
     agentEventInboxMode: String? = nil,
     bridgeProvider: String? = nil,
-    members: [[String: Any]] = []
+    members: [[String: Any]] = [],
+    roomDescription: String? = nil,
+    accessType: String = "private",
+    publicSlug: String? = nil,
+    shareLink: String? = nil,
+    joinApprovalRequired: Bool = false,
+    restrictSavingContent: Bool = false,
+    memberCount: Int? = nil,
+    createdAt: Double = 0
   ) {
     self.chatId = chatId
     self.title = title
@@ -559,6 +590,16 @@ struct ChatRoute: Identifiable, Hashable {
           agentId: peerAgentId
         ))
     self.members = members
+    let description = roomDescription?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    self.roomDescription = description.isEmpty ? nil : description
+    let normalizedAccess = accessType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    self.accessType = normalizedAccess == "public" ? "public" : "private"
+    self.publicSlug = Self.normalizedString(publicSlug)
+    self.shareLink = Self.normalizedString(shareLink)
+    self.joinApprovalRequired = joinApprovalRequired
+    self.restrictSavingContent = restrictSavingContent
+    self.memberCount = memberCount.map { max(0, $0) }
+    self.createdAt = max(0, createdAt)
   }
 
   init(row: ChatHomeListRow) {
@@ -599,7 +640,15 @@ struct ChatRoute: Identifiable, Hashable {
       initialRows: cachedRows,
       agentEventInboxMode: row.agentEventInboxMode,
       bridgeProvider: resolvedBridge,
-      members: row.members
+      members: row.members,
+      roomDescription: row.roomDescription,
+      accessType: row.accessType ?? "private",
+      publicSlug: row.publicSlug,
+      shareLink: row.shareLink,
+      joinApprovalRequired: row.joinApprovalRequired,
+      restrictSavingContent: row.restrictSavingContent,
+      memberCount: row.memberCount,
+      createdAt: row.createdAt
     )
   }
 
@@ -648,7 +697,15 @@ struct ChatRoute: Identifiable, Hashable {
       initialRows: initialRows,
       agentEventInboxMode: agentEventInboxMode,
       bridgeProvider: bridgeProvider,
-      members: members
+      members: members,
+      roomDescription: roomDescription,
+      accessType: accessType,
+      publicSlug: publicSlug,
+      shareLink: shareLink,
+      joinApprovalRequired: joinApprovalRequired,
+      restrictSavingContent: restrictSavingContent,
+      memberCount: memberCount,
+      createdAt: createdAt
     )
   }
 
@@ -1314,6 +1371,175 @@ final class AppShellCoordinator: ObservableObject {
   }
 }
 
+private enum ChannelRoomLinkJoinResult {
+  case opened(ChatRoute)
+  case pending(String)
+}
+
+/// Single ingress for public/private room links. AppDelegate can receive a URL before
+/// authentication or before the tab shell exists, so the router retains one pending
+/// value and resolves it only after the authenticated coordinator registers.
+@MainActor
+final class VibeRoomLinkRouter {
+  static let shared = VibeRoomLinkRouter()
+
+  private weak var coordinator: AppShellCoordinator?
+  private var pendingValue: String?
+  private var joinTask: Task<Void, Never>?
+
+  private init() {}
+
+  func register(coordinator: AppShellCoordinator) {
+    self.coordinator = coordinator
+    processPendingIfPossible()
+  }
+
+  func handle(url: URL) {
+    guard let value = Self.linkValue(from: url) else { return }
+    pendingValue = value
+    processPendingIfPossible()
+  }
+
+  private func processPendingIfPossible() {
+    guard joinTask == nil, let value = pendingValue, let coordinator,
+      let config = AppSessionConfig.current
+    else { return }
+    pendingValue = nil
+    joinTask = Task { @MainActor [weak self, weak coordinator] in
+      defer { self?.joinTask = nil }
+      do {
+        switch try await ChannelRoomLinkService.join(value: value, config: config) {
+        case .opened(let route):
+          coordinator?.openChat(route)
+        case .pending(let message):
+          AppToastController.shared.show(message)
+        }
+      } catch {
+        AppToastController.shared.show(error.localizedDescription)
+      }
+      self?.processPendingIfPossible()
+    }
+  }
+
+  private static func linkValue(from url: URL) -> String? {
+    if url.scheme?.lowercased() == "vibe" {
+      let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+      for key in ["link", "token", "slug", "value"] {
+        if let value = components?.queryItems?.first(where: { $0.name == key })?.value,
+          !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+          return value
+        }
+      }
+      let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+      if !path.isEmpty { return path }
+      return nil
+    }
+
+    let parts = url.pathComponents.filter { $0 != "/" }
+    guard parts.count >= 2, ["r", "j"].contains(parts[parts.count - 2]) else { return nil }
+    return url.absoluteString
+  }
+}
+
+private enum ChannelRoomLinkService {
+  static func join(value: String, config: AppSessionConfig) async throws -> ChannelRoomLinkJoinResult {
+    let active = AppSessionConfig.current ?? config
+    do {
+      return try await joinOnce(value: value, config: active)
+    } catch let error as ChatDirectMessageServiceError {
+      guard error.isSessionExpired else { throw error }
+      let refreshed = try await AppSessionRefreshService.refresh(config: active)
+      return try await joinOnce(value: value, config: refreshed)
+    }
+  }
+
+  private static func joinOnce(
+    value: String, config: AppSessionConfig
+  ) async throws -> ChannelRoomLinkJoinResult {
+    let request = try request(value: value, config: config)
+    let payload: [String: Any]
+    switch config.transportMode {
+    case .offline:
+      throw ChatDirectMessageServiceError.transportUnavailable("offline")
+    case .bridgeText:
+      throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
+    case .packetMesh:
+      let snapshot = try await PacketRuntime.shared.ensureStarted(config: config)
+      payload = try await perform(request, session: PacketRuntime.shared.makeURLSession(snapshot: snapshot))
+    case .direct:
+      do {
+        payload = try await perform(request, session: .shared)
+      } catch {
+        guard ChatDirectMessageService.shouldAttemptPacketFallback(for: error) else { throw error }
+        let snapshot = try await PacketRuntime.shared.ensureStarted(config: config)
+        payload = try await perform(
+          request, session: PacketRuntime.shared.makeURLSession(snapshot: snapshot))
+      }
+    }
+
+    let status = normalizedString(payload["status"])?.lowercased()
+    if status == "pending" || status == "approval_required" {
+      let message = normalizedString(payload["message"])
+        ?? "Your request to join was sent to the channel administrators."
+      return .pending(message)
+    }
+
+    let room = (payload["room"] as? [String: Any]) ?? payload
+    guard let row = ChatHomeListRow.parse(room) else {
+      throw ChatDirectMessageServiceError.invalidPayload
+    }
+    if let current = AppSessionConfig.current {
+      ChatHomeService.upsertCachedRow(row, config: current)
+    }
+    return .opened(ChatRoute(row: row))
+  }
+
+  private static func request(value: String, config: AppSessionConfig) throws -> URLRequest {
+    var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") { base.removeLast() }
+    let pathBase = base.lowercased().hasSuffix("/api") ? base : "\(base)/api"
+    guard let url = URL(string: "\(pathBase)/channel/links/join") else {
+      throw ChatDirectMessageServiceError.invalidURL
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 20
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
+    request.httpBody = try JSONSerialization.data(withJSONObject: ["link": value])
+    return request
+  }
+
+  private static func perform(
+    _ request: URLRequest, session: URLSession
+  ) async throws -> [String: Any] {
+    let (data, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw ChatDirectMessageServiceError.invalidResponse
+    }
+    guard (200...299).contains(http.statusCode) else {
+      let body = String(data: data, encoding: .utf8) ?? ""
+      throw ChatDirectMessageServiceError.http(http.statusCode, body)
+    }
+    guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      throw ChatDirectMessageServiceError.invalidPayload
+    }
+    return payload
+  }
+
+  private static func normalizedString(_ value: Any?) -> String? {
+    if let value = value as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let value = value as? NSNumber { return value.stringValue }
+    return nil
+  }
+}
+
 @MainActor
 private final class ChatsViewModel: ObservableObject {
   /// Home carries only enough recent raw rows to paint the first chat viewport. The
@@ -1551,6 +1777,39 @@ private final class ChatsViewModel: ObservableObject {
     if let config = AppSessionConfig.current {
       ChatHomeService.upsertCachedRow(row, config: config)
     }
+  }
+
+  /// Project the canonical create response into Home before any background list
+  /// fetch. This makes Back from a just-created room deterministic even when
+  /// `/api/chats` is slow or the socket has not observed the new membership yet.
+  func projectCreatedRoom(_ route: ChatRoute) {
+    let nowMs = Date().timeIntervalSince1970 * 1_000.0
+    let createdAt = route.createdAt > 0 ? route.createdAt : nowMs
+    var payload: [String: Any] = [
+      "chatId": route.chatId,
+      "type": route.isChannel ? "channel" : "group",
+      "isGroup": true,
+      "isChannel": route.isChannel,
+      "name": route.title,
+      "role": route.myRole ?? "owner",
+      "members": route.members,
+      "memberCount": max(route.roomParticipantCount, route.members.count),
+      "createdAt": createdAt,
+      "lastMessageAt": createdAt,
+      "accessType": route.accessType,
+      "joinApprovalRequired": route.joinApprovalRequired,
+      "restrictSavingContent": route.restrictSavingContent,
+      "messages": [],
+    ]
+    if route.isChannel {
+      payload["subscriberCount"] = max(route.roomParticipantCount, route.members.count)
+    }
+    if let value = route.avatarURI { payload["avatarUrl"] = value }
+    if let value = route.roomDescription { payload["description"] = value }
+    if let value = route.publicSlug { payload["publicSlug"] = value }
+    if let value = route.shareLink { payload["shareLink"] = value }
+    guard let row = ChatHomeListRow.parse(payload) else { return }
+    restoreLocalRow(row)
   }
 
   func markLocalRead(chatID: String) {
@@ -2257,6 +2516,7 @@ private struct ChatHomeScreen: View {
   @State private var isShowingChannelCreation = false
   @State private var roomCreationName = ""
   @State private var isShowingGroupCreation = false
+  @State private var pendingCreatedRoomRoute: ChatRoute?
   @State private var homeSearchQuery = ""
   @State private var isHomeSearchFocused = false
   /// The overlay's animated pose. Visibility (isHomeSearchFocused) and pose are
@@ -2787,18 +3047,22 @@ private struct ChatHomeScreen: View {
         }
       }
     }
-    .sheet(isPresented: $isShowingGroupCreation) {
+    .sheet(isPresented: $isShowingGroupCreation, onDismiss: openPendingCreatedRoom) {
       if let config = AppSessionConfig.current {
         ChatGroupCreationSheet(config: config, homeRows: visibleHomeRows) { route in
-          coordinator.openChat(route)
+          model.projectCreatedRoom(route)
+          pendingCreatedRoomRoute = route
+          isShowingGroupCreation = false
           Task { await model.refresh() }
         }
       }
     }
-    .sheet(isPresented: $isShowingChannelCreation) {
+    .sheet(isPresented: $isShowingChannelCreation, onDismiss: openPendingCreatedRoom) {
       if let config = AppSessionConfig.current {
         ChannelCreationSheet(config: config) { route in
-          coordinator.openChat(route)
+          model.projectCreatedRoom(route)
+          pendingCreatedRoomRoute = route
+          isShowingChannelCreation = false
           Task { await model.refresh() }
         }
       }
@@ -2810,6 +3074,12 @@ private struct ChatHomeScreen: View {
       }
       .ignoresSafeArea()
     }
+  }
+
+  private func openPendingCreatedRoom() {
+    guard let route = pendingCreatedRoomRoute else { return }
+    pendingCreatedRoomRoute = nil
+    coordinator.openChat(route)
   }
 
 
@@ -8371,6 +8641,7 @@ private struct ContactsPageView: View {
   @State private var isShowingChannelCreation = false
   @State private var roomCreationName = ""
   @State private var isShowingGroupCreation = false
+  @State private var pendingCreatedRoomRoute: ChatRoute?
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -8482,22 +8753,30 @@ private struct ContactsPageView: View {
         }
       }
     }
-    .sheet(isPresented: $isShowingGroupCreation) {
+    .sheet(isPresented: $isShowingGroupCreation, onDismiss: openPendingCreatedRoom) {
       if let config = AppSessionConfig.current {
         ChatGroupCreationSheet(config: config, homeRows: model.rows) { route in
-          coordinator.openChat(route)
+          pendingCreatedRoomRoute = route
+          isShowingGroupCreation = false
           Task { await model.refresh() }
         }
       }
     }
-    .sheet(isPresented: $isShowingChannelCreation) {
+    .sheet(isPresented: $isShowingChannelCreation, onDismiss: openPendingCreatedRoom) {
       if let config = AppSessionConfig.current {
         ChannelCreationSheet(config: config) { route in
-          coordinator.openChat(route)
+          pendingCreatedRoomRoute = route
+          isShowingChannelCreation = false
           Task { await model.refresh() }
         }
       }
     }
+  }
+
+  private func openPendingCreatedRoom() {
+    guard let route = pendingCreatedRoomRoute else { return }
+    pendingCreatedRoomRoute = nil
+    coordinator.openChat(route)
   }
 
   private func handleSearchPayload(_ payload: [String: Any]) {
@@ -8814,7 +9093,7 @@ final class ChatProfileRootController: UIViewController {
       profileView.setProfileName(route.title)
       profileView.setBridgeProvider(route.bridgeProvider ?? "")
       profileView.setProfileHandle(Self.profileHandle(for: route))
-      profileView.setProfileBio("")
+      profileView.setProfileBio(route.roomDescription ?? "")
       profileView.setAvatarUri(route.avatarURI)
       let resolvedChannel =
         route.isChannel
@@ -8823,6 +9102,14 @@ final class ChatProfileRootController: UIViewController {
       profileView.setRouteMembership(
         isChannel: resolvedChannel,
         myRole: route.myRole
+      )
+      profileView.setChannelSettings(
+        accessType: route.accessType,
+        publicSlug: route.publicSlug,
+        shareLink: route.shareLink,
+        joinApprovalRequired: route.joinApprovalRequired,
+        restrictSavingContent: route.restrictSavingContent,
+        subscriberCount: route.isChannel ? route.roomParticipantCount : nil
       )
       let routeMemberCount = route.members.count
       // Always hydrate the roster for groups *and* channels so owner/admin role
@@ -8834,8 +9121,8 @@ final class ChatProfileRootController: UIViewController {
         self.route = route.withMembers(resolvedMembers)
       }
       profileView.setGroupMembers(resolvedMembers)
-      if !resolvedMembers.isEmpty {
-        profileView.setGroupMemberCount(resolvedMembers.count)
+      if route.isGroup {
+        profileView.setGroupMemberCount(max(route.roomParticipantCount, resolvedMembers.count))
       }
       NSLog(
         "[WhoAmI] ChatProfileRoot.applyRoute groupMembers chatId=%@ route=%d resolved=%d isChannel=%@ myRole=%@ showsMembers=%@",
@@ -8915,7 +9202,7 @@ final class ChatProfileRootController: UIViewController {
       if action == "clearChat" {
         presentClearChatOptions()
       }
-    case "profileGroupAction", "groupMemberTapped":
+    case "profileGroupAction", "groupMemberTapped", "channelLink", "channelSetting", "channelAgents":
       _ = GroupProfileActionRouter.handle(
         payload: payload,
         route: route,
@@ -9046,7 +9333,7 @@ final class ChatProfileRootController: UIViewController {
       return "Saved Messages"
     }
     if route.isGroup {
-      return route.isChannel ? "channel" : "group"
+      return route.roomParticipantSubtitle
     }
     return route.peerUserId == nil || !route.hasPeerResponse ? "" : "last seen recently"
   }
@@ -9423,7 +9710,8 @@ final class ChatConversationController: UIViewController {
     mainView.setIsChannel(resolvedChannel)
     mainView.setGroupMembers(resolvedRouteMembers)
     mainView.setGroupMemberCount(
-      route.isGroup && !resolvedRouteMembers.isEmpty ? resolvedRouteMembers.count : nil)
+      route.isGroup ? max(route.roomParticipantCount, resolvedRouteMembers.count) : nil)
+    mainView.setRestrictSavingContent(route.isChannel && route.restrictSavingContent)
     if route.isGroup {
       NSLog(
         "[WhoAmI] ChatConversation.applyRoute groupMembers chatId=%@ route=%d resolved=%d",
@@ -9463,7 +9751,7 @@ final class ChatConversationController: UIViewController {
     mainView.setOpeningUnreadCount(route.unreadCount)
     mainView.setProfileName(route.title)
     mainView.setProfileHandle(Self.profileHandle(for: route))
-    mainView.setProfileBio("")
+    mainView.setProfileBio(route.roomDescription ?? "")
     markRouteSurfaceStep("avatar")
     mainView.setAvatarUri(route.avatarURI)
     markRouteSurfaceStep("groupAndInput")
@@ -10411,7 +10699,7 @@ final class ChatConversationController: UIViewController {
       profileView.setProfileName(route.title)
       profileView.setBridgeProvider(route.bridgeProvider ?? "")
       profileView.setProfileHandle(Self.profileHandle(for: route))
-      profileView.setProfileBio("")
+      profileView.setProfileBio(route.roomDescription ?? "")
       profileView.setAvatarUri(route.avatarURI)
       // Multi-party + channel flags must land together. Missing setRouteMembership
       // left isChannel=false so channel profiles rendered as Group settings.
@@ -10424,6 +10712,14 @@ final class ChatConversationController: UIViewController {
         isChannel: resolvedChannel,
         myRole: route.myRole
       )
+      profileView.setChannelSettings(
+        accessType: route.accessType,
+        publicSlug: route.publicSlug,
+        shareLink: route.shareLink,
+        joinApprovalRequired: route.joinApprovalRequired,
+        restrictSavingContent: route.restrictSavingContent,
+        subscriberCount: route.isChannel ? route.roomParticipantCount : nil
+      )
       let routeMemberCount = route.members.count
       let resolvedMembers = ChatRoute.resolvedMembers(
         chatId: route.chatId, routeMembers: route.members)
@@ -10431,8 +10727,8 @@ final class ChatConversationController: UIViewController {
         self.route = route.withMembers(resolvedMembers)
       }
       profileView.setGroupMembers(resolvedMembers)
-      if !resolvedMembers.isEmpty {
-        profileView.setGroupMemberCount(resolvedMembers.count)
+      if route.isGroup {
+        profileView.setGroupMemberCount(max(route.roomParticipantCount, resolvedMembers.count))
       }
       NSLog(
         "[WhoAmI] configureProfileView groupMembers chatId=%@ route=%d resolved=%d isChannel=%@ myRole=%@",
@@ -10739,6 +11035,11 @@ final class ChatConversationController: UIViewController {
           ])
         }
       case "shareInside":
+        guard !route.restrictSavingContent else {
+          AppToastController.shared.show("Forwarding is disabled for this channel")
+          mainView.clearMessageSelection()
+          return
+        }
         let messageIds = (payload["messageIds"] as? [String]) ?? []
         appShellRouteLog(
           "ChatConversationController shareInside chatId=\(route.chatId) count=\(messageIds.count)")
@@ -10781,6 +11082,10 @@ final class ChatConversationController: UIViewController {
                       "chatId": sourceChatId,
                       "messageId": msgId,
                     ]) {
+                      var metadata = (row["metadata"] as? [String: Any]) ?? [:]
+                      metadata["forwardedFromChatId"] = sourceChatId
+                      metadata["forwardedFromMessageId"] = msgId
+                      row["metadata"] = metadata
                       row["chatId"] = targetChatId
                       row.removeValue(forKey: "messageId")
                       row.removeValue(forKey: "message_id")
@@ -10806,7 +11111,7 @@ final class ChatConversationController: UIViewController {
       default:
         break
       }
-    case "profileGroupAction", "groupMemberTapped":
+    case "profileGroupAction", "groupMemberTapped", "channelLink", "channelSetting", "channelAgents":
       var presenter: UIViewController = self
       while let presented = presenter.presentedViewController { presenter = presented }
       _ = GroupProfileActionRouter.handle(
@@ -11002,7 +11307,7 @@ final class ChatConversationController: UIViewController {
       return bridgeSubtitle
     }
     if route.isGroup {
-      return route.isChannel ? "channel" : "group"
+      return route.roomParticipantSubtitle
     }
     guard route.hasPeerResponse else { return "" }
     if isOnline(for: route) {
@@ -11024,7 +11329,7 @@ final class ChatConversationController: UIViewController {
       return bridgeSubtitle
     }
     if route.isGroup {
-      return route.isChannel ? "channel" : "group"
+      return route.roomParticipantSubtitle
     }
     return route.peerUserId == nil || !route.hasPeerResponse ? "" : "last seen recently"
   }
@@ -11327,7 +11632,7 @@ struct AppChatNavigationHeaderView: View {
       return "Saved Messages"
     }
     if route.isGroup {
-      return route.isChannel ? "channel" : "group"
+      return route.roomParticipantSubtitle
     }
     return route.peerUserId == nil || !route.hasPeerResponse ? "" : "last seen recently"
   }
@@ -12658,24 +12963,70 @@ struct ChatRoomCreateResult {
   let chatID: String
   let name: String
   let type: String
+  let roomDescription: String?
+  let avatarUrl: String?
+  let creatorId: String?
+  let role: String?
+  let members: [[String: Any]]
+  let memberCount: Int?
+  let subscriberCount: Int?
+  let createdAt: Double
+  let lastMessageAt: Double
+  let accessType: String
+  let publicSlug: String?
+  let shareLink: String?
+  let joinApprovalRequired: Bool
+  let restrictSavingContent: Bool
 }
 
 enum ChatRoomCreateService {
-  static func create(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = [], avatarUrl: String? = nil) async throws -> ChatRoomCreateResult {
+  static func create(
+    kind: ChatRoomCreationKind,
+    config: AppSessionConfig,
+    name: String,
+    description: String? = nil,
+    memberIds: [String] = [],
+    agentAdminIds: [String] = [],
+    avatarUrl: String? = nil,
+    accessType: String = "private",
+    publicSlug: String? = nil,
+    joinApprovalRequired: Bool = false,
+    restrictSavingContent: Bool = false
+  ) async throws -> ChatRoomCreateResult {
     let activeConfig = AppSessionConfig.current ?? config
     do {
-      return try await createOnce(kind: kind, config: activeConfig, name: name, memberIds: memberIds, avatarUrl: avatarUrl)
+      return try await createOnce(
+        kind: kind, config: activeConfig, name: name, description: description,
+        memberIds: memberIds, agentAdminIds: agentAdminIds, avatarUrl: avatarUrl,
+        accessType: accessType, publicSlug: publicSlug,
+        joinApprovalRequired: joinApprovalRequired,
+        restrictSavingContent: restrictSavingContent)
     } catch let error as ChatDirectMessageServiceError {
       guard error.isSessionExpired else {
         throw error
       }
       let refreshedConfig = try await AppSessionRefreshService.refresh(config: activeConfig)
-      return try await createOnce(kind: kind, config: refreshedConfig, name: name, memberIds: memberIds, avatarUrl: avatarUrl)
+      return try await createOnce(
+        kind: kind, config: refreshedConfig, name: name, description: description,
+        memberIds: memberIds, agentAdminIds: agentAdminIds, avatarUrl: avatarUrl,
+        accessType: accessType, publicSlug: publicSlug,
+        joinApprovalRequired: joinApprovalRequired,
+        restrictSavingContent: restrictSavingContent)
     }
   }
 
-  private static func createOnce(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = [], avatarUrl: String? = nil) async throws -> ChatRoomCreateResult {
-    let request = try buildRequest(kind: kind, config: config, name: name, memberIds: memberIds, avatarUrl: avatarUrl)
+  private static func createOnce(
+    kind: ChatRoomCreationKind, config: AppSessionConfig, name: String,
+    description: String?, memberIds: [String], agentAdminIds: [String], avatarUrl: String?,
+    accessType: String, publicSlug: String?, joinApprovalRequired: Bool,
+    restrictSavingContent: Bool
+  ) async throws -> ChatRoomCreateResult {
+    let request = try buildRequest(
+      kind: kind, config: config, name: name, description: description,
+      memberIds: memberIds, agentAdminIds: agentAdminIds, avatarUrl: avatarUrl,
+      accessType: accessType, publicSlug: publicSlug,
+      joinApprovalRequired: joinApprovalRequired,
+      restrictSavingContent: restrictSavingContent)
 
     switch config.transportMode {
     case .offline:
@@ -12705,7 +13056,12 @@ enum ChatRoomCreateService {
     }
   }
 
-  private static func buildRequest(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = [], avatarUrl: String? = nil) throws -> URLRequest {
+  private static func buildRequest(
+    kind: ChatRoomCreationKind, config: AppSessionConfig, name: String,
+    description: String?, memberIds: [String], agentAdminIds: [String], avatarUrl: String?,
+    accessType: String, publicSlug: String?, joinApprovalRequired: Bool,
+    restrictSavingContent: Bool
+  ) throws -> URLRequest {
     var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
     while base.hasSuffix("/") {
       base.removeLast()
@@ -12724,11 +13080,25 @@ enum ChatRoomCreateService {
     }
 
     var body: [String: Any] = ["name": name]
+    if let description {
+      body["description"] = description.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
     if let avatarUrl {
       body["avatarUrl"] = avatarUrl
     }
     if case .group = kind {
       body["memberIds"] = memberIds
+    } else {
+      body["memberIds"] = memberIds
+      body["agentAdminIds"] = agentAdminIds
+      body["accessType"] = accessType
+      if let publicSlug,
+        !publicSlug.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      {
+        body["publicSlug"] = publicSlug
+      }
+      body["joinApprovalRequired"] = joinApprovalRequired
+      body["restrictSavingContent"] = restrictSavingContent
     }
 
     var request = URLRequest(url: url)
@@ -12763,11 +13133,62 @@ enum ChatRoomCreateService {
     let name = ChatDirectMessageService.normalizedString(payload["name"]) ?? fallbackName
     let type = ChatDirectMessageService.normalizedString(payload["type"])
       ?? (request.url?.path.contains("/channel") == true ? "channel" : "group")
+    let members = (payload["members"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+    let createdAt = numericValue(payload["createdAt"] ?? payload["created_at"]) ?? 0
+    let lastMessageAt =
+      numericValue(payload["lastMessageAt"] ?? payload["last_message_at"])
+      ?? createdAt
+    let accessType =
+      ChatDirectMessageService.normalizedString(payload["accessType"] ?? payload["access_type"])
+      ?? "private"
     return ChatRoomCreateResult(
       chatID: chatID,
       name: name,
-      type: type
+      type: type,
+      roomDescription: ChatDirectMessageService.normalizedString(
+        payload["description"] ?? payload["roomDescription"]),
+      avatarUrl: ChatDirectMessageService.normalizedString(
+        payload["avatarUrl"] ?? payload["avatar_url"]),
+      creatorId: ChatDirectMessageService.normalizedString(
+        payload["creatorId"] ?? payload["creator_id"]),
+      role: ChatDirectMessageService.normalizedString(payload["role"]),
+      members: members,
+      memberCount: integerValue(payload["memberCount"] ?? payload["member_count"]),
+      subscriberCount: integerValue(
+        payload["subscriberCount"] ?? payload["subscriber_count"]),
+      createdAt: createdAt,
+      lastMessageAt: lastMessageAt,
+      accessType: accessType,
+      publicSlug: ChatDirectMessageService.normalizedString(
+        payload["publicSlug"] ?? payload["public_slug"]),
+      shareLink: ChatDirectMessageService.normalizedString(
+        payload["shareLink"] ?? payload["share_link"]),
+      joinApprovalRequired: boolValue(
+        payload["joinApprovalRequired"] ?? payload["join_approval_required"]),
+      restrictSavingContent: boolValue(
+        payload["restrictSavingContent"] ?? payload["restrict_saving_content"])
     )
+  }
+
+  private static func numericValue(_ value: Any?) -> Double? {
+    if let number = value as? NSNumber { return number.doubleValue }
+    if let text = value as? String { return Double(text) }
+    return nil
+  }
+
+  private static func integerValue(_ value: Any?) -> Int? {
+    if let number = value as? NSNumber { return number.intValue }
+    if let text = value as? String { return Int(text) }
+    return nil
+  }
+
+  private static func boolValue(_ value: Any?) -> Bool {
+    if let value = value as? Bool { return value }
+    if let number = value as? NSNumber { return number.boolValue }
+    if let text = value as? String {
+      return ["1", "true", "yes", "on"].contains(text.lowercased())
+    }
+    return false
   }
 
   static func uploadAvatar(imageData: Data, config: AppSessionConfig) async throws -> String {
@@ -13123,6 +13544,18 @@ enum GroupProfileActionRouter {
       presentMemberActions(payload: payload, chatId: chatId, presenter: presenter)
       return true
 
+    case "channelLink":
+      shareChannelLink(payload: payload, route: route, presenter: presenter)
+      return true
+
+    case "channelSetting":
+      updateChannelSetting(payload: payload, chatId: chatId)
+      return true
+
+    case "channelAgents":
+      presentChannelAgents(chatId: chatId, presenter: presenter)
+      return true
+
     default:
       return false
     }
@@ -13139,27 +13572,37 @@ enum GroupProfileActionRouter {
       return
     }
     let name = str(payload["name"]) ?? route.title
-    let description = str(payload["description"]) ?? ""
-    let avatarUri = str(payload["avatarUri"])
+    let description = str(payload["description"]) ?? route.roomDescription ?? ""
+    let avatarUri = str(payload["avatarUri"]) ?? route.avatarURI
     let channel =
       isChannel
       ?? (route.isChannel || bool(payload["isChannel"]) == true || cachedIsChannel(chatId: chatId))
-    let sheet = GroupEditSheet(
+    // Full page (not sheet) for group/channel edit — production NavigationStack page.
+    let page = RoomEditPage(
       config: config,
       chatId: chatId,
+      isChannel: channel,
       initialName: name,
       initialDescription: description,
-      initialAvatarUri: avatarUri,
-      isChannel: channel
+      initialAvatarUri: avatarUri
     ) { newName, newDescription, newAvatarUrl in
       onEdited?(newName, newAvatarUrl, newDescription)
       AppToastController.shared.show(channel ? "Channel updated." : "Group updated.")
+      if let nav = presenter.navigationController {
+        nav.popViewController(animated: true)
+      } else {
+        presenter.dismiss(animated: true)
+      }
     }
-    let host = UIHostingController(rootView: sheet)
-    // Clear the hosting backing so the sheet's `.presentationBackground(.ultraThinMaterial)`
-    // reads as true frosted glass rather than a material over an opaque view.
-    host.view.backgroundColor = .clear
-    presenter.present(host, animated: true)
+    let host = UIHostingController(rootView: page)
+    host.view.backgroundColor = .systemBackground
+    if let nav = presenter.navigationController {
+      nav.pushViewController(host, animated: true)
+    } else {
+      let wrap = UINavigationController(rootViewController: host)
+      wrap.modalPresentationStyle = .pageSheet
+      presenter.present(wrap, animated: true)
+    }
   }
 
   private static func presentMemberActions(
@@ -13232,6 +13675,105 @@ enum GroupProfileActionRouter {
       detents.preferredCornerRadius = 28
     }
     presenter.present(host, animated: true)
+  }
+
+  private static func shareChannelLink(
+    payload: [String: Any], route: ChatRoute, presenter: UIViewController
+  ) {
+    guard let config = AppSessionConfig.current else {
+      AppToastController.shared.show("The current session is unavailable.")
+      return
+    }
+    if let known = canonicalShareURL(
+      str(payload["shareLink"]) ?? route.shareLink,
+      publicSlug: str(payload["publicSlug"]) ?? route.publicSlug,
+      config: config
+    ) {
+      presentShareSheet(value: known, presenter: presenter)
+      return
+    }
+    Task { @MainActor in
+      do {
+        let settings = try await ChannelProfileService.rotateInviteLink(
+          chatId: route.chatId, config: config)
+        guard let link = canonicalShareURL(
+          settings.inviteLink,
+          publicSlug: settings.publicSlug,
+          config: config
+        ) else {
+          throw ChannelProfileServiceError.invalidPayload
+        }
+        presentShareSheet(value: link, presenter: presenter)
+      } catch {
+        AppToastController.shared.show(error.localizedDescription)
+      }
+    }
+  }
+
+  private static func updateChannelSetting(payload: [String: Any], chatId: String) {
+    guard let config = AppSessionConfig.current,
+      let setting = str(payload["setting"]),
+      ["joinApprovalRequired", "restrictSavingContent"].contains(setting),
+      let value = bool(payload["value"])
+    else { return }
+    Task { @MainActor in
+      do {
+        _ = try await ChannelProfileService.updatePolicy(
+          chatId: chatId, values: [setting: value], config: config)
+        AppToastController.shared.show("Channel setting updated.")
+      } catch {
+        AppToastController.shared.show(error.localizedDescription)
+      }
+    }
+  }
+
+  private static func presentChannelAgents(chatId: String, presenter: UIViewController) {
+    let pushBuilder: () -> Void = { [weak presenter] in
+      guard let presenter, let nav = presenter.navigationController else { return }
+      let controller = ChatAgentConversationController(
+        isDark: nav.traitCollection.userInterfaceStyle == .dark,
+        onClose: { [weak nav] in nav?.popViewController(animated: true) }
+      )
+      nav.pushViewController(controller, animated: true)
+    }
+    let page = ChannelAgentManagementPage(chatId: chatId, onCreateAgent: pushBuilder)
+    let host = UIHostingController(rootView: page)
+    host.view.backgroundColor = .systemBackground
+    if let nav = presenter.navigationController {
+      nav.pushViewController(host, animated: true)
+    } else {
+      let wrapper = UINavigationController(rootViewController: host)
+      wrapper.modalPresentationStyle = .pageSheet
+      presenter.present(wrapper, animated: true)
+    }
+  }
+
+  private static func canonicalShareURL(
+    _ raw: String?, publicSlug: String?, config: AppSessionConfig
+  ) -> String? {
+    let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if value.contains("://") { return value }
+    var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") { base.removeLast() }
+    if base.lowercased().hasSuffix("/api") { base.removeLast(4) }
+    if !value.isEmpty {
+      return value.hasPrefix("/") ? "\(base)\(value)" : "\(base)/\(value)"
+    }
+    if let slug = publicSlug?.trimmingCharacters(in: .whitespacesAndNewlines), !slug.isEmpty {
+      return "\(base)/r/\(slug)"
+    }
+    return nil
+  }
+
+  private static func presentShareSheet(value: String, presenter: UIViewController) {
+    let activity = UIActivityViewController(activityItems: [value], applicationActivities: nil)
+    if let popover = activity.popoverPresentationController {
+      popover.sourceView = presenter.view
+      popover.sourceRect = CGRect(
+        x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
+      popover.permittedArrowDirections = []
+    }
+    presenter.present(activity, animated: true)
   }
 
   private static func confirmDestructive(
@@ -13690,6 +14232,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     // --- Coordinator wiring ----------------------------------------------
     coordinator.tabBarController = self
     coordinator.selectedTab = .chats
+    VibeRoomLinkRouter.shared.register(coordinator: coordinator)
 
     // --- Appearance & lifecycle ------------------------------------------
     configureGlobalNavigationBarAppearance()

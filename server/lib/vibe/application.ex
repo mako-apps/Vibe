@@ -52,6 +52,7 @@ defmodule Vibe.Application do
       # Start the scheduled post scheduler
       Vibe.Scheduler,
       Vibe.AgentDeliveryScheduler,
+      Vibe.ChannelAgentScheduler,
       # Start the Story Cleaner
       Vibe.StoryCleaner,
       # Bounded pool for @claude / @codex local agent workers (caps concurrency + cost)
@@ -105,5 +106,4 @@ defmodule Vibe.Application do
         :ok
     end
   end
-
 end

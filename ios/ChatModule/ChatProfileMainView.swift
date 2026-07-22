@@ -1184,6 +1184,12 @@ private enum ChatProfileSwiftUIDestination: Hashable {
   case members
   /// Push (not sheet) — same navigation pattern as New Chat / contact search.
   case addMembers
+  case channelAdmins
+  case channelSubscribers
+  case channelSettings
+  case channelRecentActions
+  /// Full-page edit for group or channel (not a sheet).
+  case editRoom
 
   var transitionID: String {
     switch self {
@@ -1201,6 +1207,16 @@ private enum ChatProfileSwiftUIDestination: Hashable {
       return "group-members"
     case .addMembers:
       return "add-group-members"
+    case .channelAdmins:
+      return "channel-admins"
+    case .channelSubscribers:
+      return "channel-subscribers"
+    case .channelSettings:
+      return "channel-settings"
+    case .channelRecentActions:
+      return "channel-recent-actions"
+    case .editRoom:
+      return "edit-room"
     }
   }
 }
@@ -1268,6 +1284,13 @@ private struct ChatProfileSwiftUIRootView: View {
   var bridgePaired: Bool = false
   var bridgeDeviceLabel: String = ""
   var bridgeRunningTasks: [AgentBridgeRunningTask] = []
+  // Channel policy snapshot (host setters). Defaults keep group paths unchanged.
+  var channelAccessType: String = "private"
+  var channelPublicSlug: String = ""
+  var channelShareLink: String = ""
+  var channelJoinApprovalRequired: Bool = false
+  var channelRestrictSavingContent: Bool = false
+  var channelSubscriberCount: Int? = nil
   let onScroll: (CGFloat) -> Void
   let onNavigationActiveChanged: (Bool) -> Void
   let onCopyUsername: () -> Void
@@ -1278,6 +1301,9 @@ private struct ChatProfileSwiftUIRootView: View {
   /// Fired when the Members destination appears so the host can re-log / hydrate
   /// the roster (empty cache is the usual reason "No members yet" shows).
   var onMembersScreenAppeared: (() -> Void)? = nil
+  /// Local echoes for channel policy toggles (managers only).
+  @State private var joinApprovalLocal: Bool?
+  @State private var restrictSavingLocal: Bool?
 
   @Namespace private var morphNamespace
   @StateObject private var navCoordinator = ChatProfileNavigationCoordinator()
@@ -1315,6 +1341,9 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var intelligenceLocal = AgentBridgeSelectionStore.selectedIntelligence()
   @State private var workModeLocal = AgentBridgeSelectionStore.selectedWorkMode()
   @State private var showAddMembersSheet = false
+  /// Live channel profile from `GET /api/channel/:id` (admins, settings, actions).
+  @State private var channelProfileCache: ChannelProfileService.Profile?
+  @State private var channelSettingsLocal = ChannelProfileService.Settings.default
 
   private var rowFill: Color {
     Color(uiColor: posterGradientColors.0).opacity(isDark ? 0.055 : 0.11)
@@ -1379,12 +1408,49 @@ private struct ChatProfileSwiftUIRootView: View {
   /// count, falling back to the loaded roster. Nil for a 1:1 DM.
   private var groupHeaderSubtitle: String? {
     guard isGroupOrChannel else { return nil }
-    let count = (memberCount ?? 0) > 0 ? (memberCount ?? 0) : groupMembers.count
-    guard count > 0 else { return isChannel ? "Channel" : nil }
+    let count: Int = {
+      if isChannel, let subscriberCount = channelSubscriberCount, subscriberCount > 0 {
+        return subscriberCount
+      }
+      if let memberCount, memberCount > 0 { return memberCount }
+      return groupMembers.count
+    }()
     if isChannel {
       return count == 1 ? "1 subscriber" : "\(count) subscribers"
     }
+    guard count > 0 else { return nil }
     return count == 1 ? "1 member" : "\(count) members"
+  }
+
+  private var effectiveJoinApproval: Bool {
+    joinApprovalLocal ?? channelJoinApprovalRequired
+  }
+
+  private var effectiveRestrictSaving: Bool {
+    restrictSavingLocal ?? channelRestrictSavingContent
+  }
+
+  private var channelTypeLabel: String {
+    let host = channelAccessType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let fromSettings = channelSettingsLocal.channelType
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    let resolved = (host == "public" || host == "private") ? host : fromSettings
+    return resolved == "public" ? "Public" : "Private"
+  }
+
+  private var channelLinkDisplay: String {
+    let share = channelShareLink.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !share.isEmpty { return share }
+    if let invite = channelSettingsLocal.inviteLink?
+      .trimmingCharacters(in: .whitespacesAndNewlines),
+      !invite.isEmpty
+    {
+      return invite
+    }
+    let slug = channelPublicSlug.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !slug.isEmpty { return "vibegram.io/r/\(slug)" }
+    return "Invite link"
   }
 
   /// Committed hero band ≈ 55% of screen (reads taller than half on device).
@@ -1556,11 +1622,13 @@ private struct ChatProfileSwiftUIRootView: View {
                 if !bridgeProvider.isEmpty {
                   defaultViewSection
                 }
-                if bridgeProvider.isEmpty {
+                // Photo/poster: DMs + channels (not bridge agent profiles).
+                if bridgeProvider.isEmpty, !isGroupOrChannel || isChannel {
                   appearanceSection
                 }
-                sharedContentSection
+                // Shared media tabs are DM-only (not group/channel).
                 if !isGroupOrChannel {
+                  sharedContentSection
                   contactActionsSection
                   emergencySection
                 }
@@ -1626,7 +1694,9 @@ private struct ChatProfileSwiftUIRootView: View {
             Button("Search") { onAction("search") }
             if isGroupOrChannel {
               if canManageGroupMembers {
-                Button(isChannel ? "Edit Channel" : "Edit Group") { onAction("editGroup") }
+                Button(isChannel ? "Edit Channel" : "Edit Group") {
+                  navCoordinator.path.append(.editRoom)
+                }
                 if !isChannel {
                   Button("Add Members") { showAddMembersSheet = true }
                 }
@@ -1686,8 +1756,35 @@ private struct ChatProfileSwiftUIRootView: View {
     .onChange(of: navCoordinator.path.isEmpty) { _, isEmpty in
       onNavigationActiveChanged(!isEmpty)
     }
+    .task(id: isChannel ? bridgeChatId : "") {
+      guard isChannel, !bridgeChatId.isEmpty else { return }
+      await loadChannelProfile()
+    }
     .sheet(isPresented: $showAddMembersSheet) {
       addMembersSheetContent
+    }
+  }
+
+  @MainActor
+  private func loadChannelProfile() async {
+    guard let config = AppSessionConfig.current else { return }
+    do {
+      let profile = try await ChannelProfileService.fetchProfile(
+        chatId: bridgeChatId, config: config)
+      channelProfileCache = profile
+      channelSettingsLocal = profile.settings
+      joinApprovalLocal = profile.settings.joinApprovalRequired
+      restrictSavingLocal = profile.settings.restrictSavingContent
+      // Seed description into the note field via host when empty.
+      if note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        let desc = profile.description,
+        !desc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      {
+        // Host owns profileBio; surface via action so UIKit setProfileBio can run.
+        onAction("channelDescription:\(desc)")
+      }
+    } catch {
+      NSLog("[ChannelProfile] load failed chatId=%@ error=%@", bridgeChatId, error.localizedDescription)
     }
   }
 
@@ -2129,61 +2226,22 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  /// Group identity: Edit + Members. Channels: Channel settings + admin control.
+  /// Group: Edit + Members. Channel: description, admins, subscribers, settings.
   @ViewBuilder
   private var groupTopicSection: some View {
-    let hasEdit = canManageGroupMembers
-    let hasMembers = showsMemberList
-    let hasChannelAdmin = showsChannelAdminControls
-    if hasEdit || hasMembers || hasChannelAdmin || isChannel {
-      VStack(alignment: .leading, spacing: 8) {
-        profileSectionHeader(isChannel ? "Channel settings" : "Group")
-        ChatProfileSwiftUISection(fill: rowFill) {
-          if isChannel {
-            // —— Channel control surface (not group Members/Models) ——
+    if isChannel {
+      channelProfileSections
+    } else {
+      let hasEdit = canManageGroupMembers
+      let hasMembers = showsMemberList
+      if hasEdit || hasMembers {
+        VStack(alignment: .leading, spacing: 8) {
+          profileSectionHeader("Group")
+          ChatProfileSwiftUISection(fill: rowFill) {
             if hasEdit {
-              Button { onAction("editGroup") } label: {
-                ChatProfileSwiftUIRow(
-                  title: "Edit channel",
-                  subtitle: "Name, photo, description",
-                  trailingSystemImage: nil,
-                  showsChevron: true,
-                  separatorColor: separatorColor,
-                  isLast: false
-                )
-              }
-              .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-            }
-
-            if hasChannelAdmin {
               Button {
-                onMembersScreenAppeared?()
-                navCoordinator.path.append(.members)
+                navCoordinator.path.append(.editRoom)
               } label: {
-                ChatProfileSwiftUIRow(
-                  title: "Channel control",
-                  subtitle: channelAdminSubtitle,
-                  trailingSystemImage: nil,
-                  showsChevron: true,
-                  separatorColor: separatorColor,
-                  isLast: false
-                )
-              }
-              .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-            }
-
-            ChatProfileSwiftUIRow(
-              title: "Subscribers",
-              subtitle: channelSubscriberCountLabel,
-              trailingSystemImage: nil,
-              showsChevron: false,
-              separatorColor: separatorColor,
-              isLast: true
-            )
-          } else {
-            // —— Group surface ——
-            if hasEdit {
-              Button { onAction("editGroup") } label: {
                 ChatProfileSwiftUIRow(
                   title: "Edit group",
                   subtitle: "Name, photo, description",
@@ -2218,32 +2276,329 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  private var channelAdminSubtitle: String {
-    let total = memberCount ?? groupMembers.count
-    let adminCount = groupMembers.reduce(into: 0) { count, entry in
-      let role =
-        ((entry["role"] as? String)
-          ?? (entry["memberRole"] as? String)
-          ?? (entry["member_role"] as? String)
-          ?? "")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-      if role == "owner" || role == "admin" {
-        count += 1
+  /// Production channel profile body (no username / contact / shared media).
+  @ViewBuilder
+  private var channelProfileSections: some View {
+    let admins = channelAdministrators
+    let humanAdmins = admins.filter { $0.role != "agent_admin" && $0.role != "Agent admin" }
+    let agentAdmins = admins.filter {
+      $0.role == "agent_admin" || $0.role == "Agent admin"
+    }
+    let desc = note.trimmingCharacters(in: .whitespacesAndNewlines)
+    let manager = canManageGroupMembers
+
+    if !desc.isEmpty {
+      VStack(alignment: .leading, spacing: 8) {
+        profileSectionHeader("Description")
+        ChatProfileSwiftUISection(fill: rowFill) {
+          ChatProfileSwiftUIRow(
+            title: "About",
+            subtitle: desc,
+            trailingSystemImage: nil,
+            showsChevron: false,
+            separatorColor: separatorColor,
+            isLast: true
+          )
+        }
       }
     }
-    if total > 0 {
-      return "\(adminCount) admin\(adminCount == 1 ? "" : "s") · \(total) subscriber\(total == 1 ? "" : "s")"
+
+    // Privacy / link / content policy — host-seeded data; mutations emit native events.
+    VStack(alignment: .leading, spacing: 8) {
+      profileSectionHeader("Channel settings")
+      ChatProfileSwiftUISection(fill: rowFill) {
+        ChatProfileSwiftUIRow(
+          title: "Type",
+          trailingText: channelTypeLabel,
+          trailingSystemImage: nil,
+          showsChevron: false,
+          separatorColor: separatorColor,
+          isLast: false
+        )
+
+        Button {
+          onAction("channelLink")
+        } label: {
+          ChatProfileSwiftUIRow(
+            title: "Link",
+            subtitle: channelLinkDisplay,
+            trailingSystemImage: "square.and.arrow.up",
+            showsChevron: false,
+            separatorColor: separatorColor,
+            isLast: !manager
+          )
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+        if manager {
+          Toggle(
+            isOn: Binding(
+              get: { effectiveJoinApproval },
+              set: { next in
+                joinApprovalLocal = next
+                onAction("channelSetting:joinApprovalRequired:\(next ? "1" : "0")")
+              }
+            )
+          ) {
+            VStack(alignment: .leading, spacing: 2) {
+              Text("Approve new subscribers")
+                .font(.system(size: 17, weight: .regular))
+              Text("Join requests need your approval")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+            }
+          }
+          .padding(.horizontal, 22)
+          .padding(.vertical, 12)
+          .overlay(alignment: .bottom) {
+            Rectangle()
+              .fill(separatorColor)
+              .frame(height: 1 / UIScreen.main.scale)
+              .padding(.leading, 22)
+          }
+
+          Toggle(
+            isOn: Binding(
+              get: { effectiveRestrictSaving },
+              set: { next in
+                restrictSavingLocal = next
+                onAction("channelSetting:restrictSavingContent:\(next ? "1" : "0")")
+              }
+            )
+          ) {
+            VStack(alignment: .leading, spacing: 2) {
+              Text("Restrict saving content")
+                .font(.system(size: 17, weight: .regular))
+              Text("Limit saving and forwarding where supported")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+            }
+          }
+          .padding(.horizontal, 22)
+          .padding(.vertical, 12)
+          .overlay(alignment: .bottom) {
+            Rectangle()
+              .fill(separatorColor)
+              .frame(height: 1 / UIScreen.main.scale)
+              .padding(.leading, 22)
+          }
+
+          Button {
+            navCoordinator.path.append(.channelSettings)
+          } label: {
+            ChatProfileSwiftUIRow(
+              title: "More settings",
+              subtitle: "Reactions, discussions…",
+              trailingSystemImage: nil,
+              showsChevron: true,
+              separatorColor: separatorColor,
+              isLast: false
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+          Button {
+            navCoordinator.path.append(.editRoom)
+          } label: {
+            ChatProfileSwiftUIRow(
+              title: "Edit channel",
+              subtitle: "Name, photo, description",
+              trailingSystemImage: nil,
+              showsChevron: true,
+              separatorColor: separatorColor,
+              isLast: true
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+        }
+      }
     }
-    return groupMembersSubtitle
+
+    VStack(alignment: .leading, spacing: 8) {
+      profileSectionHeader("People")
+      ChatProfileSwiftUISection(fill: rowFill) {
+        if manager {
+          Button {
+            navCoordinator.path.append(.channelAdmins)
+          } label: {
+            ChatProfileSwiftUIRow(
+              title: "Administrators",
+              subtitle: channelAdminPeopleSubtitle(
+                humanCount: humanAdmins.count, agentCount: agentAdmins.count),
+              trailingSystemImage: nil,
+              showsChevron: true,
+              separatorColor: separatorColor,
+              isLast: false
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+          Button {
+            navCoordinator.path.append(.channelSubscribers)
+          } label: {
+            ChatProfileSwiftUIRow(
+              title: "Subscribers",
+              subtitle: channelSubscriberCountLabel,
+              trailingSystemImage: nil,
+              showsChevron: true,
+              separatorColor: separatorColor,
+              isLast: false
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+          Button {
+            onAction("channelAgents")
+          } label: {
+            ChatProfileSwiftUIRow(
+              title: "Channel agent",
+              subtitle: agentAdmins.isEmpty
+                ? "Configure agent admin tools and triggers"
+                : "\(agentAdmins.count) agent admin\(agentAdmins.count == 1 ? "" : "s")",
+              trailingSystemImage: nil,
+              showsChevron: true,
+              separatorColor: separatorColor,
+              isLast: true
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+        } else {
+          // Non-managers: read-only type/link above + subscriber count only.
+          ChatProfileSwiftUIRow(
+            title: "Subscribers",
+            subtitle: channelSubscriberCountLabel,
+            trailingSystemImage: nil,
+            showsChevron: false,
+            separatorColor: separatorColor,
+            isLast: true
+          )
+        }
+      }
+    }
+  }
+
+  private func channelAdminPeopleSubtitle(humanCount: Int, agentCount: Int) -> String {
+    var parts: [String] = []
+    if humanCount > 0 {
+      parts.append("\(humanCount) admin\(humanCount == 1 ? "" : "s")")
+    }
+    if agentCount > 0 {
+      parts.append("\(agentCount) agent admin\(agentCount == 1 ? "" : "s")")
+    }
+    if parts.isEmpty { return "No administrators" }
+    return parts.joined(separator: " · ")
   }
 
   private var channelSubscriberCountLabel: String {
-    let total = memberCount ?? groupMembers.count
-    if total > 0 {
-      return "\(total) subscriber\(total == 1 ? "" : "s")"
-    }
+    let total: Int = {
+      if let channelSubscriberCount, channelSubscriberCount > 0 { return channelSubscriberCount }
+      if let memberCount, memberCount > 0 { return memberCount }
+      if let profile = channelProfileCache {
+        return profile.administrators.count + profile.subscribers.count
+      }
+      return groupMembers.count
+    }()
+    if total == 1 { return "1 subscriber" }
+    if total > 0 { return "\(total) subscribers" }
     return "No subscribers yet"
+  }
+
+  private var channelAdministrators: [ChannelProfileService.Member] {
+    if let profile = channelProfileCache {
+      // Keep human admins from API; merge agent_admin from roster when present.
+      var merged = profile.administrators
+      let existing = Set(merged.map { $0.userId.uppercased() })
+      for entry in groupMembers {
+        let role =
+          ((entry["role"] as? String) ?? "")
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+          .lowercased()
+        guard role == "agent_admin" else { continue }
+        let userId =
+          (entry["userId"] as? String)
+          ?? (entry["user_id"] as? String)
+          ?? (entry["id"] as? String)
+        guard let userId, existing.contains(userId.uppercased()) == false else { continue }
+        let name =
+          (entry["name"] as? String)
+          ?? (entry["username"] as? String)
+          ?? userId
+        merged.append(
+          ChannelProfileService.Member(
+            userId: userId,
+            name: name,
+            username: entry["username"] as? String,
+            avatarUrl: entry["avatarUrl"] as? String ?? entry["avatar_url"] as? String,
+            role: "Agent admin"
+          )
+        )
+      }
+      return merged.map { member in
+        if member.role == "agent_admin" {
+          return ChannelProfileService.Member(
+            userId: member.userId,
+            name: member.name,
+            username: member.username,
+            avatarUrl: member.avatarUrl,
+            role: "Agent admin"
+          )
+        }
+        return member
+      }
+    }
+    return groupMembers.compactMap { entry -> ChannelProfileService.Member? in
+      let role =
+        ((entry["role"] as? String) ?? "member")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+      guard role == "owner" || role == "admin" || role == "agent_admin" else { return nil }
+      let userId =
+        (entry["userId"] as? String)
+        ?? (entry["user_id"] as? String)
+        ?? (entry["id"] as? String)
+      guard let userId else { return nil }
+      let name =
+        (entry["name"] as? String)
+        ?? (entry["username"] as? String)
+        ?? userId
+      let displayRole = role == "agent_admin" ? "Agent admin" : role
+      return ChannelProfileService.Member(
+        userId: userId,
+        name: name,
+        username: entry["username"] as? String,
+        avatarUrl: entry["avatarUrl"] as? String ?? entry["avatar_url"] as? String,
+        role: displayRole
+      )
+    }
+  }
+
+  private var channelSubscribers: [ChannelProfileService.Member] {
+    if let profile = channelProfileCache {
+      return profile.subscribers
+    }
+    return groupMembers.compactMap { entry -> ChannelProfileService.Member? in
+      let role =
+        ((entry["role"] as? String) ?? "member")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+      guard role != "owner", role != "admin", role != "agent_admin" else { return nil }
+      let userId =
+        (entry["userId"] as? String)
+        ?? (entry["user_id"] as? String)
+        ?? (entry["id"] as? String)
+      guard let userId else { return nil }
+      let name =
+        (entry["name"] as? String)
+        ?? (entry["username"] as? String)
+        ?? userId
+      return ChannelProfileService.Member(
+        userId: userId,
+        name: name,
+        username: entry["username"] as? String,
+        avatarUrl: entry["avatarUrl"] as? String ?? entry["avatar_url"] as? String,
+        role: role.isEmpty ? "subscriber" : role
+      )
+    }
   }
 
   /// Model configuration: repository + per-agent model menus (model on the right).
@@ -2617,7 +2972,7 @@ private struct ChatProfileSwiftUIRootView: View {
         navCoordinator.path.append(.appearance)
       } label: {
         ChatProfileSwiftUIRow(
-          title: "Contact Photo & Poster",
+          title: isChannel ? "Photo & Poster" : "Contact Photo & Poster",
           leading: AnyView(
             ChatProfileMiniAvatar(
               text: avatarDisplayText,
@@ -2818,6 +3173,71 @@ private struct ChatProfileSwiftUIRootView: View {
         separatorColor: separatorColor,
         onContentPressed: onContentPressed
       )
+    case .channelAdmins:
+      // Human admins first, then agent admins (role label already "Agent admin").
+      let admins = channelAdministrators
+      let humans = admins.filter {
+        $0.role != "agent_admin" && $0.role != "Agent admin"
+      }
+      let agents = admins.filter {
+        $0.role == "agent_admin" || $0.role == "Agent admin"
+      }
+      ChannelMemberListPage(
+        title: "Administrators",
+        members: humans + agents,
+        emptyText: "No administrators yet"
+      )
+    case .channelSubscribers:
+      ChannelMemberListPage(
+        title: "Subscribers",
+        members: channelSubscribers,
+        emptyText: "No subscribers yet"
+      )
+    case .channelSettings:
+      ChannelSettingsPage(
+        chatId: bridgeChatId,
+        channelName: profileName,
+        canManage: canManageGroupMembers,
+        settings: $channelSettingsLocal,
+        onEditName: {
+          navCoordinator.path.append(.editRoom)
+        },
+        onOpenAppearance: {
+          navCoordinator.path.append(.appearance)
+        },
+        onOpenRecentActions: {
+          navCoordinator.path.append(.channelRecentActions)
+        },
+        onSettingsChanged: { next in
+          channelSettingsLocal = next
+        }
+      )
+    case .channelRecentActions:
+      ChannelRecentActionsPage(actions: channelProfileCache?.recentActions ?? [])
+    case .editRoom:
+      if let config = AppSessionConfig.current {
+        RoomEditPage(
+          config: config,
+          chatId: bridgeChatId,
+          isChannel: isChannel,
+          initialName: profileName,
+          initialDescription: note,
+          initialAvatarUri: avatarUri
+        ) { name, description, avatarUrl in
+          onAction("roomEdited:\(name)")
+          if !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            onAction("channelDescription:\(description)")
+          }
+          if let avatarUrl, !avatarUrl.isEmpty {
+            onAction("roomAvatar:\(avatarUrl)")
+          }
+          if !navCoordinator.path.isEmpty {
+            navCoordinator.path.removeLast()
+          }
+        }
+      } else {
+        Text("Not signed in")
+      }
     case .members:
       // Snapshot items once for this destination body — avoid recomputing
       // [String: Any] payloads on every AttributeGraph pass (ForEach churn).
@@ -2870,6 +3290,7 @@ private struct ChatProfileSwiftUIRootView: View {
         switch item.roleLabel.lowercased() {
         case "owner": return "owner"
         case "admin": return "admin"
+        case "agent admin", "agent_admin": return "agent_admin"
         case "subscriber": return "subscriber"
         default: return "member"
         }
@@ -2889,7 +3310,9 @@ private struct ChatProfileSwiftUIRootView: View {
         id: item.userId,
         title: item.name,
         subtitle: item.roleLabel,
-        systemImage: item.isAdmin ? "star.circle.fill" : "person.circle",
+        systemImage: item.isAdmin || roleKey == "agent_admin"
+          ? "star.circle.fill"
+          : "person.circle",
         avatarUri: item.avatarUri,
         roleKey: roleKey,
         payload: payload
@@ -2929,6 +3352,7 @@ private func chatProfileMemberItems(from raw: [[String: Any]]) -> [ChatGroupMemb
     switch rawRole {
     case "owner": roleLabel = "Owner"
     case "admin": roleLabel = "Admin"
+    case "agent_admin": roleLabel = "Agent admin"
     case "subscriber": roleLabel = "Subscriber"
     case "member", "": roleLabel = "Member"
     default: roleLabel = rawRole.capitalized
@@ -2995,6 +3419,13 @@ private struct ChatProfileMembersListView: View {
         if !admins.isEmpty {
           plainSection(title: "Admins", rows: admins)
         }
+        // Agent publishers group separately from human admins.
+        if !agentAdmins.isEmpty {
+          plainSection(
+            title: agentAdmins.count == 1 ? "Agent admin" : "Agent admins",
+            rows: agentAdmins
+          )
+        }
         if !membersOnly.isEmpty {
           let memberTitle: String = {
             if isChannel {
@@ -3044,8 +3475,13 @@ private struct ChatProfileMembersListView: View {
   private var admins: [ChatProfileSwiftUIContentItem] {
     cleanedItems.filter { $0.roleKey == "admin" }
   }
+  private var agentAdmins: [ChatProfileSwiftUIContentItem] {
+    cleanedItems.filter { $0.roleKey == "agent_admin" }
+  }
   private var membersOnly: [ChatProfileSwiftUIContentItem] {
-    cleanedItems.filter { $0.roleKey != "owner" && $0.roleKey != "admin" }
+    cleanedItems.filter {
+      $0.roleKey != "owner" && $0.roleKey != "admin" && $0.roleKey != "agent_admin"
+    }
   }
 
   @ViewBuilder
@@ -5248,6 +5684,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private var groupMembers: [[String: Any]] = []
   /// Sticky role so incomplete member payloads cannot demote admin→member (or empty).
   private var stickyMyGroupRole: String = ""
+  // Channel policy snapshot for host setters → SwiftUI root (additive).
+  private var channelAccessType: String = "private"
+  private var channelPublicSlug: String = ""
+  private var channelShareLink: String = ""
+  private var channelJoinApprovalRequired = false
+  private var channelRestrictSavingContent = false
+  private var channelSubscriberCount: Int?
 
   private var engineChatId = ""
   private var engineMyUserId = ""
@@ -5865,6 +6308,40 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     renderSwiftUIProfile()
   }
 
+  /// Host-provided channel policy snapshot (additive; does not rename existing APIs).
+  /// Lead wires this from home row / `GET /api/channel/:id` without profile networking.
+  func setChannelSettings(
+    accessType: String? = nil,
+    publicSlug: String? = nil,
+    shareLink: String? = nil,
+    joinApprovalRequired: Bool? = nil,
+    restrictSavingContent: Bool? = nil,
+    subscriberCount: Int? = nil
+  ) {
+    if let accessType {
+      let trimmed = accessType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      if !trimmed.isEmpty {
+        channelAccessType = trimmed
+      }
+    }
+    if let publicSlug {
+      channelPublicSlug = publicSlug.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    if let shareLink {
+      channelShareLink = shareLink.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    if let joinApprovalRequired {
+      channelJoinApprovalRequired = joinApprovalRequired
+    }
+    if let restrictSavingContent {
+      channelRestrictSavingContent = restrictSavingContent
+    }
+    if let subscriberCount {
+      channelSubscriberCount = max(0, subscriberCount)
+    }
+    renderSwiftUIProfile()
+  }
+
   /// Re-hydrate the group roster when the Members screen opens empty (stale home
   /// cache that omitted `members`). Tries on-disk cache first, then a live home
   /// fetch. Always logs so device console shows the path taken.
@@ -6160,6 +6637,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       )?.id ?? "",
       avatarUri ?? "",
       profileBio,
+      channelAccessType,
+      channelPublicSlug,
+      channelShareLink,
+      "\(channelJoinApprovalRequired)",
+      "\(channelRestrictSavingContent)",
+      "\(channelSubscriberCount ?? -1)",
     ].joined(separator: "|")
     // Skip no-op host reassignments that recreate the ScrollView and jump offset.
     if signature == lastSwiftUIRenderSignature, swiftUIHostingController != nil {
@@ -6201,6 +6684,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       bridgePaired: bridgePaired,
       bridgeDeviceLabel: bridgeDeviceLabel,
       bridgeRunningTasks: bridgeRunningTasks,
+      channelAccessType: channelAccessType,
+      channelPublicSlug: channelPublicSlug,
+      channelShareLink: channelShareLink,
+      channelJoinApprovalRequired: channelJoinApprovalRequired,
+      channelRestrictSavingContent: channelRestrictSavingContent,
+      channelSubscriberCount: channelSubscriberCount,
       onScroll: { [weak self] offset in
         guard let self else { return }
         self.swiftUIScrollOffset = offset
@@ -6349,9 +6838,57 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         // Sheet titles (Edit Channel vs Edit Group) must not depend only on
         // ChatRoute — that can lag a stale home row without type/isChannel.
         "isChannel": isChannel,
+        // Prefer full-page edit inside the profile NavigationStack when available.
+        "preferPage": true,
       ])
+    case let value where value.hasPrefix("channelDescription:"):
+      let desc = String(value.dropFirst("channelDescription:".count))
+      setProfileBio(desc)
+    case let value where value.hasPrefix("roomEdited:"):
+      let name = String(value.dropFirst("roomEdited:".count))
+      if !name.isEmpty {
+        setProfileName(name)
+        setHeaderTitle(name)
+      }
+      renderSwiftUIProfile()
+    case let value where value.hasPrefix("roomAvatar:"):
+      let url = String(value.dropFirst("roomAvatar:".count))
+      if !url.isEmpty {
+        setAvatarUri(url)
+      }
     case "openMembers":
       presentGroupMembersUIKit()
+    case "channelLink":
+      onNativeEvent([
+        "type": "channelLink",
+        "chatId": engineChatId,
+        "shareLink": channelShareLink,
+        "publicSlug": channelPublicSlug,
+        "accessType": channelAccessType,
+      ])
+    case "channelAgents":
+      onNativeEvent([
+        "type": "channelAgents",
+        "chatId": engineChatId,
+      ])
+    case let value where value.hasPrefix("channelSetting:"):
+      // Format: channelSetting:<setting>:<0|1>
+      let body = String(value.dropFirst("channelSetting:".count))
+      let parts = body.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+      let setting = parts.first.map(String.init) ?? ""
+      let rawValue = parts.count > 1 ? String(parts[1]) : ""
+      let boolValue = rawValue == "1" || rawValue.lowercased() == "true"
+      if setting == "joinApprovalRequired" {
+        channelJoinApprovalRequired = boolValue
+      } else if setting == "restrictSavingContent" {
+        channelRestrictSavingContent = boolValue
+      }
+      onNativeEvent([
+        "type": "channelSetting",
+        "chatId": engineChatId,
+        "setting": setting,
+        "value": boolValue,
+      ])
     default:
       break
     }

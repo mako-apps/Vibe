@@ -62,6 +62,7 @@ defmodule Vibe.AI.AgentEventRuntime do
       else
         with {:ok, normalized} <- normalize_event(agent, integration, params),
              :ok <- ensure_destination_chat(agent, normalized.destination_chat_id),
+             :ok <- ensure_event_trigger(agent, normalized.destination_chat_id),
              {:ok, result} <- persist_event(agent, integration, normalized) do
           Logger.info(
             "[InboxBanner] ingest result agent_id=#{inspect(agent.id)} " <>
@@ -777,6 +778,12 @@ defmodule Vibe.AI.AgentEventRuntime do
     if Chat.is_participant?(chat_id, agent.agent_user_id),
       do: :ok,
       else: {:error, :chat_not_attached}
+  end
+
+  defp ensure_event_trigger(%Agent{} = agent, chat_id) do
+    if Chat.channel_agent_event_enabled?(chat_id, agent),
+      do: :ok,
+      else: {:error, :event_trigger_not_enabled}
   end
 
   defp upsert_thread!(

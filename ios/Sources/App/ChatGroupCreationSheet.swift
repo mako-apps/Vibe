@@ -11,11 +11,12 @@ struct ChatGroupCreationSheet: View {
   let onCreated: (ChatRoute) -> Void
 
   enum Step: Hashable {
-    case info
+    case members
   }
 
   @State private var path = NavigationPath()
   @State private var groupName = ""
+  @State private var groupDescription = ""
   @State private var selectedMembers = Set<ContactSearchUser>()
   @State private var searchQuery = ""
   @FocusState private var isQueryFieldFocused: Bool
@@ -33,19 +34,24 @@ struct ChatGroupCreationSheet: View {
     AppThemePalette.resolve(for: colorScheme)
   }
 
-  private func contactUser(for row: ChatHomeListRow) -> ContactSearchUser {
+  private var trimmedGroupName: String {
+    groupName.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private func contactUser(for row: ChatHomeListRow) -> ContactSearchUser? {
     ContactSearchUser(payload: [
       "userId": row.peerUserId ?? row.chatId,
       "username": row.title,
       "profileImage": row.avatarUri ?? "",
       "isAgent": row.isBuiltInAgentSurface || row.isBridgeAgentSurface,
-      "tier": row.isGoldTier ? "gold" : "free"
-    ])!
+      "tier": row.isGoldTier ? "gold" : "free",
+    ])
   }
 
   var body: some View {
     NavigationStack(path: $path) {
-      membersStepView
+      // Identity first (avatar / name / optional description), then members.
+      infoStepView
         .background(palette.background.ignoresSafeArea())
         .navigationTitle("New Group")
         .navigationBarTitleDisplayMode(.inline)
@@ -59,25 +65,33 @@ struct ChatGroupCreationSheet: View {
           }
           ToolbarItem(placement: .topBarTrailing) {
             Button("Next") {
-              path.append(Step.info)
+              path.append(Step.members)
             }
-            .disabled(selectedMembers.isEmpty)
+            .disabled(trimmedGroupName.isEmpty)
           }
         }
         .navigationDestination(for: Step.self) { step in
-          if step == .info {
-            infoStepView
+          if step == .members {
+            membersStepView
               .background(palette.background.ignoresSafeArea())
-              .navigationTitle("New Group")
+              .navigationTitle("Add Members")
               .navigationBarTitleDisplayMode(.inline)
               .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                   Button("Create") {
                     Task { await createGroup() }
                   }
-                  .disabled(isCreating || groupName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                  .disabled(isCreating || trimmedGroupName.isEmpty || selectedMembers.isEmpty)
                 }
               }
+          }
+        }
+        .onChange(of: avatarItem) { _, newItem in
+          Task {
+            guard let data = try? await newItem?.loadTransferable(type: Data.self) else { return }
+            guard let uiImage = UIImage(data: data) else { return }
+            self.avatarData = data
+            self.avatarImage = Image(uiImage: uiImage)
           }
         }
         .overlay {
@@ -121,7 +135,7 @@ struct ChatGroupCreationSheet: View {
             groupedUsersSection(users: searchResults)
           }
         } else {
-          groupedUsersSection(users: homeRows.map(contactUser(for:)))
+          groupedUsersSection(users: homeRows.compactMap(contactUser(for:)))
         }
       }
       .listStyle(.plain)
@@ -153,7 +167,7 @@ struct ChatGroupCreationSheet: View {
 
     return ForEach(sortedKeys, id: \.self) { letter in
       Section(letter) {
-        ForEach(grouped[letter]!) { user in
+        ForEach(grouped[letter] ?? [], id: \.userID) { user in
           memberRow(user: user)
         }
       }
@@ -177,69 +191,59 @@ struct ChatGroupCreationSheet: View {
   }
 
   private var infoStepView: some View {
-    VStack(alignment: .leading, spacing: 20) {
-      Text("Enter a name and add a profile image for the group.")
-        .font(.subheadline)
-        .foregroundStyle(palette.secondaryText)
-        .padding(.horizontal)
-        .padding(.top)
+    ScrollView {
+      VStack(alignment: .leading, spacing: 20) {
+        Text("Enter a name and add a profile image for the group.")
+          .font(.subheadline)
+          .foregroundStyle(palette.secondaryText)
+          .padding(.horizontal)
+          .padding(.top)
 
-      VStack(spacing: 0) {
-        HStack(spacing: 16) {
-          PhotosPicker(selection: $avatarItem, matching: .images) {
-            if let avatarImage {
-              avatarImage
-                .resizable()
-                .scaledToFill()
-                .frame(width: 56, height: 56)
-                .clipShape(Circle())
-            } else {
-              Image(systemName: "camera.fill")
-                .font(.title2)
-                .foregroundStyle(palette.accent)
-                .frame(width: 56, height: 56)
-                .background(palette.accent.opacity(0.12))
-                .clipShape(Circle())
+        VStack(spacing: 0) {
+          HStack(spacing: 16) {
+            PhotosPicker(selection: $avatarItem, matching: .images) {
+              if let avatarImage {
+                avatarImage
+                  .resizable()
+                  .scaledToFill()
+                  .frame(width: 56, height: 56)
+                  .clipShape(Circle())
+              } else {
+                Image(systemName: "camera.fill")
+                  .font(.title2)
+                  .foregroundStyle(palette.accent)
+                  .frame(width: 56, height: 56)
+                  .background(palette.accent.opacity(0.12))
+                  .clipShape(Circle())
+              }
             }
-          }
-          .buttonStyle(.plain)
+            .buttonStyle(.plain)
 
-          TextField("Group name", text: $groupName)
+            TextField("Group name", text: $groupName)
+              .font(.body)
+              .submitLabel(.next)
+          }
+          .padding()
+
+          Divider().padding(.leading, 16)
+
+          TextField("Description (optional)", text: $groupDescription, axis: .vertical)
             .font(.body)
-            .submitLabel(.done)
+            .lineLimit(2...5)
+            .padding()
         }
-        .padding()
         .background(palette.card)
         .cornerRadius(12)
-      }
-      .padding(.horizontal)
-      
-      Text("Selected Members")
-        .font(.headline)
         .padding(.horizontal)
-        .padding(.top, 10)
 
-      List {
-        ForEach(Array(selectedMembers)) { user in
-          ContactSearchResultRow(user: user, isSaved: false, palette: palette)
+        if let errorMessage {
+          Text(errorMessage)
+            .font(.footnote)
+            .foregroundStyle(.red)
+            .padding(.horizontal)
         }
-      }
-      .listStyle(.plain)
-      .frame(maxHeight: .infinity)
 
-      if let errorMessage {
-        Text(errorMessage)
-          .font(.footnote)
-          .foregroundStyle(.red)
-          .padding(.horizontal)
-      }
-    }
-    .onChange(of: avatarItem) { _, newItem in
-      Task {
-        guard let data = try? await newItem?.loadTransferable(type: Data.self) else { return }
-        guard let uiImage = UIImage(data: data) else { return }
-        self.avatarData = data
-        self.avatarImage = Image(uiImage: uiImage)
+        Spacer(minLength: 24)
       }
     }
   }
@@ -287,33 +291,47 @@ struct ChatGroupCreationSheet: View {
 
       let members = Array(selectedMembers)
       let memberIds = members.map { $0.userID }
+      let trimmedDescription = groupDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+      let descriptionPayload: String? = trimmedDescription.isEmpty ? nil : trimmedDescription
       let result = try await ChatRoomCreateService.create(
         kind: .group,
         config: config,
-        name: groupName,
+        name: trimmedGroupName,
+        description: descriptionPayload,
         memberIds: memberIds,
         avatarUrl: remoteAvatarUrl
       )
 
-      // Known immediately from what we just picked — no need to wait for the next
-      // home-list refresh before the group profile shows real members.
+      // Prefer server roster when present; otherwise local selection + owner.
       let ownMember: [String: Any] = [
         "userId": config.userID,
         "name": config.name ?? config.username ?? "You",
-        "role": "owner"
+        "role": "owner",
       ]
       let otherMembers: [[String: Any]] = members.map {
         ["userId": $0.userID, "name": $0.username, "role": "member"]
       }
+      let localFallback = [ownMember] + otherMembers
+      let resolvedMembers: [[String: Any]] = {
+        let fromResult = result.members
+        if !fromResult.isEmpty { return fromResult }
+        return localFallback
+      }()
+      let avatar = result.avatarUrl ?? remoteAvatarUrl
+      let role = result.role ?? "owner"
 
       let route = ChatRoute(
         chatId: result.chatID,
         title: result.name,
         peerUserId: nil,
-        avatarURI: remoteAvatarUrl,
+        avatarURI: avatar,
         isGroup: true,
+        myRole: role,
         initialRows: [],
-        members: [ownMember] + otherMembers
+        members: resolvedMembers,
+        roomDescription: result.roomDescription ?? descriptionPayload,
+        memberCount: result.memberCount ?? resolvedMembers.count,
+        createdAt: result.createdAt
       )
       onCreated(route)
       dismiss()

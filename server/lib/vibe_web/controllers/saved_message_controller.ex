@@ -17,7 +17,14 @@ defmodule VibeWeb.SavedMessageController do
     attrs = Map.put(params, "user_id", conn.assigns.current_user.id)
 
     case Chat.save_message(attrs) do
-      {:ok, message} -> json(conn, %{data: message})
+      {:ok, message} ->
+        json(conn, %{data: message})
+
+      {:error, :content_saving_restricted} ->
+        conn
+        |> put_status(:forbidden)
+        |> json(%{error: "Content protection is enabled for this channel"})
+
       {:error, _changeset} ->
         conn |> put_status(:unprocessable_entity) |> json(%{error: "Failed to save"})
     end
