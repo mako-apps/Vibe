@@ -358,6 +358,11 @@ struct AgentBridgeHistorySession: Identifiable, Hashable {
   let isRunning: Bool
   let taskId: String?
   let sessionId: String?
+  /// Bridge-reported model id for this session (live task or archived transcript).
+  var model: String? = nil
+  /// Bridge-reported thinking/reasoning effort (`low`…`max`). Nil when unknown —
+  /// never invent a mobile default for archived rows.
+  var reasoningEffort: String? = nil
   /// Non-nil when this session's run is blocked on a still-pending ask/command
   /// approval ("ask" | "command" | "plan") — the bridge badges it in the list reply.
   var pendingAskKind: String? = nil
@@ -380,6 +385,46 @@ struct AgentBridgeHistorySession: Identifiable, Hashable {
     let path = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
     if !path.isEmpty { return URL(fileURLWithPath: path).lastPathComponent }
     return "Computer"
+  }
+
+  /// Compact human label for the history row, e.g. `Opus 4.6 · High Thinking`.
+  /// Omits the thinking segment when effort is missing or unmapped.
+  func configurationLabel(provider: String) -> String? {
+    AgentBridgeSessionConfiguration.compactLabel(
+      provider: provider,
+      model: model,
+      reasoningEffort: reasoningEffort
+    )
+  }
+}
+
+/// Shared formatter for bridge-reported model + thinking effort.
+enum AgentBridgeSessionConfiguration {
+  /// `Opus 4.6 · High Thinking` / `GPT-5.6 · Medium Thinking` / model-only when effort unknown.
+  static func compactLabel(
+    provider: String,
+    model: String?,
+    reasoningEffort: String?
+  ) -> String? {
+    let modelId = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let modelPart: String? = {
+      guard !modelId.isEmpty else { return nil }
+      let title = AgentBridgeSelectionStore.modelTitle(provider: provider, model: modelId)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      return title.isEmpty ? modelId : title
+    }()
+    let effortPart: String? = {
+      guard let level = AgentBridgeIntelligenceLevel.fromProviderEffort(reasoningEffort) else {
+        return nil
+      }
+      return "\(level.title) Thinking"
+    }()
+    switch (modelPart, effortPart) {
+    case let (m?, e?): return "\(m) · \(e)"
+    case let (m?, nil): return m
+    case let (nil, e?): return e
+    default: return nil
+    }
   }
 }
 
@@ -904,10 +949,19 @@ struct AgentBridgeHistoryInlineView: View {
                 .controlSize(.small)
                 .tint(.green)
             }
-            Text(session.topic)
-              .font(.system(size: 18, weight: .regular))
-              .foregroundStyle(palette.text)
-              .lineLimit(2)
+            if let topic = visibleTopic(session.topic) {
+              Text(topic)
+                .font(.system(size: 18, weight: .regular))
+                .foregroundStyle(palette.text)
+                .lineLimit(2)
+            }
+          }
+          if let config = session.configurationLabel(provider: provider) {
+            Text(config)
+              .font(.system(size: 12.5, weight: .medium))
+              .foregroundStyle(palette.secondaryText)
+              .lineLimit(1)
+              .accessibilityLabel("Session configuration: \(config)")
           }
           HStack(spacing: 6) {
             // A run blocked on an Approve/Deny (ask/command/plan) outranks the plain
@@ -942,6 +996,18 @@ struct AgentBridgeHistoryInlineView: View {
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
+  }
+
+  /// Hide transport/action copy that older payloads used as a synthetic title. It is
+  /// not conversation history and should never become a visible fallback row label.
+  private func visibleTopic(_ raw: String) -> String? {
+    let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !topic.isEmpty else { return nil }
+    let normalized = topic.lowercased()
+    if normalized == "load session in chat" || normalized == "load this session in chat" {
+      return nil
+    }
+    return topic
   }
 
   private func requestList() {
@@ -1135,6 +1201,9 @@ struct AgentBridgeHistoryInlineView: View {
       if !task.chatId.isEmpty && !chatId.isEmpty && task.chatId != chatId { return nil }
       let id = task.sessionId?.isEmpty == false ? task.sessionId! : "running:\(task.taskId)"
       let listed = listedById[id]
+      // Live task model/effort wins when present; otherwise keep archived metadata.
+      let mergedModel = firstText(task.model, listed?.model)
+      let mergedEffort = firstText(task.effectiveReasoningEffort, listed?.reasoningEffort)
       return AgentBridgeHistorySession(
         id: id,
         // A matching history row is the conversation source of truth: it carries
@@ -1159,6 +1228,8 @@ struct AgentBridgeHistoryInlineView: View {
         isRunning: true,
         taskId: task.taskId,
         sessionId: task.sessionId,
+        model: mergedModel.isEmpty ? nil : mergedModel,
+        reasoningEffort: mergedEffort.isEmpty ? nil : mergedEffort,
         pendingAskKind: listed?.pendingAskKind
       )
     }
@@ -1194,6 +1265,12 @@ struct AgentBridgeHistoryInlineView: View {
     // desktop's own terminal, which never enter the bridge's runningTasks list.
     // Honor either key so older bridges (no `live`) still parse.
     let live = (item["live"] as? Bool) ?? (item["isRunning"] as? Bool) ?? false
+    let model = Self.nonEmptyString(item["model"])
+    let reasoningEffort = Self.nonEmptyString(
+      item["reasoningEffort"]
+        ?? item["reasoning_effort"]
+        ?? item["agentBridgeReasoningEffort"]
+    )
     return AgentBridgeHistorySession(
       id: id,
       topic: (item["topic"] as? String) ?? "Untitled",
@@ -1204,12 +1281,26 @@ struct AgentBridgeHistoryInlineView: View {
       isRunning: live,
       taskId: nil,
       sessionId: id,
+      model: model,
+      reasoningEffort: reasoningEffort,
       pendingAskKind: {
         let kind = ((item["pendingAskKind"] as? String) ?? "")
           .trimmingCharacters(in: .whitespacesAndNewlines)
         return kind.isEmpty ? nil : kind
       }()
     )
+  }
+
+  private static func nonEmptyString(_ value: Any?) -> String? {
+    if let text = value as? String {
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let number = value as? NSNumber {
+      let text = number.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+      return text.isEmpty ? nil : text
+    }
+    return nil
   }
 
   /// `JSONSerialization` normally bridges a nested list directly to
@@ -1329,6 +1420,8 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     )
     controller.agentBridgeChatId = chatId
     controller.agentBridgeProvider = provider
+    controller.runModel = session.model
+    controller.runReasoningEffort = session.reasoningEffort
     controller.avatarTitle = AgentBridgeProfile.displayName(for: provider)
     controller.avatarChatId = chatId
     controller.onNewChat = { [weak coordinator] in coordinator?.startNewChat() }

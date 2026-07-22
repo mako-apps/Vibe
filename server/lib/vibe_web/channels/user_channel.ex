@@ -3,6 +3,7 @@ defmodule VibeWeb.UserChannel do
   require Logger
   alias VibeWeb.Presence
   alias Vibe.Accounts
+  alias Vibe.AgentBridge
   alias Vibe.Notifications
 
   @impl true
@@ -21,6 +22,13 @@ defmodule VibeWeb.UserChannel do
   def handle_info(:after_join, socket) do
     user_id = socket.assigns.user_id
     user = Accounts.get_user(user_id)
+
+    # Watch this user's bridge topic so computer-online / repo / running-task
+    # changes reach the phone as a push. Presence emits a diff for joins, leaves
+    # AND metadata updates, so this one subscription replaces the client's poll of
+    # /api/agent-bridge/status. The topic itself is low volume — agent output is
+    # broadcast on chat:<id>, not here.
+    Phoenix.PubSub.subscribe(Vibe.PubSub, AgentBridge.topic(user_id))
 
     # Track this user's presence immediately (fast, no DB)
     if user && user.show_online_status do
@@ -70,6 +78,25 @@ defmodule VibeWeb.UserChannel do
       online_friend_ids: online_friend_ids
     })
 
+    {:noreply, socket}
+  end
+
+  # A computer joined/left the bridge, or updated its repos / running tasks.
+  # Push the fresh status so the phone never has to poll for it.
+  @impl true
+  def handle_info(
+        %Phoenix.Socket.Broadcast{topic: "bridge:" <> _, event: "presence_diff"},
+        socket
+      ) do
+    push(socket, "bridge-status", AgentBridge.status_for_push(socket.assigns.user_id))
+    {:noreply, socket}
+  end
+
+  # Everything else on the bridge topic (run_task fan-out to the daemon) is not
+  # this channel's business — subscribing is how we observe Presence, not a claim
+  # on the topic's other traffic.
+  @impl true
+  def handle_info(%Phoenix.Socket.Broadcast{topic: "bridge:" <> _}, socket) do
     {:noreply, socket}
   end
 

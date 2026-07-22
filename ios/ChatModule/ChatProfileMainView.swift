@@ -6,6 +6,7 @@ import PhotosUI
 enum ChatProfileAppearanceMode: String, CaseIterable, Identifiable {
   case avatar
   case poster
+  case banner
 
   var id: String { rawValue }
 
@@ -15,7 +16,33 @@ enum ChatProfileAppearanceMode: String, CaseIterable, Identifiable {
       return "Avatar"
     case .poster:
       return "Poster"
+    case .banner:
+      return "Banner"
     }
+  }
+}
+
+enum ChatProfileBannerStyle: String, CaseIterable, Identifiable {
+  case solid
+  case gradient
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .solid:
+      return "Solid"
+    case .gradient:
+      return "Gradient"
+    }
+  }
+
+  /// Defaults missing/unknown values to `.gradient`.
+  static func style(id: String?) -> ChatProfileBannerStyle {
+    guard let id, let style = allCases.first(where: { $0.rawValue == id }) else {
+      return .gradient
+    }
+    return style
   }
 }
 
@@ -29,6 +56,11 @@ struct ChatProfileAppearanceSelection: Codable, Equatable {
   var posterCustomStartHex: String?
   var posterCustomEndHex: String?
   var posterImageData: Data?
+  /// Optional so older UserDefaults payloads decode without these keys.
+  var bannerPaletteID: String?
+  var bannerStyleID: String?
+  var bannerCustomStartHex: String?
+  var bannerCustomEndHex: String?
 
   static let `default` = ChatProfileAppearanceSelection(
     avatarPaletteID: ChatProfileAppearancePalette.defaultAvatarID,
@@ -39,7 +71,11 @@ struct ChatProfileAppearanceSelection: Codable, Equatable {
     avatarCustomEndHex: nil,
     posterCustomStartHex: nil,
     posterCustomEndHex: nil,
-    posterImageData: nil
+    posterImageData: nil,
+    bannerPaletteID: nil,
+    bannerStyleID: nil,
+    bannerCustomStartHex: nil,
+    bannerCustomEndHex: nil
   )
 }
 
@@ -81,21 +117,23 @@ struct ChatProfileAppearancePalette: Identifiable, Equatable {
   static let defaultPosterID = "poster-soft-neutral"
 
   static let all: [ChatProfileAppearancePalette] = [
-    ChatProfileAppearancePalette(id: "warm-gold", topHex: "#F1C766", bottomHex: "#8B411B"),
-    ChatProfileAppearancePalette(id: "aurora", topHex: "#8B4CF5", bottomHex: "#008C72"),
-    ChatProfileAppearancePalette(id: "lime", topHex: "#F0DB35", bottomHex: "#098B27"),
-    ChatProfileAppearancePalette(id: "ocean", topHex: "#23C08D", bottomHex: "#0057A8"),
-    ChatProfileAppearancePalette(id: "ember", topHex: "#3E8B69", bottomHex: "#D64A12"),
-    ChatProfileAppearancePalette(id: "rose", topHex: "#F39C62", bottomHex: "#7A1E83"),
-    ChatProfileAppearancePalette(id: "midnight", topHex: "#2F74D0", bottomHex: "#071B65"),
-    ChatProfileAppearancePalette(id: "earth", topHex: "#8C735C", bottomHex: "#4B2413"),
-    ChatProfileAppearancePalette(id: "graphite", topHex: "#727A7D", bottomHex: "#06131B"),
-    ChatProfileAppearancePalette(id: "ruby", topHex: "#B94F55", bottomHex: "#6A0808"),
-    ChatProfileAppearancePalette(id: "teal", topHex: "#35A7A5", bottomHex: "#053746"),
-    ChatProfileAppearancePalette(id: "mint", topHex: "#16C995", bottomHex: "#007D4E"),
-    ChatProfileAppearancePalette(id: "coral", topHex: "#F0516A", bottomHex: "#B71210"),
-    ChatProfileAppearancePalette(id: "marigold", topHex: "#FFE154", bottomHex: "#F0830C"),
-    ChatProfileAppearancePalette(id: "steel", topHex: "#8793A1", bottomHex: "#071026"),
+    // Soft, closely related color pairs keep fallback avatars luminous instead of
+    // producing a hard two-tone split. Existing IDs stay stable for saved selections.
+    ChatProfileAppearancePalette(id: "warm-gold", topHex: "#FFD77A", bottomHex: "#F4A65E"),
+    ChatProfileAppearancePalette(id: "aurora", topHex: "#B68AF4", bottomHex: "#7D91EA"),
+    ChatProfileAppearancePalette(id: "lime", topHex: "#C4DC78", bottomHex: "#70BE7D"),
+    ChatProfileAppearancePalette(id: "ocean", topHex: "#70D8CD", bottomHex: "#4CA7D8"),
+    ChatProfileAppearancePalette(id: "ember", topHex: "#86C5A5", bottomHex: "#EE7C62"),
+    ChatProfileAppearancePalette(id: "rose", topHex: "#F6A67F", bottomHex: "#D975C9"),
+    ChatProfileAppearancePalette(id: "midnight", topHex: "#78A5F5", bottomHex: "#5E72DC"),
+    ChatProfileAppearancePalette(id: "earth", topHex: "#C9A58A", bottomHex: "#9C7464"),
+    ChatProfileAppearancePalette(id: "graphite", topHex: "#A0A8B2", bottomHex: "#6D7886"),
+    ChatProfileAppearancePalette(id: "ruby", topHex: "#ED8491", bottomHex: "#C9586D"),
+    ChatProfileAppearancePalette(id: "teal", topHex: "#6BCDC9", bottomHex: "#41A9B7"),
+    ChatProfileAppearancePalette(id: "mint", topHex: "#79DCB3", bottomHex: "#3DB98A"),
+    ChatProfileAppearancePalette(id: "coral", topHex: "#FF8B6B", bottomHex: "#FF5E79"),
+    ChatProfileAppearancePalette(id: "marigold", topHex: "#FFE17E", bottomHex: "#F5B15C"),
+    ChatProfileAppearancePalette(id: "steel", topHex: "#A4B7CF", bottomHex: "#758EAF"),
     ChatProfileAppearancePalette(id: "poster-soft-neutral", topHex: "#DCD7CF", bottomHex: "#A9876F"),
     ChatProfileAppearancePalette(id: "poster-black", topHex: "#050507", bottomHex: "#000000"),
   ]
@@ -112,13 +150,35 @@ struct ChatProfileAppearancePalette: Identifiable, Equatable {
     for selection: ChatProfileAppearanceSelection,
     mode: ChatProfileAppearanceMode
   ) -> (UIColor, UIColor) {
-    let palette = palette(id: mode == .avatar ? selection.avatarPaletteID : selection.posterPaletteID)
-    let customStart = mode == .avatar ? selection.avatarCustomStartHex : selection.posterCustomStartHex
-    let customEnd = mode == .avatar ? selection.avatarCustomEndHex : selection.posterCustomEndHex
-    return (
-      uiColor(hex: customStart ?? palette.topHex),
-      uiColor(hex: customEnd ?? palette.bottomHex)
-    )
+    switch mode {
+    case .avatar:
+      let palette = palette(id: selection.avatarPaletteID)
+      return (
+        uiColor(hex: selection.avatarCustomStartHex ?? palette.topHex),
+        uiColor(hex: selection.avatarCustomEndHex ?? palette.bottomHex)
+      )
+    case .poster:
+      let palette = palette(id: selection.posterPaletteID)
+      return (
+        uiColor(hex: selection.posterCustomStartHex ?? palette.topHex),
+        uiColor(hex: selection.posterCustomEndHex ?? palette.bottomHex)
+      )
+    case .banner:
+      // Inherit avatar palette/custom colors until the user sets banner values.
+      let hasExplicitBanner =
+        selection.bannerPaletteID != nil
+        || selection.bannerCustomStartHex != nil
+        || selection.bannerCustomEndHex != nil
+      if hasExplicitBanner {
+        let paletteID = selection.bannerPaletteID ?? selection.avatarPaletteID
+        let palette = palette(id: paletteID)
+        return (
+          uiColor(hex: selection.bannerCustomStartHex ?? palette.topHex),
+          uiColor(hex: selection.bannerCustomEndHex ?? palette.bottomHex)
+        )
+      }
+      return colors(for: selection, mode: .avatar)
+    }
   }
 
   static func uiColor(hex raw: String) -> UIColor {
@@ -137,6 +197,8 @@ struct ChatProfileAppearancePalette: Identifiable, Equatable {
 
 enum ChatProfileAppearanceStore {
   private static let defaultsPrefix = "chatProfileAppearance.v1."
+
+  static let didChangeNotification = Notification.Name("ChatProfileAppearanceStore.didChange")
 
   static func selection(title: String?, peerUserId: String?, chatId: String?) -> ChatProfileAppearanceSelection {
     let key = defaultsKey(title: title, peerUserId: peerUserId, chatId: chatId)
@@ -157,6 +219,16 @@ enum ChatProfileAppearanceStore {
     let key = defaultsKey(title: title, peerUserId: peerUserId, chatId: chatId)
     guard let data = try? JSONEncoder().encode(selection) else { return }
     UserDefaults.standard.set(data, forKey: key)
+
+    var userInfo: [AnyHashable: Any] = [:]
+    if let title { userInfo["title"] = title }
+    if let peerUserId { userInfo["peerUserId"] = peerUserId }
+    if let chatId { userInfo["chatId"] = chatId }
+    NotificationCenter.default.post(
+      name: didChangeNotification,
+      object: nil,
+      userInfo: userInfo.isEmpty ? nil : userInfo
+    )
   }
 
   static func avatarColors(title: String?, peerUserId: String?, chatId: String?) -> (UIColor, UIColor) {
@@ -170,6 +242,23 @@ enum ChatProfileAppearanceStore {
     ChatProfileAppearancePalette.colors(
       for: selection(title: title, peerUserId: peerUserId, chatId: chatId),
       mode: .poster
+    )
+  }
+
+  static func bannerColors(title: String?, peerUserId: String?, chatId: String?) -> (UIColor, UIColor) {
+    let current = selection(title: title, peerUserId: peerUserId, chatId: chatId)
+    let colors = ChatProfileAppearancePalette.colors(for: current, mode: .banner)
+    switch ChatProfileBannerStyle.style(id: current.bannerStyleID) {
+    case .solid:
+      return (colors.0, colors.0)
+    case .gradient:
+      return colors
+    }
+  }
+
+  static func bannerStyle(title: String?, peerUserId: String?, chatId: String?) -> ChatProfileBannerStyle {
+    ChatProfileBannerStyle.style(
+      id: selection(title: title, peerUserId: peerUserId, chatId: chatId).bannerStyleID
     )
   }
 
@@ -446,6 +535,7 @@ private struct NativeProfileAvatarInnerContent: View {
             .stroke(Color.white.opacity(0.20), lineWidth: 1)
         }
       } else {
+        // Match `ChatAvatarNodeView` / Home tiles: vertical gradient + white initial.
         ZStack {
           LinearGradient(
             colors: [
@@ -457,21 +547,14 @@ private struct NativeProfileAvatarInnerContent: View {
           )
 
           Text(fallbackText)
-            // Keep letter modest — oversized glyphs look broken on empty tiles
-            // and flash too hard if a photo is still loading.
-            .font(.system(size: max(16.0, min(36.0, size * 0.28)), weight: .semibold))
-            .foregroundStyle(Color(uiColor: fallbackIconTintColor).opacity(0.92))
+            .font(.system(size: max(10.0, size * 0.4), weight: .semibold))
+            .foregroundStyle(.white)
             .lineLimit(1)
-            .minimumScaleFactor(0.5)
-            .padding(.horizontal, size * 0.16)
+            .minimumScaleFactor(0.4)
+            .multilineTextAlignment(.center)
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
-        .overlay {
-          Circle()
-            .stroke(Color.white.opacity(0.20), lineWidth: 1)
-        }
-        .shadow(color: Color.black.opacity(0.22), radius: 8, x: 0, y: 4)
       }
     }
   }
@@ -1166,6 +1249,8 @@ private struct ChatProfileSwiftUIRootView: View {
   let isChannel: Bool
   /// True for real groups (not channels) — every participant can open Members.
   var showsMemberList: Bool { isGroupOrChannel && !isChannel }
+  /// Channel owner/admin get an admins/subscribers roster (not the public Members list).
+  var showsChannelAdminControls: Bool { isChannel && canManageGroupMembers }
   let isGroupOwner: Bool
   let memberCount: Int?
   let groupMembersSubtitle: String
@@ -1282,16 +1367,23 @@ private struct ChatProfileSwiftUIRootView: View {
 
   private var avatarDisplayText: String {
     let glyph = appearanceSelection.avatarGlyph?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return glyph.isEmpty ? profileInitial : glyph
+    if !glyph.isEmpty { return glyph }
+    // Same initial rules as Home / chat `ChatAvatarNodeView` fallbacks.
+    return ChatAvatarNodeView.fallbackText(
+      from: profileName,
+      isGroupOrChannel: isGroupOrChannel
+    )
   }
 
-  /// "N members" under the group name in the header. Prefers the server member
-  /// count, falling back to the loaded roster so it still shows before the count
-  /// lands. Nil for a 1:1 DM (which shows no subtitle here).
+  /// "N members" / "N subscribers" under the room name. Prefers the server
+  /// count, falling back to the loaded roster. Nil for a 1:1 DM.
   private var groupHeaderSubtitle: String? {
     guard isGroupOrChannel else { return nil }
     let count = (memberCount ?? 0) > 0 ? (memberCount ?? 0) : groupMembers.count
-    guard count > 0 else { return nil }
+    guard count > 0 else { return isChannel ? "Channel" : nil }
+    if isChannel {
+      return count == 1 ? "1 subscriber" : "\(count) subscribers"
+    }
     return count == 1 ? "1 member" : "\(count) members"
   }
 
@@ -1534,13 +1626,19 @@ private struct ChatProfileSwiftUIRootView: View {
             Button("Search") { onAction("search") }
             if isGroupOrChannel {
               if canManageGroupMembers {
-                Button("Edit Group") { onAction("editGroup") }
-                Button("Add Members") { showAddMembersSheet = true }
+                Button(isChannel ? "Edit Channel" : "Edit Group") { onAction("editGroup") }
+                if !isChannel {
+                  Button("Add Members") { showAddMembersSheet = true }
+                }
               }
               if isGroupOwner {
-                Button("Delete Group", role: .destructive) { onAction("deleteGroup") }
+                Button(isChannel ? "Delete Channel" : "Delete Group", role: .destructive) {
+                  onAction("deleteGroup")
+                }
               } else {
-                Button("Leave Group", role: .destructive) { onAction("leaveGroup") }
+                Button(isChannel ? "Leave Channel" : "Leave Group", role: .destructive) {
+                  onAction("leaveGroup")
+                }
               }
             } else {
               Button("Share Contact") { onAction("shareContact") }
@@ -1623,7 +1721,9 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   /// Commit circle ↔ hero. Settings-style: freeze offset, animate ONE progress for spacer+media.
+  /// Fallback-only avatars stay a fixed circle (no morph) so they match Home/chat tiles.
   private func setHeroExpanded(_ expanded: Bool) {
+    guard hasProfileImage else { return }
     guard heroExpanded != expanded, !heroMorphInFlight else { return }
     NSLog(
       "[ProfileHeroMorph] commit expanded=%d fromP=%.3f localOffset=%.1f",
@@ -1700,23 +1800,30 @@ private struct ChatProfileSwiftUIRootView: View {
         text: avatarDisplayText,
         fontStyleID: appearanceSelection.avatarFontStyleID,
         imageUri: hasProfileImage ? avatarUri : nil,
+        // Same gradient pair as Home / chat `ChatAvatarNodeView` fallbacks.
+        fallbackColors: avatarGradientColors,
+        morphEnabled: hasProfileImage,
         width: g.size.width,
         collapsedHeight: avatarPinHeight,
         heroBaseHeight: heroBaseHeight,
-        expand: heroExpandProgress,
-        overscrollStretch: pull,
+        expand: hasProfileImage ? heroExpandProgress : 0,
+        overscrollStretch: hasProfileImage ? pull : 0,
         topAir: avatarTopAir,
         scrollScale: scrollAvatarScale,
         scrollOpacity: scrollAvatarOpacity,
-        parallax: Self.pixelRound(away * 0.5)
+        parallax: hasProfileImage ? Self.pixelRound(away * 0.5) : 0
       )
-      .frame(width: g.size.width, height: scrollHeaderSpacer + pull, alignment: .top)
+      .frame(width: g.size.width, height: scrollHeaderSpacer + (hasProfileImage ? pull : 0), alignment: .top)
       .overlay(alignment: .bottom) {
-        heroBottomFalloff(height: scrollHeaderSpacer + pull)
+        if hasProfileImage {
+          heroBottomFalloff(height: scrollHeaderSpacer + pull)
+        }
       }
-      .offset(y: -pull)
+      .offset(y: hasProfileImage ? -pull : 0)
       .contentShape(Rectangle())
       .onTapGesture(count: 2) {
+        // Double-tap morph only for real photos — fallback stays a fixed circle.
+        guard hasProfileImage else { return }
         if abs(localScrollOffset) < 40, !heroMorphInFlight {
           setHeroExpanded(!heroExpanded)
         }
@@ -1784,9 +1891,8 @@ private struct ChatProfileSwiftUIRootView: View {
         )
       }
 
-      // Pull-to-expand only. Scrolling up while expanded parallaxes the in-scroll
-      // band away naturally (no committed collapse — double-tap collapses).
-      if !heroExpanded {
+      // Pull-to-expand only when a real photo exists (fallback never morphs).
+      if hasProfileImage, !heroExpanded {
         if expandGestureArmed, nextValue < -60 {
           expandGestureArmed = false
           NSLog("[ProfileHeroMorph] pull-threshold offset=%.1f", Double(nextValue))
@@ -1812,16 +1918,13 @@ private struct ChatProfileSwiftUIRootView: View {
   /// `heroExpandProgress`/scroll state, so there's nothing to desync or pop.
   @ViewBuilder
   private func identityMorphCluster(bandWidth: CGFloat, bandHeight: CGFloat) -> some View {
-    let p = heroExpandProgress
+    // Fallback avatars never expand — always use the collapsed (centered) identity.
+    let p = hasProfileImage ? heroExpandProgress : 0
     let inset: CGFloat = 16
-    // Centered (collapsed) -> left-aligned with a small inset (hero). The frame
-    // narrows toward the inset as p rises, so by the time alignment flips at
-    // p=0.5 the frame is already snug around the text — center vs leading look
-    // nearly identical in a tight frame, which is what keeps the flip invisible.
-    let centerPad = max(inset, bandWidth * 0.22)
-    let nameLeadingPad = centerPad + (inset - centerPad) * p
-    let nameFrameWidth = max(1, bandWidth - nameLeadingPad * 2)
-    let nameAlign: Alignment = p < 0.5 ? .center : .leading
+    // Collapsed / no-photo: true center. Hero photo: left-aligned under the banner.
+    let useCenter = p < 0.5
+    let nameAlign: Alignment = useCenter ? .center : .leading
+    let stackAlign: HorizontalAlignment = useCenter ? .center : .leading
 
     // Collapsed: scroll-tracked Y that pins under the nav. Hero: anchored near
     // the band's bottom edge AND riding the scroll (the band is in-scroll now, so
@@ -1832,29 +1935,34 @@ private struct ChatProfileSwiftUIRootView: View {
     let topY = collapsedTopY + (expandedTopY - collapsedTopY) * p
 
     VStack(spacing: 8) {
-      VStack(alignment: nameAlign == .center ? .center : .leading, spacing: 3) {
+      VStack(alignment: stackAlign, spacing: 3) {
         HStack(spacing: 8) {
           Text(profileName)
             .font(.system(size: 28, weight: .bold))
             .foregroundStyle(.white)
             .lineLimit(1)
             .minimumScaleFactor(0.72)
+            // Natural alignment for RTL/LTR; the *stack* is what we center.
+            .multilineTextAlignment(useCenter ? .center : .leading)
           if showsGoldTier {
             ChatProfileSwiftUITierBadge(label: "Gold")
           }
         }
-        .frame(width: nameFrameWidth, alignment: nameAlign)
 
         if let groupHeaderSubtitle {
           Text(groupHeaderSubtitle)
             .font(.system(size: 14, weight: .regular))
             .foregroundStyle(.white.opacity(0.72))
             .lineLimit(1)
+            .multilineTextAlignment(useCenter ? .center : .leading)
         }
       }
       // Scale username only — actions below stay 1.0.
       .scaleEffect(identityNameScale, anchor: .top)
-      .padding(.leading, nameLeadingPad)
+      // Symmetric horizontal inset + full-width frame so center is true center
+      // (leading-only padding used to shove the name toward the right).
+      .frame(maxWidth: .infinity, alignment: nameAlign)
+      .padding(.horizontal, inset)
 
       // Actions morph circle<->pill via the same continuous expand p.
       actionRow(expand: p)
@@ -1983,9 +2091,10 @@ private struct ChatProfileSwiftUIRootView: View {
         }
       }
     } else if isGroupOrChannel {
-      // Topic cards — Group / Models / Permissions / Configuration.
+      // Channels: channel settings + admin control only.
+      // Groups: identity + optional bridge agent models/permissions.
       groupTopicSection
-      if groupBridgeProvider != nil {
+      if !isChannel, groupBridgeProvider != nil {
         groupModelsSection
         groupPermissionsSection
         groupConfigurationSection
@@ -2020,49 +2129,121 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  /// Group identity: Edit + Members only.
+  /// Group identity: Edit + Members. Channels: Channel settings + admin control.
   @ViewBuilder
   private var groupTopicSection: some View {
     let hasEdit = canManageGroupMembers
     let hasMembers = showsMemberList
-    if hasEdit || hasMembers {
+    let hasChannelAdmin = showsChannelAdminControls
+    if hasEdit || hasMembers || hasChannelAdmin || isChannel {
       VStack(alignment: .leading, spacing: 8) {
-        profileSectionHeader(isChannel ? "Channel" : "Group")
+        profileSectionHeader(isChannel ? "Channel settings" : "Group")
         ChatProfileSwiftUISection(fill: rowFill) {
-          if hasEdit {
-            Button { onAction("editGroup") } label: {
-              ChatProfileSwiftUIRow(
-                title: isChannel ? "Edit channel" : "Edit group",
-                subtitle: "Name, photo, description",
-                trailingSystemImage: nil,
-                showsChevron: true,
-                separatorColor: separatorColor,
-                isLast: !hasMembers
-              )
+          if isChannel {
+            // —— Channel control surface (not group Members/Models) ——
+            if hasEdit {
+              Button { onAction("editGroup") } label: {
+                ChatProfileSwiftUIRow(
+                  title: "Edit channel",
+                  subtitle: "Name, photo, description",
+                  trailingSystemImage: nil,
+                  showsChevron: true,
+                  separatorColor: separatorColor,
+                  isLast: false
+                )
+              }
+              .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
             }
-            .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-          }
 
-          // Native NavigationStack push — parent profile owns the nav header.
-          if hasMembers {
-            Button {
-              onMembersScreenAppeared?()
-              navCoordinator.path.append(.members)
-            } label: {
-              ChatProfileSwiftUIRow(
-                title: "Members",
-                subtitle: groupMembersSubtitle,
-                trailingSystemImage: nil,
-                showsChevron: true,
-                separatorColor: separatorColor,
-                isLast: true
-              )
+            if hasChannelAdmin {
+              Button {
+                onMembersScreenAppeared?()
+                navCoordinator.path.append(.members)
+              } label: {
+                ChatProfileSwiftUIRow(
+                  title: "Channel control",
+                  subtitle: channelAdminSubtitle,
+                  trailingSystemImage: nil,
+                  showsChevron: true,
+                  separatorColor: separatorColor,
+                  isLast: false
+                )
+              }
+              .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
             }
-            .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+            ChatProfileSwiftUIRow(
+              title: "Subscribers",
+              subtitle: channelSubscriberCountLabel,
+              trailingSystemImage: nil,
+              showsChevron: false,
+              separatorColor: separatorColor,
+              isLast: true
+            )
+          } else {
+            // —— Group surface ——
+            if hasEdit {
+              Button { onAction("editGroup") } label: {
+                ChatProfileSwiftUIRow(
+                  title: "Edit group",
+                  subtitle: "Name, photo, description",
+                  trailingSystemImage: nil,
+                  showsChevron: true,
+                  separatorColor: separatorColor,
+                  isLast: !hasMembers
+                )
+              }
+              .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+            }
+
+            if hasMembers {
+              Button {
+                onMembersScreenAppeared?()
+                navCoordinator.path.append(.members)
+              } label: {
+                ChatProfileSwiftUIRow(
+                  title: "Members",
+                  subtitle: groupMembersSubtitle,
+                  trailingSystemImage: nil,
+                  showsChevron: true,
+                  separatorColor: separatorColor,
+                  isLast: true
+                )
+              }
+              .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+            }
           }
         }
       }
     }
+  }
+
+  private var channelAdminSubtitle: String {
+    let total = memberCount ?? groupMembers.count
+    let adminCount = groupMembers.reduce(into: 0) { count, entry in
+      let role =
+        ((entry["role"] as? String)
+          ?? (entry["memberRole"] as? String)
+          ?? (entry["member_role"] as? String)
+          ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+      if role == "owner" || role == "admin" {
+        count += 1
+      }
+    }
+    if total > 0 {
+      return "\(adminCount) admin\(adminCount == 1 ? "" : "s") · \(total) subscriber\(total == 1 ? "" : "s")"
+    }
+    return groupMembersSubtitle
+  }
+
+  private var channelSubscriberCountLabel: String {
+    let total = memberCount ?? groupMembers.count
+    if total > 0 {
+      return "\(total) subscriber\(total == 1 ? "" : "s")"
+    }
+    return "No subscribers yet"
   }
 
   /// Model configuration: repository + per-agent model menus (model on the right).
@@ -2520,13 +2701,13 @@ private struct ChatProfileSwiftUIRootView: View {
   @ViewBuilder
   private var dangerSection: some View {
     if isGroupOrChannel {
-      // The owner can't just leave — they tear the whole group down. Everyone
+      // The owner can't just leave — they tear the whole room down. Everyone
       // else leaves.
       ChatProfileSwiftUISection(fill: rowFill) {
         if isGroupOwner {
           Button(role: .destructive) { onAction("deleteGroup") } label: {
             ChatProfileSwiftUIRow(
-              title: "Delete Group",
+              title: isChannel ? "Delete Channel" : "Delete Group",
               titleColor: .red,
               separatorColor: separatorColor,
               isLast: true
@@ -2536,7 +2717,7 @@ private struct ChatProfileSwiftUIRootView: View {
         } else {
           Button(role: .destructive) { onAction("leaveGroup") } label: {
             ChatProfileSwiftUIRow(
-              title: "Leave Group",
+              title: isChannel ? "Leave Channel" : "Leave Group",
               titleColor: .red,
               separatorColor: separatorColor,
               isLast: true
@@ -2642,9 +2823,11 @@ private struct ChatProfileSwiftUIRootView: View {
       // [String: Any] payloads on every AttributeGraph pass (ForEach churn).
       let memberItems = swiftUIMemberItems()
       ChatProfileMembersListView(
-        title: "Members",
+        title: isChannel ? "Channel control" : "Members",
         items: memberItems,
-        canAddMembers: canManageGroupMembers,
+        // Channels are join-based; admins manage roles, not bulk-invite here.
+        canAddMembers: canManageGroupMembers && !isChannel,
+        isChannel: isChannel,
         onContentPressed: onContentPressed,
         onAddMembers: {
           showAddMembersSheet = true
@@ -2687,10 +2870,11 @@ private struct ChatProfileSwiftUIRootView: View {
         switch item.roleLabel.lowercased() {
         case "owner": return "owner"
         case "admin": return "admin"
+        case "subscriber": return "subscriber"
         default: return "member"
         }
       }()
-      let roleRaw = roleKey == "member" ? "member" : roleKey
+      let roleRaw = roleKey
       var payload: [String: Any] = [
         "type": "groupMemberTapped",
         "userId": item.userId,
@@ -2745,7 +2929,8 @@ private func chatProfileMemberItems(from raw: [[String: Any]]) -> [ChatGroupMemb
     switch rawRole {
     case "owner": roleLabel = "Owner"
     case "admin": roleLabel = "Admin"
-    case "member", "subscriber", "": roleLabel = "Member"
+    case "subscriber": roleLabel = "Subscriber"
+    case "member", "": roleLabel = "Member"
     default: roleLabel = rawRole.capitalized
     }
     let rawAvatar =
@@ -2786,6 +2971,7 @@ private struct ChatProfileMembersListView: View {
   let title: String
   let items: [ChatProfileSwiftUIContentItem]
   let canAddMembers: Bool
+  var isChannel: Bool = false
   let onContentPressed: ([String: Any]) -> Void
   let onAddMembers: () -> Void
 
@@ -2797,7 +2983,7 @@ private struct ChatProfileMembersListView: View {
     List {
       if cleanedItems.isEmpty {
         Section {
-          Text("No members yet")
+          Text(isChannel ? "No subscribers yet" : "No members yet")
             .font(.system(size: 15))
             .foregroundStyle(palette.secondaryText)
             .listRowBackground(Color.clear)
@@ -2810,10 +2996,13 @@ private struct ChatProfileMembersListView: View {
           plainSection(title: "Admins", rows: admins)
         }
         if !membersOnly.isEmpty {
-          plainSection(
-            title: membersOnly.count == 1 ? "Member" : "Members",
-            rows: membersOnly
-          )
+          let memberTitle: String = {
+            if isChannel {
+              return membersOnly.count == 1 ? "Subscriber" : "Subscribers"
+            }
+            return membersOnly.count == 1 ? "Member" : "Members"
+          }()
+          plainSection(title: memberTitle, rows: membersOnly)
         }
       }
     }
@@ -3132,6 +3321,10 @@ private struct ChatProfileAvatarMorphView: View {
   let text: String
   let fontStyleID: String?
   let imageUri: String?
+  /// Same vertical gradient used by `ChatAvatarNodeView` / Home tiles.
+  let fallbackColors: (UIColor, UIColor)
+  /// When false (no photo), stay a fixed circle — no hero expand morph.
+  let morphEnabled: Bool
   let width: CGFloat
   let collapsedHeight: CGFloat
   let heroBaseHeight: CGFloat
@@ -3154,6 +3347,8 @@ private struct ChatProfileAvatarMorphView: View {
     text: String,
     fontStyleID: String?,
     imageUri: String?,
+    fallbackColors: (UIColor, UIColor),
+    morphEnabled: Bool,
     width: CGFloat,
     collapsedHeight: CGFloat,
     heroBaseHeight: CGFloat,
@@ -3167,22 +3362,26 @@ private struct ChatProfileAvatarMorphView: View {
     self.text = text
     self.fontStyleID = fontStyleID
     self.imageUri = imageUri
+    self.fallbackColors = fallbackColors
+    self.morphEnabled = morphEnabled
     self.width = width
     self.collapsedHeight = collapsedHeight
     self.heroBaseHeight = heroBaseHeight
-    self.expand = expand
-    self.overscrollStretch = overscrollStretch
+    self.expand = morphEnabled ? expand : 0
+    self.overscrollStretch = morphEnabled ? overscrollStretch : 0
     self.topAir = topAir
     self.scrollScale = scrollScale
     self.scrollOpacity = scrollOpacity
-    self.parallax = parallax
+    self.parallax = morphEnabled ? parallax : 0
     let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
     _image = State(initialValue: primed)
     _loadedUri = State(initialValue: primed != nil ? normalized : nil)
   }
 
-  private var p: CGFloat { min(1, max(0, expand)) }
+  private var p: CGFloat {
+    morphEnabled ? min(1, max(0, expand)) : 0
+  }
 
   private var circleSize: CGFloat { 120 }
 
@@ -3237,21 +3436,32 @@ private struct ChatProfileAvatarMorphView: View {
   @ViewBuilder
   private var mediaBody: some View {
     Group {
-      if let image {
+      if morphEnabled, let image {
         Image(uiImage: image)
           .resizable()
           .scaledToFill()
       } else {
+        // Match Home/chat `ChatAvatarNodeView` fallback: vertical palette gradient
+        // + single white initial (not a flat gray plate / oversized bold glyph).
         ZStack {
-          Color(white: 0.18)
+          LinearGradient(
+            colors: [
+              Color(uiColor: fallbackColors.0),
+              Color(uiColor: fallbackColors.1),
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+          )
           Text(text)
             .font(.system(
-              size: 28 + 36 * p,
-              weight: .bold,
+              size: max(10, mediaW * 0.4),
+              weight: .semibold,
               design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
             ))
-            .foregroundStyle(.white.opacity(0.92))
+            .foregroundStyle(.white)
             .minimumScaleFactor(0.4)
+            .lineLimit(1)
+            .multilineTextAlignment(.center)
         }
       }
     }
@@ -3419,12 +3629,12 @@ private struct ChatProfileAppearanceEditorView: View {
             }
           }
           .pickerStyle(.segmented)
-          .frame(maxWidth: 270)
+          .frame(maxWidth: 320)
           .padding(.top, 16)
 
           ChatProfileAvatarPosterPreview(
             mode: mode,
-            displayText: avatarDisplayText,
+            displayText: mode == .banner ? profileName : avatarDisplayText,
             selection: draft,
             avatarImage: hasProfileImage ? avatarImage : nil
           )
@@ -3435,6 +3645,8 @@ private struct ChatProfileAppearanceEditorView: View {
 
           if mode == .poster {
             posterPhotoSection
+          } else if mode == .banner {
+            bannerStylePicker
           } else {
             emojiSection
             memojiSection
@@ -3476,7 +3688,7 @@ private struct ChatProfileAppearanceEditorView: View {
     .sheet(isPresented: $isCustomizerPresented) {
       ChatProfileAppearanceGradientSheet(
         mode: mode,
-        displayText: avatarDisplayText,
+        displayText: mode == .banner ? profileName : avatarDisplayText,
         selection: $draft,
         onChoose: { selection in
           onSave(selection)
@@ -3520,6 +3732,34 @@ private struct ChatProfileAppearanceEditorView: View {
         )
     }
     .buttonStyle(.plain)
+  }
+
+  private var bannerStylePicker: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Style")
+        .font(.system(size: 20, weight: .bold))
+        .foregroundStyle(.white)
+
+      Picker("", selection: bannerStyleBinding) {
+        ForEach(ChatProfileBannerStyle.allCases) { style in
+          Text(style.title).tag(style)
+        }
+      }
+      .pickerStyle(.segmented)
+      .frame(maxWidth: 240)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private var bannerStyleBinding: Binding<ChatProfileBannerStyle> {
+    Binding {
+      ChatProfileBannerStyle.style(id: draft.bannerStyleID)
+    } set: { value in
+      var nextDraft = draft
+      nextDraft.bannerStyleID = value.rawValue
+      draft = nextDraft
+      onSave(nextDraft)
+    }
   }
 
   private var posterPhotoSection: some View {
@@ -3721,6 +3961,10 @@ private struct ChatProfileAppearanceGradientSheet: View {
     ChatProfileAppearancePalette.colors(for: selection, mode: .poster)
   }
 
+  private var isSolidBanner: Bool {
+    mode == .banner && ChatProfileBannerStyle.style(id: selection.bannerStyleID) == .solid
+  }
+
   var body: some View {
     ZStack {
       LinearGradient(
@@ -3771,8 +4015,12 @@ private struct ChatProfileAppearanceGradientSheet: View {
             ChatProfilePaletteGrid(mode: mode, selection: $selection)
 
             VStack(spacing: 12) {
-              ColorPicker("Start", selection: customStartBinding, supportsOpacity: false)
-              ColorPicker("End", selection: customEndBinding, supportsOpacity: false)
+              if isSolidBanner {
+                ColorPicker("Color", selection: solidBannerColorBinding, supportsOpacity: false)
+              } else {
+                ColorPicker("Start", selection: customStartBinding, supportsOpacity: false)
+                ColorPicker("End", selection: customEndBinding, supportsOpacity: false)
+              }
             }
             .font(.system(size: 17, weight: .semibold))
             .foregroundStyle(.white)
@@ -3791,17 +4039,31 @@ private struct ChatProfileAppearanceGradientSheet: View {
     }
   }
 
+  private var solidBannerColorBinding: Binding<Color> {
+    Binding {
+      let colors = ChatProfileAppearancePalette.colors(for: selection, mode: .banner)
+      return Color(uiColor: colors.0)
+    } set: { value in
+      let hex = UIColor(value).chatProfileHexString
+      selection.bannerCustomStartHex = hex
+      selection.bannerCustomEndHex = hex
+    }
+  }
+
   private var customStartBinding: Binding<Color> {
     Binding {
       let colors = ChatProfileAppearancePalette.colors(for: selection, mode: mode)
       return Color(uiColor: colors.0)
     } set: { value in
       let hex = UIColor(value).chatProfileHexString
-      if mode == .avatar {
+      switch mode {
+      case .avatar:
         selection.avatarCustomStartHex = hex
-      } else {
+      case .poster:
         selection.posterCustomStartHex = hex
         selection.posterImageData = nil
+      case .banner:
+        selection.bannerCustomStartHex = hex
       }
     }
   }
@@ -3812,11 +4074,14 @@ private struct ChatProfileAppearanceGradientSheet: View {
       return Color(uiColor: colors.1)
     } set: { value in
       let hex = UIColor(value).chatProfileHexString
-      if mode == .avatar {
+      switch mode {
+      case .avatar:
         selection.avatarCustomEndHex = hex
-      } else {
+      case .poster:
         selection.posterCustomEndHex = hex
         selection.posterImageData = nil
+      case .banner:
+        selection.bannerCustomEndHex = hex
       }
     }
   }
@@ -3836,14 +4101,36 @@ private struct ChatProfileAvatarPosterPreview: View {
     ChatProfileAppearancePalette.colors(for: selection, mode: .poster)
   }
 
+  private var bannerColors: (UIColor, UIColor) {
+    let colors = ChatProfileAppearancePalette.colors(for: selection, mode: .banner)
+    switch ChatProfileBannerStyle.style(id: selection.bannerStyleID) {
+    case .solid:
+      return (colors.0, colors.0)
+    case .gradient:
+      return colors
+    }
+  }
+
   private var posterImage: UIImage? {
     guard let data = selection.posterImageData else { return nil }
     return UIImage(data: data)
   }
 
   var body: some View {
+    Group {
+      if mode == .banner {
+        bannerMessageCard
+      } else {
+        avatarOrPosterPreview
+      }
+    }
+    .animation(.spring(response: 0.42, dampingFraction: 0.86), value: mode)
+    .animation(.easeInOut(duration: 0.2), value: selection.bannerStyleID)
+  }
+
+  private var avatarOrPosterPreview: some View {
     let isPoster = mode == .poster
-    ZStack {
+    return ZStack {
       previewBackground(isPoster: isPoster)
 
       if isPoster {
@@ -3859,7 +4146,80 @@ private struct ChatProfileAvatarPosterPreview: View {
         .stroke(Color.white.opacity(0.16), lineWidth: 1)
     )
     .shadow(color: Color.black.opacity(0.20), radius: 12, x: 0, y: 6)
-    .animation(.spring(response: 0.42, dampingFraction: 0.86), value: mode)
+  }
+
+  private var bannerMessageCard: some View {
+    let colors = bannerColors
+    let senderName: String = {
+      let trimmed = displayText.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? "Sender" : trimmed
+    }()
+
+    // Untinted outer bubble; palette applies only to the compact quoted-reply panel.
+    return VStack(alignment: .leading, spacing: 0) {
+      Text(senderName)
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundStyle(.white.opacity(0.88))
+        .lineLimit(1)
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
+
+      // Quoted reply preview: curved right-pointing arrow + referenced name + body.
+      HStack(alignment: .top, spacing: 0) {
+        BannerReplyCurvedArrow()
+          .fill(Color(uiColor: colors.0).opacity(0.95), style: FillStyle(eoFill: true))
+          .frame(width: 18, height: 18)
+          .rotationEffect(.degrees(180))
+
+        VStack(alignment: .leading, spacing: 1) {
+          Text(senderName)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(Color(uiColor: colors.0).opacity(0.96))
+            .lineLimit(1)
+          Text("Are you free later?")
+            .font(.system(size: 13, weight: .regular))
+            .foregroundStyle(.white.opacity(0.62))
+            .lineLimit(1)
+        }
+      }
+      .padding(.leading, 2)
+      .padding(.trailing, 5)
+      .padding(.top, 2)
+      .padding(.bottom, 3)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(
+        LinearGradient(
+          colors: [
+            Color(uiColor: colors.0).opacity(0.22),
+            Color(uiColor: colors.1).opacity(0.16),
+          ],
+          startPoint: .leading,
+          endPoint: .trailing
+        )
+      )
+      .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+      .padding(.horizontal, 10)
+
+      Text("Yeah — around 6 works for me.")
+        .font(.system(size: 15, weight: .regular))
+        .foregroundStyle(.white.opacity(0.96))
+        .lineLimit(2)
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+        .padding(.bottom, 12)
+    }
+    .frame(maxWidth: 280, alignment: .leading)
+    .background(
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .fill(Color.black.opacity(0.58))
+    )
+    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .stroke(Color.white.opacity(0.14), lineWidth: 1)
+    )
+    .shadow(color: Color.black.opacity(0.18), radius: 10, x: 0, y: 5)
   }
 
   @ViewBuilder
@@ -3907,6 +4267,81 @@ private struct ChatProfileAvatarPosterPreview: View {
   }
 }
 
+/// Exact user-supplied reply SVG (24×24); the call site rotates it to point right/up.
+private struct BannerReplyCurvedArrow: Shape {
+  func path(in rect: CGRect) -> Path {
+    var path = Path()
+    path.move(to: svgPoint(10.0303, 6.46967, in: rect))
+    path.addCurve(
+      to: svgPoint(10.0303, 7.53033, in: rect),
+      control1: svgPoint(10.3232, 6.76256, in: rect),
+      control2: svgPoint(10.3232, 7.23744, in: rect)
+    )
+    path.addLine(to: svgPoint(6.31066, 11.25, in: rect))
+    path.addLine(to: svgPoint(14.5, 11.25, in: rect))
+    path.addCurve(
+      to: svgPoint(18.0632, 12.3913, in: rect),
+      control1: svgPoint(15.4534, 11.25, in: rect),
+      control2: svgPoint(16.8667, 11.5298, in: rect)
+    )
+    path.addCurve(
+      to: svgPoint(20.25, 17, in: rect),
+      control1: svgPoint(19.298, 13.2804, in: rect),
+      control2: svgPoint(20.25, 14.7556, in: rect)
+    )
+    path.addCurve(
+      to: svgPoint(19.5, 17.75, in: rect),
+      control1: svgPoint(20.25, 17.4142, in: rect),
+      control2: svgPoint(19.9142, 17.75, in: rect)
+    )
+    path.addCurve(
+      to: svgPoint(18.75, 17, in: rect),
+      control1: svgPoint(19.0858, 17.75, in: rect),
+      control2: svgPoint(18.75, 17.4142, in: rect)
+    )
+    path.addCurve(
+      to: svgPoint(17.1868, 13.6087, in: rect),
+      control1: svgPoint(18.75, 15.2444, in: rect),
+      control2: svgPoint(18.0353, 14.2196, in: rect)
+    )
+    path.addCurve(
+      to: svgPoint(14.5, 12.75, in: rect),
+      control1: svgPoint(16.3, 12.9702, in: rect),
+      control2: svgPoint(15.2133, 12.75, in: rect)
+    )
+    path.addLine(to: svgPoint(6.31066, 12.75, in: rect))
+    path.addLine(to: svgPoint(10.0303, 16.4697, in: rect))
+    path.addCurve(
+      to: svgPoint(10.0303, 17.5303, in: rect),
+      control1: svgPoint(10.3232, 16.7626, in: rect),
+      control2: svgPoint(10.3232, 17.2374, in: rect)
+    )
+    path.addCurve(
+      to: svgPoint(8.96967, 17.5303, in: rect),
+      control1: svgPoint(9.73744, 17.8232, in: rect),
+      control2: svgPoint(9.26256, 17.8232, in: rect)
+    )
+    path.addLine(to: svgPoint(3.96967, 12.5303, in: rect))
+    path.addCurve(
+      to: svgPoint(3.96967, 11.4697, in: rect),
+      control1: svgPoint(3.67678, 12.2374, in: rect),
+      control2: svgPoint(3.67678, 11.7626, in: rect)
+    )
+    path.addLine(to: svgPoint(8.96967, 6.46967, in: rect))
+    path.addCurve(
+      to: svgPoint(10.0303, 6.46967, in: rect),
+      control1: svgPoint(9.26256, 6.17678, in: rect),
+      control2: svgPoint(9.73744, 6.17678, in: rect)
+    )
+    path.closeSubpath()
+    return path
+  }
+
+  private func svgPoint(_ x: CGFloat, _ y: CGFloat, in rect: CGRect) -> CGPoint {
+    CGPoint(x: rect.minX + (x / 24) * rect.width, y: rect.minY + (y / 24) * rect.height)
+  }
+}
+
 private struct ChatProfilePaletteGrid: View {
   let mode: ChatProfileAppearanceMode
   @Binding var selection: ChatProfileAppearanceSelection
@@ -3917,15 +4352,20 @@ private struct ChatProfilePaletteGrid: View {
     LazyVGrid(columns: columns, spacing: 24) {
       ForEach(ChatProfileAppearancePalette.all) { palette in
         Button {
-          if mode == .avatar {
+          switch mode {
+          case .avatar:
             selection.avatarPaletteID = palette.id
             selection.avatarCustomStartHex = nil
             selection.avatarCustomEndHex = nil
-          } else {
+          case .poster:
             selection.posterPaletteID = palette.id
             selection.posterCustomStartHex = nil
             selection.posterCustomEndHex = nil
             selection.posterImageData = nil
+          case .banner:
+            selection.bannerPaletteID = palette.id
+            selection.bannerCustomStartHex = nil
+            selection.bannerCustomEndHex = nil
           }
         } label: {
           Circle()
@@ -3963,6 +4403,17 @@ private struct ChatProfilePaletteGrid: View {
       return selection.posterPaletteID == palette.id
         && selection.posterCustomStartHex == nil
         && selection.posterCustomEndHex == nil
+    case .banner:
+      if selection.bannerCustomStartHex != nil || selection.bannerCustomEndHex != nil {
+        return false
+      }
+      if let bannerID = selection.bannerPaletteID {
+        return bannerID == palette.id
+      }
+      // Still inheriting avatar until an explicit banner palette is chosen.
+      return selection.avatarPaletteID == palette.id
+        && selection.avatarCustomStartHex == nil
+        && selection.avatarCustomEndHex == nil
     }
   }
 }
@@ -5019,11 +5470,28 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   /// Seed sticky role / channel flag from the chat route (home list `role` + type).
   func setRouteMembership(isChannel: Bool, myRole: String?) {
-    self.isChannel = isChannel && isGroupOrChannel
+    // Channels are always multi-party rooms. Promote isGroupOrChannel first so
+    // `isChannel = flag && isGroupOrChannel` cannot stick as false when callers
+    // only set membership (or set it before setIsGroupOrChannel).
+    if isChannel {
+      isGroupOrChannel = true
+    }
+    let nextChannel = isChannel && isGroupOrChannel
+    let roleChanged: Bool
     if let role = myRole?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
       !role.isEmpty
     {
+      roleChanged = stickyMyGroupRole != role
       stickyMyGroupRole = role
+    } else {
+      roleChanged = false
+    }
+    let channelChanged = self.isChannel != nextChannel
+    self.isChannel = nextChannel
+    if channelChanged || roleChanged {
+      reloadHeaderText()
+      refreshHeroContent()
+      renderSwiftUIProfile()
     }
   }
 
@@ -5120,7 +5588,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     bridgeStatusTask?.cancel()
     bridgeStatusTask = Task { [weak self] in
       guard let config = AppSessionConfig.current else { return }
-      let status = try? await AgentPairingService.status(config: config)
+      // Coalesced: Home polls the same endpoint, and each call is ~700ms of server time.
+      let status = try? await AgentPairingService.statusCoalesced(config: config)
       guard let status, !Task.isCancelled else { return }
       await MainActor.run { [weak self] in
         guard let self else { return }
@@ -5154,7 +5623,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       self?.refreshBridgeStatus()
     }
     bridgeStatusRefreshWorkItem = item
-    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: item)
+    // 3s → 12s when nothing is running. This loop ran the whole time an agent profile was
+    // open, on top of Home's own poll, and each call costs the server ~700ms. A live run
+    // keeps the old cadence so its task list stays current.
+    let delay: TimeInterval = bridgeRunningTasks.isEmpty ? 12.0 : 3.0
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
   }
 
   func setProfileBio(_ value: String) {
@@ -5713,8 +6186,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       isGroupOwner: isGroupOwner,
       memberCount: groupMemberCount ?? (groupMembers.isEmpty ? nil : groupMembers.count),
       groupMembersSubtitle: groupMembersSummary(),
-      // Channels never pass a roster into SwiftUI (no Members destination).
-      groupMembers: isChannel ? [] : groupMembers,
+      // Groups always expose the roster. Channels keep it for owner/admin control
+      // (Administrators & subscribers); non-admin channel viewers only see a count.
+      groupMembers: (isChannel && !canManageGroupMembers) ? [] : groupMembers,
       canManageGroupMembers: canManageGroupMembers,
       groupBridgeProvider: groupBridgeProviderFromMembers(),
       groupBridgeProviders: groupBridgeProvidersFromMembers(),
@@ -5872,6 +6346,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         "name": profileName,
         "avatarUri": resolvedAvatarImageUriForSwiftUI() ?? "",
         "description": profileBio,
+        // Sheet titles (Edit Channel vs Edit Group) must not depend only on
+        // ChatRoute — that can lag a stale home row without type/isChannel.
+        "isChannel": isChannel,
       ])
     case "openMembers":
       presentGroupMembersUIKit()
@@ -5882,9 +6359,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   /// Crash-safe members screen: UIKit push (not SwiftUI NavigationStack destination).
   private func presentGroupMembersUIKit() {
-    // Channels never expose a members list (groups do for every participant).
-    guard !isChannel else {
-      NSLog("[WhoAmI] MembersUIKit.present skipped — channel chatId=%@", String(engineChatId.prefix(12)))
+    // Non-admin channel viewers don't get a roster; owner/admin open Channel control.
+    if isChannel, !canManageGroupMembers {
+      NSLog(
+        "[WhoAmI] MembersUIKit.present skipped — channel non-admin chatId=%@",
+        String(engineChatId.prefix(12)))
       return
     }
     let sample = groupMembers.prefix(6).compactMap { entry -> String? in
@@ -6468,7 +6947,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       return headerSubtitle
     }
 
-    return isGroupOrChannel ? "Group Profile" : "Profile"
+    if isGroupOrChannel {
+      return isChannel ? "Channel Profile" : "Group Profile"
+    }
+    return "Profile"
   }
 
   private func resolvedActiveTabSubtitleText() -> String? {
@@ -6631,8 +7113,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private func resolvedAvatarFallbackText() -> String {
     let resolvedName =
       profileName.isEmpty ? (headerTitle.isEmpty ? "User" : headerTitle) : profileName
-    let trimmed = resolvedName.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed.isEmpty ? "U" : String(trimmed.prefix(1)).uppercased()
+    let text = ChatAvatarNodeView.fallbackText(
+      from: resolvedName,
+      isGroupOrChannel: isGroupOrChannel
+    )
+    return text.isEmpty ? "U" : text
   }
 
   private func isImageOrVideoMediaURL(_ url: String) -> Bool {

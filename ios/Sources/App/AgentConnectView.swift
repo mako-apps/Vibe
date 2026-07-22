@@ -34,8 +34,14 @@ final class AgentConnectModel: ObservableObject {
   var onConnected: (() -> Void)?
 
   private var pollTask: Task<Void, Never>?
-  /// Guards the one-shot "Connected ✓ → auto-close" transition so the 2.5s poll can't
-  /// re-schedule it, and lets us time a soft "computer still offline" hint.
+  /// Live `bridge-status` pushes off the socket — the primary signal; the timer below
+  /// is only a fallback.
+  private var statusObserver: NSObjectProtocol?
+  /// Fallback cadence for a wedged socket. Deliberately slow: the push arrives in
+  /// milliseconds, so this only has to catch a transport that has stopped delivering.
+  private static let statusFallbackInterval: TimeInterval = 20
+  /// Guards the one-shot "Connected ✓ → auto-close" transition so a repeated status
+  /// can't re-schedule it, and lets us time a soft "computer still offline" hint.
   private var didConfirmConnected = false
   private var authorizedAt: Date?
 
@@ -52,15 +58,31 @@ final class AgentConnectModel: ObservableObject {
     stopPolling()
   }
 
-  /// Polls bridge status every couple of seconds while the panel is on screen so
-  /// it flips to "connected" the moment the daemon claims its token and joins.
+  /// Watches bridge status while the panel is up, so it flips to "connected" the
+  /// moment the daemon claims its token and joins.
+  ///
+  /// This used to be a 2.5s `while` loop hitting `/api/agent-bridge/status`, which
+  /// never stopped while the model was alive — in production it was a permanent
+  /// wall of requests, one every ~3s for the whole foreground session, and each one
+  /// cost real server time. The server now pushes `bridge-status` over the socket
+  /// the phone is already joined to, which is both free and *faster* than polling:
+  /// the push fires on the Presence change itself rather than up to 2.5s later.
+  ///
+  /// The timer that remains is only a safety net for a wedged socket, at a cadence
+  /// where it costs nothing, and it goes through `statusCoalesced` so overlapping
+  /// surfaces share one round trip.
   func startPolling() {
+    observeStatusPushes()
     guard pollTask == nil else { return }
     pollTask = Task { [weak self] in
       while !Task.isCancelled {
-        await self?.refreshStatusOnce()
+        // Trust a fresh snapshot (socket push or another surface's fetch) and skip
+        // the request entirely; only reach for the network when nothing is current.
+        if !AgentPairingService.statusIsFresh(maxAge: Self.statusFallbackInterval) {
+          await self?.refreshStatusOnce()
+        }
         if Task.isCancelled { return }
-        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        try? await Task.sleep(nanoseconds: UInt64(Self.statusFallbackInterval * 1_000_000_000))
       }
     }
   }
@@ -68,44 +90,36 @@ final class AgentConnectModel: ObservableObject {
   func stopPolling() {
     pollTask?.cancel()
     pollTask = nil
+    if let statusObserver {
+      NotificationCenter.default.removeObserver(statusObserver)
+      self.statusObserver = nil
+    }
+  }
+
+  /// Apply every published bridge status — socket push, LAN snapshot, or another
+  /// surface's fetch — so the panel reacts without a request of its own.
+  private func observeStatusPushes() {
+    guard statusObserver == nil else { return }
+    statusObserver = NotificationCenter.default.addObserver(
+      forName: AgentPairingService.statusDidChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] note in
+      guard let status = (note.object as? AgentBridgeStatus)
+        ?? AgentPairingService.lastStatusSnapshot
+      else { return }
+      Task { @MainActor [weak self] in
+        self?.applyStatus(status)
+      }
+    }
   }
 
   func refreshStatusOnce() async {
     guard let config = AppSessionConfig.current else { return }
     do {
-      let next = try await AgentPairingService.status(config: config)
-      status = next
-      selectedRepository = AgentBridgeSelectionStore.ensureValidSelection(from: next.repositories)
-      if next.connected {
-        stopPolling()
-        if isScanning && didAuthorize {
-          // Confirm inside the scanner ("Connected") for a beat, then close it — so the
-          // user gets a clear "it worked" signal instead of the sheet vanishing silently.
-          if !didConfirmConnected {
-            didConfirmConnected = true
-            showScannerMessage("Connected", style: .success, canRetry: false)
-            Task { [weak self] in
-              try? await Task.sleep(nanoseconds: 900_000_000)
-              guard let self else { return }
-              self.isScanning = false
-              self.onConnected?()
-            }
-          }
-        } else {
-          isScanning = false
-          onConnected?()
-        }
-      } else if isScanning, didAuthorize, let authorizedAt,
-        Date().timeIntervalSince(authorizedAt) > 18
-      {
-        // Authorized, but the computer never came online — surface it instead of an
-        // endless "Connecting…" spinner, and let the user retry.
-        showScannerMessage(
-          "Your computer hasn't come online. Make sure the bridge is running on your Mac, then scan again.",
-          style: .error,
-          canRetry: true
-        )
-      }
+      // Coalesced: Home and any open agent profile want the same snapshot, and each
+      // uncoalesced call is a full round trip of server time.
+      applyStatus(try await AgentPairingService.statusCoalesced(config: config))
     } catch {
       // A 401 here means the whole session token died, not just the bridge — kick
       // off a silent session refresh so the panel stops spinning on a dead token.
@@ -113,6 +127,43 @@ final class AgentConnectModel: ObservableObject {
         Task { await AppSessionGuard.shared.recover(reason: "agent-connect-status") }
       }
       // Otherwise transient — keep the last known status and let the next tick retry.
+    }
+  }
+
+  /// Single place the panel reacts to a bridge status, whichever transport carried
+  /// it. Safe to call repeatedly with the same snapshot.
+  private func applyStatus(_ next: AgentBridgeStatus) {
+    status = next
+    selectedRepository = AgentBridgeSelectionStore.ensureValidSelection(from: next.repositories)
+    if next.connected {
+      stopPolling()
+      if isScanning && didAuthorize {
+        // Confirm inside the scanner ("Connected") for a beat, then close it — so the
+        // user gets a clear "it worked" signal instead of the sheet vanishing silently.
+        if !didConfirmConnected {
+          didConfirmConnected = true
+          showScannerMessage("Connected", style: .success, canRetry: false)
+          Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard let self else { return }
+            self.isScanning = false
+            self.onConnected?()
+          }
+        }
+      } else {
+        isScanning = false
+        onConnected?()
+      }
+    } else if isScanning, didAuthorize, let authorizedAt,
+      Date().timeIntervalSince(authorizedAt) > 18
+    {
+      // Authorized, but the computer never came online — surface it instead of an
+      // endless "Connecting…" spinner, and let the user retry.
+      showScannerMessage(
+        "Your computer hasn't come online. Make sure the bridge is running on your Mac, then scan again.",
+        style: .error,
+        canRetry: true
+      )
     }
   }
 

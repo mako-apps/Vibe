@@ -29,11 +29,11 @@ public enum SendMorphProfile {
   static let sourceBackgroundFadeDuration: CFTimeInterval = 0.15
 
   // The clip envelope does NOT own any corner anymore: it sits at a CONSTANT
-  // radius — the destination bubble's smallest true corner (8pt grouped
-  // top-right, else 18pt) — purely as a text-containment clip. Every visible
+  // radius — the destination bubble's smallest true corner — purely as a
+  // text-containment clip. Every visible
   // shape rounds itself: the capsule ghost via its own animated cornerRadius,
   // the plate via its stretch-proof baked corners. So the bubble shows its
-  // REAL corners (including a grouped 8pt top-right) from the first frame it
+  // REAL destination corners from the first frame it
   // fades in, and nothing about the silhouette changes at the reveal.
 
   // Composer text and bubble text ride the same path and crossfade midway,
@@ -82,9 +82,9 @@ final class SendTransitionState: NSObject {
   // frame, so it stays glued to the moving corner. nil = a separate-view media
   // tail (pinned at final placement, opacity-only, old behavior).
   let tailCornerTravel: CGSize?
-  // Smallest true corner radius of the destination bubble (8pt for a grouped
-  // top-right corner, else 18) — the clip envelope settles onto this and holds
-  // it, so the real cell's corners are already showing when it is revealed.
+  // Smallest true corner radius of the destination bubble — the clip envelope
+  // settles onto this and holds it, so the real cell's corners are already
+  // showing when it is revealed.
   let clipSettleRadius: CGFloat
   let sourceBackgroundStartFrame: CGRect
   let sourceBackgroundEndFrame: CGRect
@@ -294,8 +294,8 @@ final class SendTransitionState: NSObject {
     // destination bubble's smallest true corner radius, so it never cuts into
     // any real corner (a smaller-radius cut removes strictly less). The shapes
     // round themselves: the plate raster's baked corners are stretch-proof
-    // (9-part), so the bubble shows its REAL corners — including a grouped 8pt
-    // top-right — from the first frame the plate fades in, and the silhouette
+    // (9-part), so the bubble shows its REAL destination corners from the first
+    // frame the plate fades in, and the silhouette
     // never changes at the reveal.
     let startRadius = min(sourceBackgroundStartFrame.height / 2.0, 22.0)
     let uniformRadius = min(sourceBackgroundEndFrame.height / 2.0, 18.0)
@@ -307,7 +307,7 @@ final class SendTransitionState: NSObject {
     // capture); it used to lean on the envelope for rounding. Now it rounds
     // itself: its own animated cornerRadius is geometry, not raster, so it is
     // exact at every intermediate size — starting as the true pill and
-    // relaxing toward the bubble's 18pt as it crossfades away.
+    // relaxing toward the destination bubble's radius as it crossfades away.
     sourceBackgroundSnapshot.clipsToBounds = true
     sourceBackgroundSnapshot.layer.cornerCurve = .continuous
     sourceBackgroundSnapshot.layer.cornerRadius = uniformRadius
@@ -856,8 +856,8 @@ enum SendTransitionOverlayFactory {
     let tailCornerTravel = tailBuild?.cornerTravel
 
     // Smallest true corner radius of the destination bubble — the envelope
-    // settles onto this (see start()) so a grouped 8pt top-right corner is
-    // already showing, morphed-in smoothly, well before the reveal.
+    // settles onto this (see start()) so the final corners are already showing,
+    // morphed-in smoothly, well before the reveal.
     let cellRadii = snapshotCell.bubbleView.transitionCornerRadii()
     let clipSettleRadius = min(
       min(cellRadii.topLeft, cellRadii.topRight),

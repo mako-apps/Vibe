@@ -148,6 +148,28 @@ enum ChatAvatarImageStore {
   /// Avoid repeated failed disk stats on hot scroll paths.
   private static let diskMissLock = NSLock()
   private static var diskMissKeys = Set<String>()
+  /// Remote fetches that came back with nothing, and when to stop believing that.
+  /// A user with no uploaded picture 404s forever, and without this every repaint asked
+  /// again — the server log shows the same `/api/push/avatar/<id>` 404 (~350ms each)
+  /// every few seconds, indefinitely. Short enough that a newly-set avatar appears on
+  /// its own within a few minutes; `invalidate`/`purge` clear it immediately.
+  private static let negativeTTL: TimeInterval = 300
+  private static var negativeUntilByKey: [String: TimeInterval] = [:]
+
+  private static func isNegativeCached(_ key: String) -> Bool {
+    diskMissLock.lock()
+    defer { diskMissLock.unlock() }
+    guard let until = negativeUntilByKey[key] else { return false }
+    if until > Date().timeIntervalSince1970 { return true }
+    negativeUntilByKey.removeValue(forKey: key)
+    return false
+  }
+
+  private static func markNegative(_ key: String) {
+    diskMissLock.lock()
+    negativeUntilByKey[key] = Date().timeIntervalSince1970 + negativeTTL
+    diskMissLock.unlock()
+  }
 
   private static var diskDirectory: URL = {
     let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -192,6 +214,7 @@ enum ChatAvatarImageStore {
     imageCache.removeAllObjects()
     diskMissLock.lock()
     diskMissKeys.removeAll()
+    negativeUntilByKey.removeAll()
     diskMissLock.unlock()
   }
 
@@ -201,6 +224,7 @@ enum ChatAvatarImageStore {
     imageCache.removeObject(forKey: key as NSString)
     diskMissLock.lock()
     diskMissKeys.remove(key)
+    negativeUntilByKey.removeValue(forKey: key)
     diskMissLock.unlock()
     let url = diskFileURL(for: key)
     try? FileManager.default.removeItem(at: url)
@@ -232,6 +256,8 @@ enum ChatAvatarImageStore {
       }
     }
 
+    if isNegativeCached(key) { return nil }
+
     let task = await inFlightCoordinator.task(for: key) {
       Task.detached(priority: .utility) {
         await fetchImage(for: key)
@@ -240,6 +266,7 @@ enum ChatAvatarImageStore {
     let image = await task.value
     await inFlightCoordinator.finish(key: key)
 
+    if image == nil { markNegative(key) }
     if let image {
       let prepared = downsample(image, maxPixel: maxPixel) ?? image
       storeInMemory(prepared, key: key)
@@ -529,7 +556,8 @@ struct ChatHomeListRow {
   let type: String?
   let isGroup: Bool
   /// True when `type == "channel"`. Channels are group-like rooms but must NOT
-  /// expose a members roster in the profile (groups do).
+  /// expose a members roster in the profile (groups do). `parse` also forces
+  /// `type = "channel"` when the server sends `isChannel: true`.
   var isChannel: Bool {
     (type ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "channel"
   }
@@ -723,6 +751,7 @@ struct ChatHomeListRow {
     if let avatarGradientStartDark { payload["avatarGradientStartDark"] = avatarGradientStartDark }
     if let avatarGradientEndDark { payload["avatarGradientEndDark"] = avatarGradientEndDark }
     if let type { payload["type"] = type }
+    if isChannel { payload["isChannel"] = true }
     if let myRole { payload["role"] = myRole }
     // Group roster must survive cold start. Without this, opening a group from
     // cache always showed 0 members (profile "No members yet") until a live
@@ -805,9 +834,17 @@ struct ChatHomeListRow {
     let archived = parseBool(raw["archived"]) ?? false
     let isTyping = parseBool(raw["isTyping"] ?? raw["is_typing"]) ?? false
     let isOnline = parseBool(raw["isOnline"] ?? raw["is_online"]) ?? false
-    let type = normalizedString(raw["type"] ?? raw["chatType"] ?? raw["chat_type"])
-    let isGroup =
-      parseBool(raw["isGroup"] ?? raw["is_group"]) ?? (type == "group" || type == "channel")
+    let rawType = normalizedString(raw["type"] ?? raw["chatType"] ?? raw["chat_type"])
+    // Explicit isChannel from server (or cache) wins over a missing/stale type.
+    let explicitChannel = parseBool(raw["isChannel"] ?? raw["is_channel"]) == true
+    let type: String? = explicitChannel ? "channel" : rawType
+    // Type is authoritative for multi-party rooms. Older channel rows may have
+    // `is_group: false` on the server while `type == "channel"` — still treat as
+    // group-like so list/header/profile use the channel path, not a DM.
+    let isGroup: Bool = {
+      if type == "group" || type == "channel" { return true }
+      return parseBool(raw["isGroup"] ?? raw["is_group"]) ?? false
+    }()
     // Per-user role for this room (owner/admin/member). Stabilizes admin chrome
     // without re-deriving only from the members array (which can arrive incomplete).
     let myRole = normalizedString(

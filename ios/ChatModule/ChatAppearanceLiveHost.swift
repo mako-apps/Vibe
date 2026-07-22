@@ -53,7 +53,8 @@ enum ChatAppearancePreviewSamples {
 
   private static func shapeDict(isMe: Bool, radius: CGFloat, showTail: Bool) -> [String: Any] {
     let r = Double(radius)
-    let tight = max(4.0, r * 0.35)
+    // Match live chat: consecutive/merged corner ≈ 12 when primary is 18 (~0.67×).
+    let tight = max(8.0, r * (12.0 / 18.0))
     if isMe {
       return [
         "showTail": showTail,

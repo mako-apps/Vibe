@@ -37,16 +37,7 @@ final class ChatHomeCardCell: UITableViewCell {
   }
 
   static func getFallbackInitials(from name: String) -> String {
-    let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !cleanName.isEmpty else { return "" }
-    let components = cleanName.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-    if components.count >= 2 {
-      let first = components[0].prefix(1)
-      let second = components[1].prefix(1)
-      return (first + second).uppercased()
-    } else {
-      return String(cleanName.prefix(2)).uppercased()
-    }
+    ChatAvatarNodeView.fallbackInitials(from: name)
   }
 
   private let pressOverlayView = UIView()
@@ -60,10 +51,7 @@ final class ChatHomeCardCell: UITableViewCell {
   private let trailingFullSwipeView = ChatHomeSwipeActionTileView(frame: .zero)
   private let rowContentContainer = UIView()
   private let editSelectionContainer = UIView()
-  private let avatarContainer = UIView()
-  private let avatarImageView = UIImageView()
-  private let avatarFallbackIconView = UIImageView()
-  private let avatarFallbackLabel = UILabel()
+  private let avatarNode = ChatAvatarNodeView()
   private let editSelectionBackgroundView = UIView()
   private let editSelectionCheckView = UIImageView()
   private let onlineDot = UIView()
@@ -78,13 +66,6 @@ final class ChatHomeCardCell: UITableViewCell {
   private let pinIconView = UIImageView()
   private let rightCheckmarkView = UIImageView()
 
-  private var avatarLoadTask: Task<Void, Never>?
-  private var avatarToken = UUID().uuidString
-  private var lastAvatarURLString: String?
-  // Archive / Saved Messages rows use a glyph fallback (archivebox / bookmark);
-  // every other row falls back to gradient + initials. Tracked so the async
-  // image-load completion knows which fallback to reveal when there's no photo.
-  private var usesIconFallback = false
   private var rowContentLeadingConstraint: NSLayoutConstraint?
   private var currentEditingLayout = false
   private lazy var swipePanGestureRecognizer: UIPanGestureRecognizer = {
@@ -111,7 +92,6 @@ final class ChatHomeCardCell: UITableViewCell {
   private var leadingFullSwipeSpec: ChatHomeSwipeActionSpec?
   private var trailingFullSwipeSpec: ChatHomeSwipeActionSpec?
   private let largeSwipeHapticGenerator = UIImpactFeedbackGenerator(style: .medium)
-  private let avatarGradientLayerName = "avatarGradient"
 
   weak var swipeDelegate: ChatHomeCardCellSwipeDelegate?
 
@@ -137,15 +117,7 @@ final class ChatHomeCardCell: UITableViewCell {
 
   override func prepareForReuse() {
     super.prepareForReuse()
-    avatarLoadTask?.cancel()
-    avatarLoadTask = nil
-    // Keep avatarToken / lastAvatarURLString / imageView.image until configure.
-    // Clearing them here forced a re-apply of the same cached photo (flicker) on
-    // every reconfigure / bridge poll of already-visible rows.
-    usesIconFallback = false
-    // Keep whatever photo was on screen until the next configure replaces it.
-    // Only hide icon glyph (archive/saved) so it doesn't stick across rows.
-    avatarFallbackIconView.isHidden = true
+    avatarNode.prepareForReuse()
     unreadBadge.isHidden = true
     tierBadgeImageView.isHidden = true
     muteIconView.isHidden = true
@@ -170,6 +142,9 @@ final class ChatHomeCardCell: UITableViewCell {
     transform = .identity
     suppressesPressOverlay = false
     pressOverlayView.alpha = 0
+    dividerView.alpha = 1
+    dividerView.isHidden = false
+    dividerView.transform = .identity
   }
 
   override func setHighlighted(_ highlighted: Bool, animated: Bool) {
@@ -213,10 +188,12 @@ final class ChatHomeCardCell: UITableViewCell {
       isDark
       ? UIColor.white.withAlphaComponent(0.06)
       : UIColor.black.withAlphaComponent(0.035)
+    // Visible hairline under every row (system-separator-ish, stronger than
+    // the previous near-invisible 3–6% wash).
     let dividerColor =
       isDark
-      ? UIColor.white.withAlphaComponent(0.06)
-      : UIColor.black.withAlphaComponent(0.03)
+      ? UIColor.white.withAlphaComponent(0.14)
+      : UIColor.black.withAlphaComponent(0.10)
     let selectionRingColor =
       isDark
       ? UIColor.white.withAlphaComponent(0.22)
@@ -306,72 +283,35 @@ final class ChatHomeCardCell: UITableViewCell {
     rightCheckmarkView.isHidden = !showsRightCheckmark
     rightCheckmarkView.tintColor = isEditSelected ? badgeBackground : secondary.withAlphaComponent(0.3)
 
-    usesIconFallback = row.isArchiveEntry || row.isSavedMessages
-    if usesIconFallback {
-      let fallbackSystemImageName = row.isArchiveEntry ? "archivebox.fill" : "bookmark.fill"
-      avatarFallbackIconView.image = UIImage(systemName: fallbackSystemImageName)
-      avatarFallbackIconView.tintColor = .white
-    } else {
-      avatarFallbackLabel.text = Self.getFallbackInitials(from: row.title)
-    }
-    // Do NOT force-show the letter before loadAvatarImage — that flash is the
-    // flicker users see. loadAvatarImage decides: cache hit → photo; miss with
-    // previous image → keep photo; empty URL → letter; load fail → letter.
-
-    // Every row now has a gradient behind the fallback: an explicit one if the
-    // caller passed it, the Saved/Archive teal, else the SAME deterministic
-    // gradient the profile hero and chat header derive — so a photoless avatar
-    // is a coloured initials tile everywhere (never a flat grey block, never an
-    // icon).
-    let resolvedAvatarGradientColors =
-      avatarGradientColors
-      ?? (usesIconFallback
-        ? Self.savedMessagesGradientColors(isDark: isDark)
-        : ChatProfileAppearanceStore.avatarColors(
-          title: row.title, peerUserId: row.peerUserId, chatId: row.chatId))
-    applyAvatarGradient(
-      startColor: resolvedAvatarGradientColors.0,
-      endColor: resolvedAvatarGradientColors.1
+    let avatarKind: ChatAvatarKind =
+      row.isSavedMessages ? .savedMessages : (row.isArchiveEntry ? .archive : .standard)
+    avatarNode.configure(
+      with: ChatAvatarDescriptor(
+        title: row.title,
+        rawAvatarURI: row.avatarUri,
+        peerUserId: row.peerUserId,
+        chatId: row.chatId,
+        kind: avatarKind,
+        isGroup: row.isGroup || row.isChannel,
+        members: row.members,
+        preferPushAvatar: !row.isGroup && !row.isChannel,
+        gradientColors: avatarGradientColors
+      ),
+      isDark: isDark,
+      renderingSide: 60
     )
     pressOverlayView.backgroundColor = pressedColor
     dividerView.backgroundColor = dividerColor
+    // Swipe-delete animation zeros alpha; always restore on reconfigure.
+    dividerView.alpha = 1
+    dividerView.isHidden = false
     // SwiftUI-List-style swipe surface: while displaced, the row becomes an
     // opaque elevated card (secondary background) instead of a transparent
     // slab the action tiles show through.
     swipeSurfaceColor = isDark ? UIColor(white: 0.12, alpha: 1) : UIColor.white
     updateSwipeChrome()
-    // Capture identity before swipe config overwrites `currentRow`.
-    let previousChatId = currentRow?.chatId
-    let previousAvatarKey = lastAvatarURLString
     updateEditingLayout(isEditing, animated: true)
     configureSwipeActions(for: row, isEditing: isEditing)
-
-    // Telegram-style group rows: when the group has no photo of its own, build a
-    // mosaic from its members' avatars so you see who's in it right from the list.
-    let ownAvatar = (row.avatarUri ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    let sameChat = previousChatId == row.chatId
-    let sameAvatarKey =
-      previousAvatarKey == ownAvatar
-      || (ownAvatar.isEmpty && (previousAvatarKey == nil || previousAvatarKey?.isEmpty == true))
-    // Photo already on screen for this row+URI — leave it alone.
-    let sameRowPhoto =
-      sameChat && sameAvatarKey && avatarImageView.image != nil
-    // Photoless letter already stable for this row — leave letter alone.
-    let sameRowLetter =
-      sameChat && sameAvatarKey && avatarImageView.image == nil
-      && !avatarFallbackLabel.isHidden && !usesIconFallback
-    let sameRowIcon =
-      sameChat && sameAvatarKey && usesIconFallback && !avatarFallbackIconView.isHidden
-
-    if row.isGroup, ownAvatar.isEmpty, row.members.count >= 2 {
-      loadGroupCompositeAvatar(members: row.members, isDark: isDark)
-    } else if sameRowPhoto {
-      showAvatarFallback(false)
-    } else if sameRowLetter || sameRowIcon {
-      // Initials/icon already correct — never re-toggle isHidden (fade thrash).
-    } else {
-      loadAvatarImage(urlString: row.avatarUri)
-    }
   }
 
   private func traceBridgePreview(row: ChatHomeListRow, provider: String?, state: String) {
@@ -466,37 +406,7 @@ final class ChatHomeCardCell: UITableViewCell {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    avatarContainer.layer.sublayers?.first(where: { $0.name == avatarGradientLayerName })?.frame =
-      avatarContainer.bounds
     layoutSwipeActionViews()
-  }
-
-  private func applyAvatarGradient(startColor: UIColor, endColor: UIColor) {
-    var gradient =
-      avatarContainer.layer.sublayers?.first(where: { $0.name == avatarGradientLayerName })
-      as? CAGradientLayer
-    if gradient == nil {
-      gradient = CAGradientLayer()
-      gradient?.name = avatarGradientLayerName
-      avatarContainer.layer.insertSublayer(gradient!, at: 0)
-    }
-    gradient?.colors = [startColor.cgColor, endColor.cgColor]
-    gradient?.startPoint = CGPoint(x: 0.5, y: 0)
-    gradient?.endPoint = CGPoint(x: 0.5, y: 1)
-    gradient?.frame = avatarContainer.bounds
-    avatarContainer.backgroundColor = .clear
-  }
-
-  private static func savedMessagesGradientColors(isDark: Bool) -> (UIColor, UIColor) {
-    let startColor =
-      isDark
-      ? UIColor(red: 77 / 255, green: 217 / 255, blue: 229 / 255, alpha: 1)
-      : UIColor(red: 43 / 255, green: 165 / 255, blue: 181 / 255, alpha: 1)
-    let endColor =
-      isDark
-      ? UIColor(red: 43 / 255, green: 165 / 255, blue: 181 / 255, alpha: 1)
-      : UIColor(red: 0 / 255, green: 122 / 255, blue: 124 / 255, alpha: 1)
-    return (startColor, endColor)
   }
 
   private func configureView() {
@@ -530,6 +440,7 @@ final class ChatHomeCardCell: UITableViewCell {
 
     dividerView.translatesAutoresizingMaskIntoConstraints = false
     dividerView.isUserInteractionEnabled = false
+    dividerView.backgroundColor = UIColor.black.withAlphaComponent(0.10)
 
     rowContentContainer.translatesAutoresizingMaskIntoConstraints = false
     rowContentContainer.backgroundColor = .clear
@@ -539,26 +450,7 @@ final class ChatHomeCardCell: UITableViewCell {
     editSelectionContainer.alpha = 0
     editSelectionContainer.isUserInteractionEnabled = false
 
-    avatarContainer.translatesAutoresizingMaskIntoConstraints = false
-    avatarContainer.layer.cornerRadius = 30
-    avatarContainer.clipsToBounds = true
-
-    avatarImageView.translatesAutoresizingMaskIntoConstraints = false
-    avatarImageView.contentMode = .scaleAspectFill
-    avatarImageView.clipsToBounds = true
-
-    avatarFallbackIconView.translatesAutoresizingMaskIntoConstraints = false
-    avatarFallbackIconView.contentMode = .scaleAspectFit
-    avatarFallbackIconView.image = UIImage(systemName: "person.fill")
-    avatarFallbackIconView.tintColor = UIColor.white
-
-    avatarFallbackLabel.translatesAutoresizingMaskIntoConstraints = false
-    avatarFallbackLabel.textAlignment = .center
-    avatarFallbackLabel.textColor = .white
-    // Modest letter size — oversized initials look broken and flash too hard.
-    avatarFallbackLabel.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
-    avatarFallbackLabel.adjustsFontSizeToFitWidth = true
-    avatarFallbackLabel.minimumScaleFactor = 0.8
+    avatarNode.translatesAutoresizingMaskIntoConstraints = false
 
     editSelectionBackgroundView.translatesAutoresizingMaskIntoConstraints = false
     editSelectionBackgroundView.backgroundColor = .clear
@@ -667,15 +559,13 @@ final class ChatHomeCardCell: UITableViewCell {
     contentView.addSubview(trailingActionsContainer)
     contentView.addSubview(selectionOverlayView)
     contentView.addSubview(pressOverlayView)
-    contentView.addSubview(dividerView)
     contentView.addSubview(editSelectionContainer)
     contentView.addSubview(rowContentContainer)
+    // Divider above row chrome so the hairline is never covered.
+    contentView.addSubview(dividerView)
     leadingActionsContainer.addSubview(leadingFullSwipeView)
     trailingActionsContainer.addSubview(trailingFullSwipeView)
-    rowContentContainer.addSubview(avatarContainer)
-    avatarContainer.addSubview(avatarImageView)
-    avatarContainer.addSubview(avatarFallbackIconView)
-    avatarContainer.addSubview(avatarFallbackLabel)
+    rowContentContainer.addSubview(avatarNode)
     editSelectionContainer.addSubview(editSelectionBackgroundView)
     editSelectionBackgroundView.addSubview(editSelectionCheckView)
     rowContentContainer.addSubview(onlineDot)
@@ -709,11 +599,6 @@ final class ChatHomeCardCell: UITableViewCell {
       pressOverlayView.topAnchor.constraint(equalTo: contentView.topAnchor),
       pressOverlayView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
 
-      dividerView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-      dividerView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-      dividerView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-      dividerView.heightAnchor.constraint(equalToConstant: 1 / UIScreen.main.scale),
-
       editSelectionContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
       editSelectionContainer.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
       editSelectionContainer.widthAnchor.constraint(equalToConstant: 44),
@@ -724,25 +609,18 @@ final class ChatHomeCardCell: UITableViewCell {
       rowContentContainer.topAnchor.constraint(equalTo: contentView.topAnchor),
       rowContentContainer.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
 
-      avatarContainer.leadingAnchor.constraint(equalTo: rowContentContainer.leadingAnchor, constant: 16),
-      avatarContainer.centerYAnchor.constraint(equalTo: rowContentContainer.centerYAnchor),
-      avatarContainer.widthAnchor.constraint(equalToConstant: 60),
-      avatarContainer.heightAnchor.constraint(equalToConstant: 60),
+      avatarNode.leadingAnchor.constraint(equalTo: rowContentContainer.leadingAnchor, constant: 16),
+      avatarNode.centerYAnchor.constraint(equalTo: rowContentContainer.centerYAnchor),
+      avatarNode.widthAnchor.constraint(equalToConstant: 60),
+      avatarNode.heightAnchor.constraint(equalToConstant: 60),
 
-      avatarImageView.leadingAnchor.constraint(equalTo: avatarContainer.leadingAnchor),
-      avatarImageView.trailingAnchor.constraint(equalTo: avatarContainer.trailingAnchor),
-      avatarImageView.topAnchor.constraint(equalTo: avatarContainer.topAnchor),
-      avatarImageView.bottomAnchor.constraint(equalTo: avatarContainer.bottomAnchor),
-
-      avatarFallbackIconView.centerXAnchor.constraint(equalTo: avatarContainer.centerXAnchor),
-      avatarFallbackIconView.centerYAnchor.constraint(equalTo: avatarContainer.centerYAnchor),
-      avatarFallbackIconView.widthAnchor.constraint(equalToConstant: 24),
-      avatarFallbackIconView.heightAnchor.constraint(equalToConstant: 24),
-
-      avatarFallbackLabel.centerXAnchor.constraint(equalTo: avatarContainer.centerXAnchor),
-      avatarFallbackLabel.centerYAnchor.constraint(equalTo: avatarContainer.centerYAnchor),
-      avatarFallbackLabel.widthAnchor.constraint(equalTo: avatarContainer.widthAnchor, constant: -8),
-      avatarFallbackLabel.heightAnchor.constraint(equalTo: avatarContainer.heightAnchor, constant: -8),
+      // Align under the text stack (after avatar + gap). Tracks edit shift
+      // because it is relative to the avatar, not fixed contentView leading.
+      dividerView.leadingAnchor.constraint(
+        equalTo: avatarNode.trailingAnchor, constant: 14),
+      dividerView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+      dividerView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+      dividerView.heightAnchor.constraint(equalToConstant: max(1 / UIScreen.main.scale, 0.5)),
 
       editSelectionBackgroundView.centerXAnchor.constraint(equalTo: editSelectionContainer.centerXAnchor),
       editSelectionBackgroundView.centerYAnchor.constraint(equalTo: editSelectionContainer.centerYAnchor),
@@ -755,10 +633,10 @@ final class ChatHomeCardCell: UITableViewCell {
 
       onlineDot.widthAnchor.constraint(equalToConstant: 12),
       onlineDot.heightAnchor.constraint(equalToConstant: 12),
-      onlineDot.trailingAnchor.constraint(equalTo: avatarContainer.trailingAnchor, constant: -1),
-      onlineDot.bottomAnchor.constraint(equalTo: avatarContainer.bottomAnchor, constant: -1),
+      onlineDot.trailingAnchor.constraint(equalTo: avatarNode.trailingAnchor, constant: -1),
+      onlineDot.bottomAnchor.constraint(equalTo: avatarNode.bottomAnchor, constant: -1),
 
-      textStack.leadingAnchor.constraint(equalTo: avatarContainer.trailingAnchor, constant: 14),
+      textStack.leadingAnchor.constraint(equalTo: avatarNode.trailingAnchor, constant: 14),
       textStack.centerYAnchor.constraint(equalTo: rowContentContainer.centerYAnchor),
       textStack.trailingAnchor.constraint(equalTo: metaStack.leadingAnchor, constant: -10),
 
@@ -1358,153 +1236,6 @@ final class ChatHomeCardCell: UITableViewCell {
     min(1, max(0, value))
   }
 
-  /// Show/hide the no-photo fallback as one unit: the glyph for archive/saved
-  /// rows, the gradient+initials label for everything else. Photo present ⇒ both
-  /// hidden, so a loaded avatar never has a letter sitting on top of it.
-  /// No-ops when already in the requested state (stops letter fade thrash).
-  private func showAvatarFallback(_ show: Bool) {
-    let nextIconHidden = !(show && usesIconFallback)
-    let nextLabelHidden = !(show && !usesIconFallback)
-    if avatarFallbackIconView.isHidden != nextIconHidden {
-      avatarFallbackIconView.isHidden = nextIconHidden
-    }
-    if avatarFallbackLabel.isHidden != nextLabelHidden {
-      avatarFallbackLabel.isHidden = nextLabelHidden
-    }
-  }
-
-  private func loadAvatarImage(urlString: String?) {
-    let normalizedURL = (urlString ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-
-    // Same URL already resolved — leave chrome alone (stable letter or photo).
-    if normalizedURL == lastAvatarURLString {
-      if avatarImageView.image != nil {
-        showAvatarFallback(false)
-        return
-      }
-      if avatarLoadTask != nil {
-        return
-      }
-      // Photoless + already showing letter for this (empty) key.
-      if normalizedURL.isEmpty, !avatarFallbackLabel.isHidden || !avatarFallbackIconView.isHidden {
-        return
-      }
-    }
-
-    if normalizedURL != lastAvatarURLString {
-      avatarLoadTask?.cancel()
-      avatarLoadTask = nil
-    }
-    let token = UUID().uuidString
-    avatarToken = token
-    lastAvatarURLString = normalizedURL
-
-    guard !normalizedURL.isEmpty else {
-      // Stable photoless tile — only clear photo if one is still painted.
-      if avatarImageView.image != nil {
-        avatarImageView.image = nil
-      }
-      showAvatarFallback(true)
-      return
-    }
-
-    if let cached = ChatAvatarImageStore.cached(for: normalizedURL) {
-      if avatarImageView.image !== cached {
-        // Never pass fallbackLabel into apply when we manage it ourselves —
-        // apply toggles isHidden and causes letter flash on reconfigure.
-        avatarImageView.image = cached
-      }
-      showAvatarFallback(false)
-      return
-    }
-
-    // No cache. Keep previous photo if any; if none, keep letter stable while loading
-    // (do NOT show letter then immediately hide it — that was the fade thrash).
-    if avatarImageView.image != nil {
-      showAvatarFallback(false)
-    } else {
-      showAvatarFallback(true)
-    }
-
-    let task = Task { [weak self] in
-      let image = await ChatAvatarImageStore.load(from: normalizedURL)
-      guard !Task.isCancelled else { return }
-      await MainActor.run {
-        guard let self, token == self.avatarToken else { return }
-        self.avatarLoadTask = nil
-        if let image {
-          if self.avatarImageView.image !== image {
-            self.avatarImageView.image = image
-          }
-          self.showAvatarFallback(false)
-        } else if self.avatarImageView.image == nil {
-          self.showAvatarFallback(true)
-        }
-      }
-    }
-    avatarLoadTask = task
-  }
-
-  /// Build (and cache) a mosaic avatar from up to four group members. Members with
-  /// a photo show it; the rest show a coloured initials tile. Slot parsing +
-  /// rendering are shared with the group profile hero via `GroupCompositeAvatar`.
-  private func loadGroupCompositeAvatar(members: [[String: Any]], isDark: Bool) {
-    let usable = Array(GroupCompositeAvatar.slots(from: members).prefix(4))
-    guard usable.count >= 2 else {
-      loadAvatarImage(urlString: nil)
-      return
-    }
-
-    let cacheKey = "group-composite:" + usable.map(\.id).joined(separator: ",")
-    if cacheKey == lastAvatarURLString, avatarImageView.image != nil { return }
-    avatarLoadTask?.cancel()
-    avatarLoadTask = nil
-    lastAvatarURLString = cacheKey
-
-    if let cached = ChatAvatarImageStore.cached(for: cacheKey) {
-      if avatarImageView.image !== cached {
-        avatarImageView.image = cached
-      }
-      showAvatarFallback(false)
-      return
-    }
-
-    // Keep prior composite if any; otherwise keep letter stable while mosaic builds.
-    if avatarImageView.image != nil {
-      showAvatarFallback(false)
-    } else {
-      showAvatarFallback(true)
-    }
-    let token = UUID().uuidString
-    avatarToken = token
-    let side: CGFloat = 60
-
-    let task = Task { [weak self] in
-      var images: [String: UIImage] = [:]
-      await withTaskGroup(of: (String, UIImage?).self) { group in
-        for slot in usable {
-          guard let url = slot.url else { continue }
-          group.addTask { (slot.id, await ChatAvatarImageStore.load(from: url)) }
-        }
-        for await (id, image) in group {
-          if let image { images[id] = image }
-        }
-      }
-      guard !Task.isCancelled else { return }
-      let composite = GroupCompositeAvatar.render(
-        slots: usable, images: images, side: side, isDark: isDark)
-      ChatAvatarImageStore.cache(composite, for: cacheKey)
-      await MainActor.run {
-        guard let self, token == self.avatarToken else { return }
-        self.avatarLoadTask = nil
-        if self.avatarImageView.image !== composite {
-          self.avatarImageView.image = composite
-        }
-        self.showAvatarFallback(false)
-      }
-    }
-    avatarLoadTask = task
-  }
 }
 
 private final class ChatHomeSwipeActionButton: UIButton {

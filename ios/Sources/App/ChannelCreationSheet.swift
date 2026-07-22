@@ -117,20 +117,31 @@ struct ChannelCreationSheet: View {
         remoteAvatarUrl = try await ChatRoomCreateService.uploadAvatar(imageData: avatarData, config: config)
       }
 
+      let trimmedName = channelName.trimmingCharacters(in: .whitespacesAndNewlines)
       let result = try await ChatRoomCreateService.create(
         kind: .channel,
         config: config,
-        name: channelName,
+        name: trimmedName,
         avatarUrl: remoteAvatarUrl
       )
-      
+
+      // Channels are multi-party rooms: isGroup=true + isChannel=true so header,
+      // profile, and send permissions use the channel path (not a DM).
+      let ownMember: [String: Any] = [
+        "userId": config.userID,
+        "name": config.name ?? config.username ?? "You",
+        "role": "owner",
+      ]
       let route = ChatRoute(
         chatId: result.chatID,
         title: result.name,
         peerUserId: nil,
         avatarURI: remoteAvatarUrl,
-        isGroup: false,
-        initialRows: []
+        isGroup: true,
+        isChannel: true,
+        myRole: "owner",
+        initialRows: [],
+        members: [ownMember]
       )
       onCreated(route)
       dismiss()

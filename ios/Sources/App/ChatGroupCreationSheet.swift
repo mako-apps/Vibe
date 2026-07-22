@@ -820,6 +820,7 @@ struct GroupEditSheet: View {
   let config: AppSessionConfig
   let chatId: String
   let initialAvatarUri: String?
+  let isChannel: Bool
   let onSaved: (_ name: String, _ description: String, _ avatarUrl: String?) -> Void
 
   @State private var name: String
@@ -836,11 +837,13 @@ struct GroupEditSheet: View {
     initialName: String,
     initialDescription: String,
     initialAvatarUri: String?,
+    isChannel: Bool = false,
     onSaved: @escaping (String, String, String?) -> Void
   ) {
     self.config = config
     self.chatId = chatId
     self.initialAvatarUri = initialAvatarUri
+    self.isChannel = isChannel
     self.onSaved = onSaved
     _name = State(initialValue: initialName)
     _descriptionText = State(initialValue: initialDescription)
@@ -857,7 +860,7 @@ struct GroupEditSheet: View {
           }
           .buttonStyle(.plain)
 
-          TextField("Group name", text: $name)
+          TextField(isChannel ? "Channel name" : "Group name", text: $name)
             .font(.body)
             .submitLabel(.done)
         }
@@ -870,7 +873,11 @@ struct GroupEditSheet: View {
           Text("Description")
             .font(.headline)
             .padding(.horizontal, 4)
-          TextField("What's this group about?", text: $descriptionText, axis: .vertical)
+          TextField(
+            isChannel ? "What's this channel about?" : "What's this group about?",
+            text: $descriptionText,
+            axis: .vertical
+          )
             .lineLimit(2...5)
             .padding()
             .background(palette.card)
@@ -891,7 +898,7 @@ struct GroupEditSheet: View {
       // Glass sheet: let the frosted material (below) show through instead of a
       // flat solid fill. The inner cards keep their tint for text contrast.
       .background(Color.clear)
-      .navigationTitle("Edit Group")
+      .navigationTitle(isChannel ? "Edit Channel" : "Edit Group")
       .navigationBarTitleDisplayMode(.inline)
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {

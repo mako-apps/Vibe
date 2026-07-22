@@ -2,6 +2,7 @@ defmodule Vibe.Accounts do
   import Ecto.Query, warn: false
   import Plug.Crypto, only: [secure_compare: 2]
   alias Vibe.Repo
+  alias Vibe.Accounts.TokenCache
   alias Vibe.Accounts.User
   alias Vibe.Accounts.UserBlock
 
@@ -54,7 +55,31 @@ defmodule Vibe.Accounts do
     update_user(user, updates)
   end
 
+  # Authenticating a request is the one query that repeats identically on every
+  # call of a session, and the DB is ~350ms away — so it was the floor under every
+  # authenticated endpoint. Serve it from a short-TTL cache; see
+  # `Vibe.Accounts.TokenCache` for the invalidation rules that keep it honest.
   def get_user_by_token(token) when is_binary(token) and byte_size(token) > 0 do
+    case TokenCache.fetch(token) do
+      {:ok, user} -> {:ok, user}
+      :miss -> resolve_user_by_token(token)
+    end
+  end
+
+  def get_user_by_token(_token), do: {:error, :not_found}
+
+  defp resolve_user_by_token(token) do
+    case load_user_by_token(token) do
+      {:ok, user} = ok ->
+        TokenCache.put(token, user)
+        ok
+
+      other ->
+        other
+    end
+  end
+
+  defp load_user_by_token(token) do
     case Repo.get_by(User, login_token: token) do
       nil ->
         case get_session_by_token(token) do
@@ -84,8 +109,6 @@ defmodule Vibe.Accounts do
         end
     end
   end
-
-  def get_user_by_token(_token), do: {:error, :not_found}
 
   # Push a still-valid token's expiry forward on use, so an actively-used app never
   # gets logged out. With key-only login that lockout can mean permanent account
@@ -212,10 +235,23 @@ defmodule Vibe.Accounts do
     user
     |> User.changeset(attrs)
     |> Repo.update()
+    |> tap_invalidate_token_cache(user)
   end
 
   def delete_user(%User{} = user) do
+    TokenCache.invalidate_user(user.id)
+    TokenCache.invalidate(user.login_token)
     Repo.delete(user)
+  end
+
+  # Any write to the user row (profile edit, token rotation, expiry slide) must
+  # evict the cached auth entry, or the next request would authenticate against a
+  # pre-write copy. Sweeping by user id also drops a rotated-away login_token,
+  # which is keyed by its own value and so cannot be found any other way.
+  defp tap_invalidate_token_cache(result, %User{} = previous) do
+    TokenCache.invalidate_user(previous.id)
+    TokenCache.invalidate(previous.login_token)
+    result
   end
 
   @doc """
@@ -507,11 +543,17 @@ defmodule Vibe.Accounts do
         {:error, :not_found}
 
       session ->
-        session
-        |> DeviceSession.changeset(%{
-          revoked_at: DateTime.utc_now() |> DateTime.truncate(:second)
-        })
-        |> Repo.update()
+        result =
+          session
+          |> DeviceSession.changeset(%{
+            revoked_at: DateTime.utc_now() |> DateTime.truncate(:second)
+          })
+          |> Repo.update()
+
+        # A revoked session must stop authenticating immediately, not once the
+        # cached auth entry ages out.
+        TokenCache.invalidate_user(user_id)
+        result
     end
   end
 

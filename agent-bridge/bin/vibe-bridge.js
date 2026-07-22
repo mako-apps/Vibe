@@ -4039,6 +4039,9 @@ function runtimePayload({
   const resolvedPayloadAdvisor = metadata.advisor || advisorFor(provider, task && task.chatId, task);
   if (resolvedPayloadModel) payload.model = resolvedPayloadModel;
   if (resolvedPayloadAdvisor) payload.advisor = resolvedPayloadAdvisor;
+  payload.intelligence = intelligenceFor(task);
+  payload.speed = speedFor(task);
+  payload.reasoningEffort = reasoningEffortFor(provider, task);
   if (metadata.permissionMode) payload.permissionMode = metadata.permissionMode;
   if (metadata.sessionId) payload.sessionId = metadata.sessionId;
   if (metadata.threadId) payload.threadId = metadata.threadId;
@@ -5766,13 +5769,21 @@ async function readJsonl(file, onEvent, maxBytes) {
 
 // — Claude —
 async function claudeSummary(file) {
-  let topic = null, firstUser = null, lastTs = null, messages = 0;
+  let topic = null, firstUser = null, lastTs = null, messages = 0, model = null;
   await readJsonl(file, (ev) => {
     const t = ev.type;
     if (t === "ai-title" && ev.aiTitle) topic = ev.aiTitle;
     else if (t === "user" || t === "assistant") {
       messages++;
       if (ev.timestamp) lastTs = ev.timestamp;
+      if (
+        t === "assistant" &&
+        ev.message &&
+        ev.message.model &&
+        String(ev.message.model) !== "<synthetic>"
+      ) {
+        model = String(ev.message.model);
+      }
       if (t === "user" && !firstUser) {
         const c = ev.message && ev.message.content;
         if (typeof c === "string") {
@@ -5782,7 +5793,7 @@ async function claudeSummary(file) {
       }
     }
   });
-  return { topic: topic || firstUser || "Untitled", lastTs, messages };
+  return { topic: topic || firstUser || "Untitled", lastTs, messages, model };
 }
 
 function claudeSessionFiles() {
@@ -6032,6 +6043,52 @@ function messageHasUserText(m) {
   return false;
 }
 
+const CLAUDE_BACKGROUND_TERMINAL_STATUSES = new Set([
+  "completed", "complete", "done", "success", "failed", "failure", "error",
+  "cancelled", "canceled", "interrupted", "stopped", "killed",
+]);
+
+// Claude Code reports an async Bash lifecycle in two different records: the
+// tool_result carries `backgroundTaskId`, then a task-notification XML envelope
+// announces completion. Keep that lifecycle separate from model turn boundaries:
+// a synthetic task notification is not a new user prompt, while a pending task
+// remains live even if the assistant has already emitted `end_turn`.
+function claudeTaskNotification(event) {
+  if (!event || typeof event !== "object") return null;
+  const candidates = [
+    event.content,
+    event.message && event.message.content,
+    event.attachment && event.attachment.prompt,
+  ];
+  const raw = candidates.find((value) => typeof value === "string" && /<task-notification>/i.test(value));
+  if (!raw) return null;
+  const idMatch = raw.match(/<task-id>\s*([^<]+?)\s*<\/task-id>/i);
+  const statusMatch = raw.match(/<status>\s*([^<]+?)\s*<\/status>/i);
+  const id = idMatch ? String(idMatch[1]).trim() : "";
+  const status = statusMatch ? String(statusMatch[1]).trim().toLowerCase() : "";
+  return id ? { id, status } : null;
+}
+
+function updateClaudeBackgroundTasks(activeTaskIds, event) {
+  if (!(activeTaskIds instanceof Set) || !event || typeof event !== "object") return false;
+  const backgroundTaskId = String(
+    (event.toolUseResult && event.toolUseResult.backgroundTaskId) || ""
+  ).trim();
+  if (backgroundTaskId) activeTaskIds.add(backgroundTaskId);
+
+  const notification = claudeTaskNotification(event);
+  if (!notification) return false;
+  if (
+    event.operation === "remove"
+    || CLAUDE_BACKGROUND_TERMINAL_STATUSES.has(notification.status)
+  ) {
+    activeTaskIds.delete(notification.id);
+  } else {
+    activeTaskIds.add(notification.id);
+  }
+  return true;
+}
+
 // A session is "live" when its transcript file is actively being appended to (a
 // turn is in flight) — detected by a recent mtime — OR when it matches a task the
 // bridge itself spawned and is still running. This lets the phone show a live badge
@@ -6063,6 +6120,14 @@ const GROK_DETAIL_MIDTURN_STALE_MS = Number(
 // a 40-file list — a primary cause of the socket drops + list-retry storm. Now async +
 // cached, so this is a one-time bound; raise via env for full topic parity at 8 MB.
 const CODEX_SUMMARY_HEAD_BYTES = Number(process.env.VIBE_CODEX_SUMMARY_HEAD_BYTES || 4 * 1024 * 1024);
+// Model/effort are emitted on `turn_context`, including when a resumed session
+// changes model. Read a bounded tail for roster rows so we see the latest context
+// without turning a 40-row list into 40 full rollout scans. The result is stored in
+// historySummaryCache alongside the head summary and invalidated only when the file
+// grows.
+const CODEX_METADATA_TAIL_BYTES = Number(
+  process.env.VIBE_CODEX_METADATA_TAIL_BYTES || 1024 * 1024
+);
 
 // Per-file roster-summary cache. Session/rollout files only ever APPEND, and every
 // field the list surfaces (topic, meta, first-message count) is derived from the file
@@ -6086,6 +6151,46 @@ function setCachedSummary(file, size, summary) {
   }
 }
 
+async function codexMetadataFromTail(file, size) {
+  const fileSize = Math.max(
+    0,
+    Number(size) || await fs.promises.stat(file).then((stat) => stat.size).catch(() => 0)
+  );
+  const length = Math.min(fileSize, CODEX_METADATA_TAIL_BYTES);
+  if (!length) return {};
+  let handle;
+  try {
+    handle = await fs.promises.open(file, "r");
+    const buffer = Buffer.allocUnsafe(length);
+    const position = Math.max(0, fileSize - length);
+    const { bytesRead } = await handle.read(buffer, 0, length, position);
+    let body = buffer.subarray(0, bytesRead).toString("utf8");
+    if (position > 0) body = body.slice(Math.max(0, body.indexOf("\n") + 1));
+    let model = null;
+    let reasoningEffort = null;
+    for (const line of body.split("\n")) {
+      if (!line) continue;
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      if (!event || event.type !== "turn_context" || !event.payload) continue;
+      if (event.payload.model && String(event.payload.model).trim()) {
+        model = String(event.payload.model).trim();
+      }
+      if (event.payload.effort && String(event.payload.effort).trim()) {
+        reasoningEffort = String(event.payload.effort).trim();
+      }
+    }
+    return {
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    };
+  } catch {
+    return {};
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
 function runningSessionIdSet(provider) {
   const set = new Set();
   const want = String(provider || "").trim().toLowerCase();
@@ -6100,6 +6205,25 @@ function runningSessionIdSet(provider) {
     if (entry.sessionId) set.add(entry.sessionId);
   }
   return set;
+}
+
+// A history row and its bridge task share the durable provider session id. Prefer
+// the newest matching task if reconnect/re-delivery briefly leaves more than one
+// entry, and expose only values the live task actually knows.
+function runningSessionMetadata(provider, sessionId) {
+  if (!sessionId) return {};
+  const want = String(provider || "").trim().toLowerCase();
+  let match = null;
+  for (const entry of runningTasks.values()) {
+    if (!entry || entry.sessionId !== sessionId) continue;
+    if (want && String(entry.provider || "").toLowerCase() !== want) continue;
+    if (!match || Number(entry.startedAt || 0) > Number(match.startedAt || 0)) match = entry;
+  }
+  if (!match) return {};
+  const metadata = {};
+  if (match.model) metadata.model = match.model;
+  if (match.reasoningEffort) metadata.reasoningEffort = match.reasoningEffort;
+  return metadata;
 }
 
 function sessionIsLive(mtime, id, runningIds) {
@@ -6155,10 +6279,13 @@ async function claudeOpenTurnState(file, size) {
     let text = buffer.subarray(0, bytesRead).toString("utf8");
     if (position > 0) text = text.slice(Math.max(0, text.indexOf("\n") + 1));
     let state = null;
+    const activeBackgroundTasks = new Set();
     for (const line of text.split("\n")) {
       if (!line) continue;
       let event;
       try { event = JSON.parse(line); } catch { continue; }
+      const isTaskNotification = updateClaudeBackgroundTasks(activeBackgroundTasks, event);
+      if (isTaskNotification) continue;
       if (!event || (event.type !== "user" && event.type !== "assistant")) continue;
       const message = event.message || {};
       if (event.type === "user") {
@@ -6169,7 +6296,7 @@ async function claudeOpenTurnState(file, size) {
       const stop = String(message.stop_reason || "").toLowerCase();
       state = stop === "end_turn" ? false : true;
     }
-    return state;
+    return activeBackgroundTasks.size > 0 ? true : state;
   } catch {
     return null;
   } finally {
@@ -6190,6 +6317,7 @@ async function listClaude(limit) {
       || (explicitTurnState == null
         ? sessionIsLive(s.mtime, s.id, runningIds)
         : explicitTurnState);
+    const liveMetadata = runningSessionMetadata("claude", s.id);
     results.push({
       provider: "claude",
       id: s.id,
@@ -6199,6 +6327,8 @@ async function listClaude(limit) {
       updatedAt: sum.lastTs || new Date(s.mtime).toISOString(),
       messageCount: sum.messages,
       live,
+      ...(liveMetadata.model || sum.model ? { model: liveMetadata.model || sum.model } : {}),
+      ...(liveMetadata.reasoningEffort ? { reasoningEffort: liveMetadata.reasoningEffort } : {}),
     });
   }
   return results;
@@ -7780,6 +7910,8 @@ async function claudeDetail(id, limit, before) {
   const messages = [];
   let pending = newRuntimeAccumulator();
   let topic = null;
+  let model = null;
+  const activeBackgroundTasks = new Set();
   // Claude Code re-appends prior messages (same `uuid`) into the JSONL every time a
   // session is resumed/compacted, so a long session contains the SAME message many
   // times over. Replaying those duplicates produced garbled "corpse" history and
@@ -7823,9 +7955,14 @@ async function claudeDetail(id, limit, before) {
   };
   await readJsonl(match.file, (ev) => {
     if (ev.type === "ai-title" && ev.aiTitle) topic = ev.aiTitle;
+    const isTaskNotification = updateClaudeBackgroundTasks(activeBackgroundTasks, ev);
+    if (isTaskNotification) return;
     if (ev.type !== "user" && ev.type !== "assistant") return;
-    if (ev.uuid) { if (seen.has(ev.uuid)) return; seen.add(ev.uuid); }
     const m = ev.message || {};
+    if (ev.type === "assistant" && m.model && String(m.model) !== "<synthetic>") {
+      model = String(m.model);
+    }
+    if (ev.uuid) { if (seen.has(ev.uuid)) return; seen.add(ev.uuid); }
     // /compact summaries are injected as user messages — render them as a
     // mid-chat divider (kind:"summary"), never a user bubble or a turn boundary.
     if (ev.type === "user" && ev.isCompactSummary) {
@@ -7957,6 +8094,7 @@ async function claudeDetail(id, limit, before) {
     if (ev.timestamp) lastEventTs = ev.timestamp;
   });
   flushTurn();
+  if (activeBackgroundTasks.size > 0) lastStopReason = "background_task";
   // Keep the most RECENT `limit` messages (the tail), not the oldest — a long
   // session must show what's happening NOW, not its opening turns (this was the
   // "messages are too old" bug: reading stopped at `limit` from the top). The
@@ -7968,6 +8106,7 @@ async function claudeDetail(id, limit, before) {
   // received the WHOLE session — otherwise "absent" just means "older than the
   // window", and deleting those would erase valid scrollback.
   const window = windowHistoryMessages(messages, limit, before);
+  const liveMetadata = runningSessionMetadata("claude", id);
   return {
     provider: "claude",
     id,
@@ -7982,6 +8121,8 @@ async function claudeDetail(id, limit, before) {
     totalMessages: window.totalMessages,
     messages: window.messages,
     lastStopReason,
+    ...(liveMetadata.model || model ? { model: liveMetadata.model || model } : {}),
+    ...(liveMetadata.reasoningEffort ? { reasoningEffort: liveMetadata.reasoningEffort } : {}),
   };
 }
 
@@ -8121,7 +8262,7 @@ function codexStoredTitles() {
 // fs.readSync(8 MB)-per-file scan that blocked the event loop for seconds across a
 // 40-file list (starving the WebSocket heartbeat) — this streams async so the socket
 // stays alive, and stops after a few KB for the common case.
-async function codexSummaryFromHead(file) {
+async function codexSummaryFromHead(file, size) {
   let meta = null, topic = null, assistantTopic = null, messages = 0, userTurns = 0;
   await readJsonl(file, (ev) => {
     if (ev.type === "session_meta") { meta = ev.payload || meta || {}; return; }
@@ -8147,17 +8288,27 @@ async function codexSummaryFromHead(file) {
     if (topic && !isWeakCodexTitle(topic) && messages >= 2) return false;
     if (topic && isWeakCodexTitle(topic) && assistantTopic) return false;
   }, CODEX_SUMMARY_HEAD_BYTES);
+  const sessionMetadata = await codexMetadataFromTail(file, size);
   const resolvedTopic = resolveCodexTopic(null, topic, assistantTopic);
   const renderedMessages = userTurns > 0 ? userTurns * 2 : messages;
-  return { meta, topic: resolvedTopic, lastTs: null, messages, renderedMessages };
+  return { meta, topic: resolvedTopic, lastTs: null, messages, renderedMessages, ...sessionMetadata };
 }
 
 async function codexSummary(file, opts = {}) {
-  if (opts.fast) return codexSummaryFromHead(file);
+  if (opts.fast) return codexSummaryFromHead(file, opts.size);
   let meta = null, topic = null, assistantTopic = null, lastTs = null, messages = 0, userTurns = 0;
+  let model = null, reasoningEffort = null;
   await readJsonl(file, (ev) => {
-    if (ev.type === "session_meta") meta = ev.payload || {};
-    else if (ev.type === "response_item" && ev.payload && ev.payload.type === "message") {
+    if (ev.type === "session_meta") {
+      meta = ev.payload || {};
+    } else if (ev.type === "turn_context" && ev.payload) {
+      if (ev.payload.model && String(ev.payload.model).trim()) {
+        model = String(ev.payload.model).trim();
+      }
+      if (ev.payload.effort && String(ev.payload.effort).trim()) {
+        reasoningEffort = String(ev.payload.effort).trim();
+      }
+    } else if (ev.type === "response_item" && ev.payload && ev.payload.type === "message") {
       const role = ev.payload.role;
       if (role !== "user" && role !== "assistant") return;
       const raw = codexText(ev.payload.content);
@@ -8180,7 +8331,7 @@ async function codexSummary(file, opts = {}) {
   });
   const resolvedTopic = resolveCodexTopic(null, topic, assistantTopic);
   const renderedMessages = userTurns > 0 ? userTurns * 2 : messages;
-  return { meta, topic: resolvedTopic, lastTs, messages, renderedMessages };
+  return { meta, topic: resolvedTopic, lastTs, messages, renderedMessages, model, reasoningEffort };
 }
 
 async function listCodex(limit) {
@@ -8190,7 +8341,7 @@ async function listCodex(limit) {
   const results = [];
   for (const f of files) {
     let sum = getCachedSummary(f.file, f.size);
-    if (!sum) { sum = await codexSummary(f.file, { fast: true }); setCachedSummary(f.file, f.size, sum); }
+    if (!sum) { sum = await codexSummary(f.file, { fast: true, size: f.size }); setCachedSummary(f.file, f.size, sum); }
     if (sum.messages === 0) continue;
     const project = (sum.meta && sum.meta.cwd) || "";
     if (isEphemeralProject(project)) continue;
@@ -8207,6 +8358,7 @@ async function listCodex(limit) {
       || (explicitTurnState == null
         ? sessionIsLive(f.mtime, id, runningIds)
         : explicitTurnState);
+    const liveMetadata = runningSessionMetadata("codex", id);
     results.push({
       provider: "codex",
       id,
@@ -8216,6 +8368,10 @@ async function listCodex(limit) {
       updatedAt: new Date(f.mtime).toISOString(),
       messageCount: Math.max(1, sum.renderedMessages || sum.messages || 0),
       live,
+      ...(liveMetadata.model || sum.model ? { model: liveMetadata.model || sum.model } : {}),
+      ...(liveMetadata.reasoningEffort || sum.reasoningEffort
+        ? { reasoningEffort: liveMetadata.reasoningEffort || sum.reasoningEffort }
+        : {}),
     });
   }
   return results;
@@ -8237,6 +8393,8 @@ async function codexDetail(id, limit, before) {
   let assistantFallbackTopic = null;
   let pending = newRuntimeAccumulator();
   let project = "";
+  let model = null;
+  let reasoningEffort = null;
   // Same guard as Claude: skip any response_item we've already processed (by id) so a
   // resumed/re-emitted rollout never replays a message or its apply_patch twice.
   const seen = new Set();
@@ -8270,6 +8428,15 @@ async function codexDetail(id, limit, before) {
   };
   await readJsonl(match.file, (ev) => {
     if (ev.type === "session_meta" && ev.payload) project = ev.payload.cwd || "";
+    if (ev.type === "turn_context" && ev.payload) {
+      if (ev.payload.model && String(ev.payload.model).trim()) {
+        model = String(ev.payload.model).trim();
+      }
+      if (ev.payload.effort && String(ev.payload.effort).trim()) {
+        reasoningEffort = String(ev.payload.effort).trim();
+      }
+      return;
+    }
     if (ev.type !== "response_item" || !ev.payload) return;
     const p = ev.payload;
     const dkey = p.id || ev.id || `codex-${eventSeq}`;
@@ -8345,6 +8512,7 @@ async function codexDetail(id, limit, before) {
     assistantFallbackTopic
   );
   const window = windowHistoryMessages(messages, limit, before);
+  const liveMetadata = runningSessionMetadata("codex", id);
   return {
     provider: "codex",
     id,
@@ -8358,6 +8526,10 @@ async function codexDetail(id, limit, before) {
     windowEnd: window.windowEnd,
     totalMessages: window.totalMessages,
     messages: window.messages,
+    ...(liveMetadata.model || model ? { model: liveMetadata.model || model } : {}),
+    ...(liveMetadata.reasoningEffort || reasoningEffort
+      ? { reasoningEffort: liveMetadata.reasoningEffort || reasoningEffort }
+      : {}),
   };
 }
 
@@ -9619,9 +9791,19 @@ function isInterruptMarkerMessage(m) {
 function markDetailLiveTurn(result, provider, sessionId, chatId) {
   if (!result || result.mode !== "detail") return false;
   const msgs = result.session && result.session.messages;
-  if (!Array.isArray(msgs) || !msgs.length) return false;
+  if (!Array.isArray(msgs)) return false;
+  const runningEntry = runningTaskForChat(chatId);
+  const spawnedRunning = !!runningEntry;
+  // A bridge-owned task is live before Claude has persisted either the mirrored user
+  // prompt or its first assistant block. Surface that pre-token thinking phase now;
+  // otherwise STOP/header state only appears after the first streamed text/tool node.
+  if (!msgs.length) {
+    const placeholder = runningPlaceholderMessage(runningEntry);
+    if (!placeholder) return false;
+    msgs.push(placeholder);
+    return true;
+  }
   if (isInterruptMarkerMessage(msgs[msgs.length - 1])) return false; // stopped → settled
-  const spawnedRunning = !!runningTaskForChat(chatId);
   // Structural turn state (Claude only): the transcript's last assistant entry says
   // whether the turn truly ended (end_turn / stop_sequence) or is mid-flight
   // (tool_use, or null while an entry is being written). mtime alone can't tell a
@@ -9637,9 +9819,9 @@ function markDetailLiveTurn(result, provider, sessionId, chatId) {
   // A fresh user prompt with no assistant reply yet = the model is thinking before
   // its first token — the phone otherwise shows nothing "live" until the first
   // entry lands. Synthesize a running thinking turn so the chat goes live at send.
-  if (!spawnedRunning && last0 && last0.role === "user"
-      && sessionFileIsLive(provider, sessionId, midturnWindowMs)) {
-    msgs.push({
+  if (last0 && last0.role === "user"
+      && (spawnedRunning || sessionFileIsLive(provider, sessionId, midturnWindowMs))) {
+    const placeholder = runningPlaceholderMessage(runningEntry) || {
       role: "assistant",
       text: "",
       uid: `running-mirror-${sessionId}`,
@@ -9648,7 +9830,8 @@ function markDetailLiveTurn(result, provider, sessionId, chatId) {
       progressNodes: [
         { id: `running-mirror-${sessionId}`, label: "Thinking", kind: "thinking", status: "running", depth: 0 },
       ],
-    });
+    };
+    msgs.push(placeholder);
     return true;
   }
   if (!spawnedRunning) {
@@ -12762,7 +12945,11 @@ module.exports = {
   handleFileRequest,
   normalizeModel,
   runningPlaceholderMessage,
+  markDetailLiveTurn,
   markMessageRunning,
+  claudeOpenTurnState,
+  claudeTaskNotification,
+  updateClaudeBackgroundTasks,
   sessionFilePath,
   sessionFileIsLive,
   providerTerminalFailure,

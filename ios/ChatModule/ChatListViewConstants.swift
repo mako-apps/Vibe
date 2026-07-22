@@ -7,10 +7,11 @@ let sectionTopInset: CGFloat = 10.0
 let sectionBottomInset: CGFloat = 14.0
 let bubbleSideMargin: CGFloat = 2.0
 let bubbleHorizontalPadding: CGFloat = 12.0
-let bubbleTopPadding: CGFloat = 7.0
+// Telegram text bubbles sit a bit tighter vertically than 7/8.
+let bubbleTopPadding: CGFloat = 5.0
 // Slightly more bottom pad so meta/time clear the lower Telegram-aligned tail join.
-let bubbleBottomPadding: CGFloat = 8.0
-let bubbleMetaTopSpacing: CGFloat = 2.0
+let bubbleBottomPadding: CGFloat = 6.0
+let bubbleMetaTopSpacing: CGFloat = 1.0
 let bubbleMetaHeight: CGFloat = 14.0
 let bubbleMinWidth: CGFloat = 26.0
 let bubbleMaxWidthFactor: CGFloat = 0.85

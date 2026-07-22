@@ -1,5 +1,30 @@
 import Foundation
 
+/// Shares one in-flight `/api/chats` request per list (normal / archived) across
+/// every concurrent caller. See `ChatHomeService.coalesced(config:archived:)`.
+private actor ChatsRequestCoalescer {
+  static let shared = ChatsRequestCoalescer()
+
+  private var inFlight: [Bool: Task<[ChatHomeListRow], Error>] = [:]
+
+  func load(
+    archived: Bool,
+    using work: @escaping () async throws -> [ChatHomeListRow]
+  ) async throws -> [ChatHomeListRow] {
+    // A request is already out for this list — ride along with it. Actor
+    // reentrancy is what makes this work: `await` below suspends without holding
+    // the actor, so later callers can still see and join the in-flight entry.
+    if let existing = inFlight[archived] {
+      return try await existing.value
+    }
+    let task = Task { try await work() }
+    inFlight[archived] = task
+    let result = await task.result
+    inFlight[archived] = nil
+    return try result.get()
+  }
+}
+
 enum ChatHomeService {
   static func cachedRows(config: AppSessionConfig) -> [ChatHomeListRow] {
     rowsIncludingBuiltInAgent(ChatHomeRowsCache.rows(userID: config.userID))
@@ -55,11 +80,29 @@ enum ChatHomeService {
   }
 
   static func fetchChats(config: AppSessionConfig) async throws -> [ChatHomeListRow] {
-    try await fetchChats(config: config, archived: false)
+    try await coalesced(config: config, archived: false)
   }
 
   static func fetchArchivedChats(config: AppSessionConfig) async throws -> [ChatHomeListRow] {
-    try await fetchChats(config: config, archived: true)
+    try await coalesced(config: config, archived: true)
+  }
+
+  /// `/api/chats` has several independent callers (Home's list, the archived list,
+  /// the home view controller, an opened profile) and at launch they fire at the
+  /// same moment — production logs showed three or four identical requests landing
+  /// within one millisecond of each other, each costing seconds of server time and
+  /// each holding one of URLSession's few per-host connections while the rest of
+  /// the launch burst queued behind them.
+  ///
+  /// Concurrent callers now share a single request and all receive its result.
+  /// This is a *sharing* window, not a cache: the entry is dropped the moment the
+  /// request finishes, so a later refresh still goes to the network.
+  private static func coalesced(config: AppSessionConfig, archived: Bool) async throws
+    -> [ChatHomeListRow]
+  {
+    try await ChatsRequestCoalescer.shared.load(archived: archived) {
+      try await fetchChats(config: config, archived: archived)
+    }
   }
 
   private static func fetchChats(config: AppSessionConfig, archived: Bool) async throws

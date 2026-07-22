@@ -216,6 +216,8 @@ struct ChatListRow {
     let cwd: String?
     let workMode: String?
     let model: String?
+    /// Bridge-reported thinking/reasoning effort for this run (`low`…`max`).
+    let reasoningEffort: String?
     let advisor: String?
     let permissionMode: String?
     let sessionId: String?
@@ -505,6 +507,9 @@ struct ChatListRow {
   let replyToId: String?
   let replyPreviewTitle: String?
   let replyPreviewText: String?
+  /// User id of the author referenced by the reply preview (quoted original).
+  /// Used to resolve that author's banner palette for the compact preview only.
+  let replyPreviewUserId: String?
   let reactionEmoji: String?
   let shape: BubbleShape
   let messageType: String
@@ -681,6 +686,7 @@ struct ChatListRow {
       replyToId = nil
       replyPreviewTitle = nil
       replyPreviewText = nil
+      replyPreviewUserId = nil
       reactionEmoji = nil
       shape = BubbleShape(
         isMe: false, showTail: false, borderTopLeftRadius: 18, borderTopRightRadius: 18,
@@ -799,6 +805,22 @@ struct ChatListRow {
     ) ?? firstNonEmptyString(
       in: [replyPreview],
       keys: ["text", "preview"]
+    )
+    replyPreviewUserId = firstNonEmptyString(
+      in: [message, metadata, extra],
+      keys: [
+        "replyPreviewUserId", "reply_preview_user_id",
+        "replyAuthorId", "reply_author_id",
+      ]
+    ) ?? firstNonEmptyString(
+      in: [replyPreview],
+      keys: [
+        "replyPreviewUserId", "reply_preview_user_id",
+        "replyAuthorId", "reply_author_id",
+        "senderId", "sender_id",
+        "userId", "user_id",
+        "from_id", "fromId",
+      ]
     )
     reactionEmoji = message["reactionEmoji"] as? String
     messageType = ((message["type"] as? String) ?? "text").lowercased()
@@ -1337,7 +1359,8 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && (lhs.isAgentMessage
       || (lhs.replyToId == rhs.replyToId
         && lhs.replyPreviewTitle == rhs.replyPreviewTitle
-        && lhs.replyPreviewText == rhs.replyPreviewText))
+        && lhs.replyPreviewText == rhs.replyPreviewText
+        && lhs.replyPreviewUserId == rhs.replyPreviewUserId))
     && lhs.messageType == rhs.messageType
     && lhs.mediaUrl == rhs.mediaUrl && lhs.localMediaUrl == rhs.localMediaUrl
     && lhs.mediaKey == rhs.mediaKey && lhs.fileName == rhs.fileName
@@ -1412,6 +1435,12 @@ func chatListRowSignatureFields(_ row: ChatListRow) -> [(name: String, value: St
     ("replyToId", row.isAgentMessage ? "-" : String(describing: row.replyToId)),
     ("replyPreviewTitle", row.isAgentMessage ? "-" : String(describing: row.replyPreviewTitle)),
     ("replyPreviewText", row.isAgentMessage ? "-" : String(describing: row.replyPreviewText)),
+    // Neutral for EVERY row, not just agent rows: the reply author's id has no effect on
+    // any measurement, and it is resolved LATE (the reply-preview pass fills nil→uuid ~2s
+    // after open — `[ChatOpen] parse reuse-MISS … fields=[message.replyPreviewUserId=77]`).
+    // Heights are persisted after that pass and audited before it, so including it made
+    // every reply row fail its signature audit on the next open and re-measure on screen.
+    ("replyPreviewUserId", "-"),
     ("messageType", row.messageType), ("mediaUrl", String(describing: row.mediaUrl)),
     ("localMediaUrl", String(describing: row.localMediaUrl)),
     ("mediaKey", String(describing: row.mediaKey)), ("fileName", String(describing: row.fileName)),
@@ -1622,6 +1651,13 @@ func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
     cwd: parseNonEmptyString(object["cwd"]),
     workMode: parseNonEmptyString(object["workMode"] ?? object["work_mode"]),
     model: parseNonEmptyString(object["model"]),
+    reasoningEffort: parseNonEmptyString(
+      object["reasoningEffort"]
+        ?? object["reasoning_effort"]
+        ?? object["agentBridgeReasoningEffort"]
+        ?? object["intelligence"]
+        ?? object["agentBridgeIntelligence"]
+    ),
     advisor: parseNonEmptyString(object["advisor"] ?? object["advisorModel"] ?? object["advisor_model"]),
     permissionMode: parseNonEmptyString(object["permissionMode"] ?? object["permission_mode"]),
     sessionId: parseNonEmptyString(object["sessionId"] ?? object["session_id"]),

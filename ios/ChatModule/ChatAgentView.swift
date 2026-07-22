@@ -2764,21 +2764,26 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     isSequenceEnd: Bool,
     showTail: Bool
   ) -> [String: Any] {
+    // Match ChatEngine bubbleShapePayload — full 18 / merged 12 (Telegram-like).
+    let full: CGFloat = 18
+    let merged: CGFloat = 12
     var shape: [String: Any] = [
       "isMe": isMe,
       "showTail": showTail && isSequenceEnd,
-      "borderTopLeftRadius": 18,
-      "borderTopRightRadius": 18,
-      "borderBottomLeftRadius": 18,
-      "borderBottomRightRadius": 18,
+      "borderTopLeftRadius": full,
+      "borderTopRightRadius": full,
+      "borderBottomLeftRadius": full,
+      "borderBottomRightRadius": full,
     ]
 
     if isMe {
-      shape["borderTopRightRadius"] = isSequenceStart ? 18 : 5
-      shape["borderBottomRightRadius"] = isSequenceEnd ? 18 : 5
+      // Outgoing top-right remains full in every sequence position; only the
+      // bottom-right corner tightens when another outgoing bubble follows.
+      shape["borderTopRightRadius"] = full
+      shape["borderBottomRightRadius"] = isSequenceEnd ? full : merged
     } else {
-      shape["borderTopLeftRadius"] = isSequenceStart ? 18 : 5
-      shape["borderBottomLeftRadius"] = isSequenceEnd ? 18 : 5
+      shape["borderTopLeftRadius"] = isSequenceStart ? full : merged
+      shape["borderBottomLeftRadius"] = isSequenceEnd ? full : merged
     }
 
     return shape

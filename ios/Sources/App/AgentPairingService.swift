@@ -231,6 +231,12 @@ struct AgentBridgeRunningTask: Hashable, Identifiable {
   let cwd: String?
   let workMode: String?
   let model: String?
+  /// Bridge-reported thinking/reasoning effort (`low`…`max`) when known.
+  var reasoningEffort: String? = nil
+  /// Optional intelligence level from the spawn options (`low` / `medium` / …).
+  var intelligence: String? = nil
+  /// Optional speed mode from the spawn options (`fast` / `standard` / `careful`).
+  var speed: String? = nil
   let startedAt: String?
   let teamRunId: String?
   let teamMode: String?
@@ -239,6 +245,21 @@ struct AgentBridgeRunningTask: Hashable, Identifiable {
   var id: String {
     if let sessionId, !sessionId.isEmpty { return sessionId }
     return taskId
+  }
+
+  /// Prefer explicit reasoning effort; fall back to mapped intelligence when present.
+  var effectiveReasoningEffort: String? {
+    if let effort = reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !effort.isEmpty
+    {
+      return effort
+    }
+    if let intelligence,
+      let level = AgentBridgeIntelligenceLevel.fromProviderEffort(intelligence)
+    {
+      return level.providerEffort
+    }
+    return nil
   }
 }
 
@@ -1380,6 +1401,64 @@ enum AgentPairingService {
     return Date().timeIntervalSince(at) < maxAge
   }
 
+  /// Shared in-flight status request, so N surfaces asking at once cost ONE round trip.
+  @MainActor private static var statusFetchInFlight: Task<AgentBridgeStatus, Error>?
+
+  /// Coalesced status read. Returns the cached snapshot while it is younger than
+  /// `maxAge`, and otherwise shares a single request with every concurrent caller.
+  ///
+  /// Why: measured against the deployed server, `/api/agent-bridge/status` costs ~700ms
+  /// EVERY time, and Home (2s loop) + an open agent profile (3s loop) were each firing
+  /// their own — the Railway log is a wall of paired status calls every ~3s, forever.
+  /// On a small instance that polling is most of the load, which is why the launch's
+  /// `/api/chats` sat at ~6.5s. Nothing here needs second-level freshness: the LAN bridge
+  /// pushes an authoritative snapshot on every task start/finish (`ingestLanStatusSnapshot`).
+  @MainActor
+  static func statusCoalesced(
+    config: AppSessionConfig, maxAge: TimeInterval = 5
+  ) async throws -> AgentBridgeStatus {
+    if let cached = lastStatus, statusIsFresh(maxAge: maxAge) {
+      return cached
+    }
+    if let inFlight = statusFetchInFlight {
+      return try await inFlight.value
+    }
+    let task = Task<AgentBridgeStatus, Error> { try await status(config: config) }
+    statusFetchInFlight = task
+    do {
+      let result = try await task.value
+      statusFetchInFlight = nil
+      return result
+    } catch {
+      statusFetchInFlight = nil
+      throw error
+    }
+  }
+
+  /// Cadence for the surfaces that keep a background status loop alive.
+  ///
+  /// These loops used to run at 2–2.5s each, and several ran at once (Home while
+  /// mounted, any open group/bridge chat, the connect panel, an open agent profile).
+  /// Against a server where this endpoint costs a real round trip, that was a
+  /// permanent load floor for the entire foreground session. The server now pushes
+  /// `bridge-status` on every Presence change, so these loops are demoted to a
+  /// safety net for a wedged socket.
+  static let statusFallbackInterval: TimeInterval = 20
+
+  static var statusFallbackIntervalNanos: UInt64 {
+    UInt64(statusFallbackInterval * 1_000_000_000)
+  }
+
+  /// Refresh bridge status only if no snapshot has arrived recently. With the socket
+  /// push feeding `lastStatusFetchedAt`, the healthy case costs nothing at all.
+  @MainActor
+  static func refreshStatusIfStale(
+    config: AppSessionConfig, maxAge: TimeInterval = statusFallbackInterval
+  ) async {
+    guard !statusIsFresh(maxAge: maxAge) else { return }
+    _ = try? await statusCoalesced(config: config, maxAge: maxAge)
+  }
+
   /// GET /api/agent-bridge/status
   static func status(config: AppSessionConfig) async throws -> AgentBridgeStatus {
     let request = try buildRequest(config: config, path: "/agent-bridge/status", method: "GET")
@@ -1396,6 +1475,18 @@ enum AgentPairingService {
   static func ingestLanStatusSnapshot(_ object: [String: Any]) {
     let result = statusSnapshot(from: object, directBridge: true)
     publishStatus(result, source: "lan")
+  }
+
+  /// The server pushes `bridge-status` on the already-joined `user:<id>` topic
+  /// whenever a computer joins/leaves the bridge or updates its repos and running
+  /// tasks. This is the authoritative cloud snapshot, delivered the instant it
+  /// changes — it is what makes polling `/api/agent-bridge/status` unnecessary.
+  /// Publishing here also stamps `lastStatusFetchedAt`, so `statusIsFresh()` keeps
+  /// every surface off the network for as long as the socket is feeding us.
+  @MainActor
+  static func ingestSocketStatusSnapshot(_ object: [String: Any]) {
+    let result = statusSnapshot(from: object, directBridge: false)
+    publishStatus(result, source: "socket")
   }
 
   private static func statusSnapshot(
@@ -1681,6 +1772,17 @@ enum AgentPairingService {
       cwd: normalizedString(object["cwd"]),
       workMode: normalizedString(object["workMode"] ?? object["work_mode"]),
       model: normalizedString(object["model"]),
+      reasoningEffort: normalizedString(
+        object["reasoningEffort"]
+          ?? object["reasoning_effort"]
+          ?? object["agentBridgeReasoningEffort"]
+      ),
+      intelligence: normalizedString(
+        object["intelligence"]
+          ?? object["agentBridgeIntelligence"]
+          ?? object["thinkingMode"]
+      ),
+      speed: normalizedString(object["speed"] ?? object["agentBridgeSpeed"]),
       startedAt: normalizedString(object["startedAt"] ?? object["started_at"]),
       teamRunId: normalizedString(object["teamRunId"] ?? object["team_run_id"]),
       teamMode: normalizedString(object["teamMode"] ?? object["team_mode"]),

@@ -358,35 +358,35 @@ defmodule Vibe.AgentBridge do
 
   def online?(_), do: false
 
+  @doc """
+  Status payload for a live push to the phone, built without a DB round trip
+  whenever possible.
+
+  `UserChannel` calls this on every Presence change on the `bridge:<id>` topic,
+  which is what lets the phone stop polling `/api/agent-bridge/status`: a computer
+  coming online, changing repos, or starting/finishing a task all surface as a
+  Presence diff, and the phone is already joined to `user:<id>`.
+
+  While a computer is connected, `paired` is known to be true — a live bridge
+  channel only exists behind an accepted pairing — so the common case costs zero
+  queries. Only the rarer "went offline" edge falls back to the `paired?` lookup,
+  because the phone needs to tell "no computer running" apart from "unpaired".
+  """
+  def status_for_push(user_id) when is_binary(user_id) and user_id != "" do
+    if online?(user_id) do
+      presence_status(user_id, true)
+    else
+      presence_status(user_id, paired?(user_id))
+    end
+  rescue
+    _ -> status(user_id)
+  end
+
+  def status_for_push(_user_id), do: status(nil)
+
   @doc "Public bridge status for the phone UI, including connected devices and repo choices."
   def status(user_id) when is_binary(user_id) and user_id != "" do
-    presence = VibeWeb.Presence.list(topic(user_id))
-    devices = presence_devices(presence)
-
-    repositories =
-      devices
-      |> Enum.flat_map(fn device -> Map.get(device, "repositories", []) end)
-      |> dedupe_repositories()
-
-    running_tasks =
-      devices
-      |> Enum.flat_map(fn device -> Map.get(device, "runningTasks", []) end)
-      |> dedupe_running_tasks()
-
-    # Live model catalogs from the connected bridge (provider CLI/API discovery).
-    models =
-      devices
-      |> Enum.map(fn device -> Map.get(device, "models") end)
-      |> Enum.find(&is_map/1)
-
-    %{
-      connected: map_size(presence) > 0,
-      paired: paired?(user_id),
-      devices: devices,
-      repositories: repositories,
-      runningTasks: running_tasks,
-      models: models || %{}
-    }
+    presence_status(user_id, paired?(user_id))
   rescue
     _ ->
       %{
@@ -408,6 +408,38 @@ defmodule Vibe.AgentBridge do
       runningTasks: [],
       models: %{}
     }
+
+  # Presence-derived status. Split out of `status/1` so the broadcast path can
+  # supply `paired` from context instead of paying a DB query per status frame.
+  defp presence_status(user_id, paired) do
+    presence = VibeWeb.Presence.list(topic(user_id))
+    devices = presence_devices(presence)
+
+    repositories =
+      devices
+      |> Enum.flat_map(fn device -> Map.get(device, "repositories", []) end)
+      |> dedupe_repositories()
+
+    running_tasks =
+      devices
+      |> Enum.flat_map(fn device -> Map.get(device, "runningTasks", []) end)
+      |> dedupe_running_tasks()
+
+    # Live model catalogs from the connected bridge (provider CLI/API discovery).
+    models =
+      devices
+      |> Enum.map(fn device -> Map.get(device, "models") end)
+      |> Enum.find(&is_map/1)
+
+    %{
+      connected: map_size(presence) > 0,
+      paired: paired,
+      devices: devices,
+      repositories: repositories,
+      runningTasks: running_tasks,
+      models: models || %{}
+    }
+  end
 
   @doc "Normalize daemon-reported status before storing it in Presence metadata."
   def presence_meta(payload, computer_id \\ nil)

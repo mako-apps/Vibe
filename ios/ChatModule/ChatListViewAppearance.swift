@@ -115,7 +115,7 @@ enum ChatWallpaperMaskStore {
 /// Colors are `#RRGGBB` / `#RRGGBBAA` strings (not `UIColor`) so the draft can
 /// persist and cross the wire. Integrator maps via `ChatListAppearance.from(draft:)`.
 struct ChatAppearanceDraft: Equatable, Codable {
-  var version: Int = 1
+  var version: Int = 2
   var mode: String = "dark"  // "dark" | "light" | "system"
   var themeId: String? = nil
 
@@ -132,7 +132,8 @@ struct ChatAppearanceDraft: Equatable, Codable {
 
   var accent: String = "#2F9E93"
   /// Normalized 0…1. Points via `messageCornerRadiusPoints(normalized:)`.
-  var messageCornerRadius: Double = 0.62
+  /// Telegram-matched default: (16pt - 4pt) / 22pt = 6/11.
+  var messageCornerRadius: Double = 6.0 / 11.0
   /// Optional for backward-compatible decoding. nil resolves to the reference tail.
   /// 0 = compact/straight, 1 = the default Telegram-reference cubic.
   var messageTailCurvature: Double? = nil
@@ -153,9 +154,22 @@ struct ChatAppearanceDraft: Equatable, Codable {
     CGFloat(4.0 + max(0.0, min(1.0, normalized)) * 22.0)
   }
 
-  /// Default stored point radius on `ChatListAppearance` (== mapping at ~0.636).
-  static let defaultMessageCornerRadiusPoints: CGFloat = 18
+  /// Default stored point radius on `ChatListAppearance` (== mapping at 6/11).
+  static let defaultMessageCornerRadiusPoints: CGFloat = 16
   static let defaultMessageTailCurvature: CGFloat = 1.0
+
+  /// v1 shipped with 0.62 as its untouched default (17.64pt / 52.92px at 3×).
+  /// Move only that exact legacy default to the screenshot-matched 16pt value; preserve
+  /// every deliberately customized slider position.
+  static func migratingLegacyDefaults(_ draft: ChatAppearanceDraft) -> ChatAppearanceDraft {
+    guard draft.version < 2 else { return draft }
+    var migrated = draft
+    migrated.version = 2
+    if abs(draft.messageCornerRadius - 0.62) < 0.000_001 {
+      migrated.messageCornerRadius = 6.0 / 11.0
+    }
+    return migrated
+  }
 
   // MARK: Dictionary bridge (persistence / Settings)
 
@@ -237,7 +251,7 @@ struct ChatAppearanceDraft: Equatable, Codable {
     if let anim = parseBool(raw["animationsEnabled"]) ?? parseBool(raw["animations"]) {
       draft.animationsEnabled = anim
     }
-    return draft
+    return migratingLegacyDefaults(draft)
   }
 
   var asDictionary: [String: Any] {
@@ -284,7 +298,7 @@ enum ChatAppearanceDraftStore {
       return seededDefault()
     }
     if let draft = try? JSONDecoder().decode(ChatAppearanceDraft.self, from: data) {
-      return draft
+      return ChatAppearanceDraft.migratingLegacyDefaults(draft)
     }
     if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
       return ChatAppearanceDraft.from(raw: obj)
@@ -497,7 +511,7 @@ struct ChatListAppearance {
     dayBorderColor: UIColor,
     insertionAnimationMode: Int,
     accent: UIColor = ChatListAppearance.brandAccentFallback,
-    messageCornerRadius: CGFloat = 18,
+    messageCornerRadius: CGFloat = 16,
     messageTailCurvature: CGFloat = ChatAppearanceDraft.defaultMessageTailCurvature,
     wallpaperScrollGradient: [UIColor] = []
   ) {

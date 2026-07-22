@@ -1037,16 +1037,19 @@ final class BubbleBackgroundView: UIView {
       let originX = onRight ? width : 0.0
       let t = max(0.0, min(1.0, curvature))
 
-      let referenceOuterStart = CGPoint(x: 0.0967, y: -7.9401)
-      let referenceOuterControl1 = CGPoint(x: 0.0967, y: -4.6557)
-      let referenceOuterControl2 = CGPoint(x: 4.4885, y: -2.5490)
-      let referenceTip = CGPoint(x: 5.3793, y: 0.0061)
-      let referenceInnerControl1 = CGPoint(x: 0.6122, y: 0.6143)
-      let referenceInnerControl2 = CGPoint(x: -3.9233, y: -0.5402)
-      let referenceNotch = CGPoint(x: -7.0522, y: -3.8821)
-      let referenceCornerControl1 = CGPoint(x: -9.0308, y: -1.5103)
-      let referenceCornerControl2 = CGPoint(x: -12.1883, y: 0.0061)
-      let referenceBottomJoin = CGPoint(x: -14.7700, y: 0.0061)
+      // Body-aligned fit against Telegram's outgoing tail. In particular, the inner
+      // control stays above the baseline (no downward hook), the tip overhang is shorter,
+      // and the bottom join begins farther inward so the tail grows from the body.
+      let referenceOuterStart = CGPoint(x: 0.0000, y: -7.7280)
+      let referenceOuterControl1 = CGPoint(x: 0.4310, y: -5.4310)
+      let referenceOuterControl2 = CGPoint(x: 1.9830, y: -2.2870)
+      let referenceTip = CGPoint(x: 4.6380, y: 0.0000)
+      let referenceInnerControl1 = CGPoint(x: 0.9830, y: -0.4090)
+      let referenceInnerControl2 = CGPoint(x: -4.4190, y: -0.6970)
+      let referenceNotch = CGPoint(x: -7.7280, y: -3.4780)
+      let referenceCornerControl1 = CGPoint(x: -10.5260, y: -1.6100)
+      let referenceCornerControl2 = CGPoint(x: -13.7070, y: -0.6630)
+      let referenceBottomJoin = CGPoint(x: -17.0020, y: 0.0000)
 
       // The straight endpoint stays intentionally non-degenerate. It is 58% of the
       // reference footprint, with cubic controls on each chord, so the slider reduces
@@ -1257,9 +1260,10 @@ final class BubbleBackgroundView: UIView {
 }
 
 /// Paint/capture reserve for the integrated tail at the maximum supported 26pt corner.
-/// The reference cubic reaches 5.38pt at radius 18 and 7.77pt at radius 26.
+/// The fitted cubic reaches 4.64pt at radius 18 and 6.70pt at radius 26; retain the
+/// existing 7.8pt reserve so send-morph snapshots keep generous antialias coverage.
 let bubbleTailOverhang: CGFloat = 7.8
-/// The fitted curve is tangent to the plate bottom (maximum dip ≈ 0.161pt at radius 18).
+/// The fitted curve stays on/above the plate bottom; this is antialias coverage only.
 let bubbleTailBottomOverhang: CGFloat = 0.5
 
 private let bubbleMessageFont = UIFont.systemFont(ofSize: 16)
@@ -1449,7 +1453,7 @@ final class ChatTallBubbleGlassToggleView: UIView {
     applyIcon(collapsed: true, animated: false)
   }
 
-  required init?(coder: NSCoder) { nil }
+  required init?(coder: NSCoder) { return nil }
 
   override func layoutSubviews() {
     super.layoutSubviews()
@@ -1828,7 +1832,15 @@ func agentSystemDividerText(for row: ChatListRow) -> String? {
     return notice
   }
 
-  guard !body.isEmpty else { return nil }
+  if body.isEmpty {
+    let runtimeStatus = row.agentRuntime?.status
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased() ?? ""
+    if ["stopped", "cancelled", "canceled", "interrupted"].contains(runtimeStatus) {
+      return "Interrupted"
+    }
+    return nil
+  }
   if body == "[Request interrupted by user]"
     || body.localizedCaseInsensitiveContains("request interrupted by user")
   {
@@ -1999,6 +2011,8 @@ private func isRTL(_ text: String) -> Bool {
 private func usesRTLColumnLayout(_ row: ChatListRow) -> Bool {
   guard row.kind == .message, row.visualKind == .text else { return false }
   guard row.messageType != "typing" else { return false }
+  // Always stack meta under RTL body (Telegram short Farsi/Arabic): text on top,
+  // time below — bubble height grows. Never put time beside RTL on one row.
   return isRTL(row.text)
 }
 
@@ -2957,23 +2971,26 @@ private final class BubbleLinkPreviewStore {
 }
 
 private final class BubbleReplyPreviewView: UIView {
-  private let backgroundOverlay = UIView()
-  private let accentView = UIView()
+  private let gradientLayer = CAGradientLayer()
+  private let arrowLayer = CAShapeLayer()
   private let titleLabel = UILabel()
   private let previewLabel = UILabel()
+  private var accentColors: (UIColor, UIColor)?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
     backgroundColor = .clear
     clipsToBounds = true
     layer.cornerRadius = 6.0
+    layer.cornerCurve = .continuous
 
-    backgroundOverlay.isUserInteractionEnabled = false
-    addSubview(backgroundOverlay)
+    gradientLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
+    gradientLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
+    layer.insertSublayer(gradientLayer, at: 0)
 
-    accentView.layer.cornerCurve = .continuous
-    accentView.layer.cornerRadius = 1.5
-    addSubview(accentView)
+    arrowLayer.fillRule = .evenOdd
+    arrowLayer.strokeColor = nil
+    layer.addSublayer(arrowLayer)
 
     titleLabel.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
     titleLabel.numberOfLines = 1
@@ -2993,39 +3010,151 @@ private final class BubbleReplyPreviewView: UIView {
   func reset() {
     titleLabel.text = nil
     previewLabel.text = nil
+    accentColors = nil
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    gradientLayer.colors = nil
+    arrowLayer.path = nil
+    arrowLayer.fillColor = nil
+    CATransaction.commit()
   }
 
-  func configure(title: String, text: String, appearance: ChatListAppearance, isMe: Bool) {
+  func configure(
+    title: String,
+    text: String,
+    appearance: ChatListAppearance,
+    isMe: Bool,
+    accentColors: (UIColor, UIColor)? = nil
+  ) {
     titleLabel.text = title
     previewLabel.text = text
+    self.accentColors = accentColors
     applyAppearance(appearance, isMe: isMe)
   }
 
   func applyAppearance(_ appearance: ChatListAppearance, isMe: Bool) {
-    let titleColor = isMe ? appearance.textColorMe : appearance.textColorThem
-    let accentColor =
-      isMe ? (appearance.bubbleMeGradient.first ?? titleColor) : appearance.bubbleThemColor
+    let fallbackAccent =
+      isMe
+      ? (appearance.bubbleMeGradient.first ?? appearance.textColorMe)
+      : appearance.bubbleThemColor
+    let paletteStart = accentColors?.0 ?? fallbackAccent
+    let paletteEnd = accentColors?.1 ?? paletteStart
+    let titleColor = accentColors != nil
+      ? paletteStart
+      : (isMe ? appearance.textColorMe : appearance.textColorThem)
+    let bodyColor = isMe ? appearance.textColorMe : appearance.textColorThem
 
-    accentView.backgroundColor = accentColor.withAlphaComponent(0.95)
-    titleLabel.textColor = titleColor.withAlphaComponent(0.94)
-    previewLabel.textColor = titleColor.withAlphaComponent(0.68)
+    titleLabel.textColor = titleColor.withAlphaComponent(0.96)
+    previewLabel.textColor = bodyColor.withAlphaComponent(0.62)
 
-    backgroundOverlay.backgroundColor = accentColor.withAlphaComponent(appearance.isDark ? 0.15 : 0.08)
+    let bgAlpha: CGFloat = appearance.isDark ? 0.22 : 0.12
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    gradientLayer.colors = [
+      paletteStart.withAlphaComponent(bgAlpha).cgColor,
+      paletteEnd.withAlphaComponent(bgAlpha * 0.72).cgColor,
+    ]
+    arrowLayer.fillColor = paletteStart.withAlphaComponent(0.95).cgColor
+    CATransaction.commit()
+    setNeedsLayout()
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    backgroundOverlay.frame = bounds
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
 
-    let height = bounds.height
-    let accentH = max(4.0, height - 8.0)
-    accentView.frame = CGRect(x: 4.0, y: 4.0, width: 3.0, height: accentH)
+    gradientLayer.frame = bounds
 
-    let textX = accentView.frame.maxX + 6.0
-    let textW = max(1.0, bounds.width - textX - 8.0)
+    // Exact supplied 24×24 reply SVG, rotated 180° so its bend rises and arrow points
+    // right toward the referenced name. The SVG carries its own optical inset, so keep
+    // the host rect tight to the preview's leading/top edges.
+    let arrowRect = CGRect(x: 0.0, y: 0.0, width: 18.0, height: 18.0)
+    arrowLayer.frame = bounds
+    arrowLayer.path = Self.replySVGPath(in: arrowRect).cgPath
 
-    titleLabel.frame = CGRect(x: textX, y: 3.0, width: textW, height: 16.0)
+    let textX = arrowRect.maxX - 1.0
+    let textW = max(1.0, bounds.width - textX - 6.0)
+    titleLabel.frame = CGRect(x: textX, y: 1.0, width: textW, height: 16.0)
     previewLabel.frame = CGRect(x: textX, y: titleLabel.frame.maxY, width: textW, height: 16.0)
+
+    CATransaction.commit()
+  }
+
+  /// Exact path supplied by the user (SVG viewBox 0 0 24 24), then rotated 180°.
+  private static func replySVGPath(in rect: CGRect) -> UIBezierPath {
+    let path = UIBezierPath()
+    path.usesEvenOddFillRule = true
+    path.move(to: CGPoint(x: 10.0303, y: 6.46967))
+    path.addCurve(
+      to: CGPoint(x: 10.0303, y: 7.53033),
+      controlPoint1: CGPoint(x: 10.3232, y: 6.76256),
+      controlPoint2: CGPoint(x: 10.3232, y: 7.23744)
+    )
+    path.addLine(to: CGPoint(x: 6.31066, y: 11.25))
+    path.addLine(to: CGPoint(x: 14.5, y: 11.25))
+    path.addCurve(
+      to: CGPoint(x: 18.0632, y: 12.3913),
+      controlPoint1: CGPoint(x: 15.4534, y: 11.25),
+      controlPoint2: CGPoint(x: 16.8667, y: 11.5298)
+    )
+    path.addCurve(
+      to: CGPoint(x: 20.25, y: 17.0),
+      controlPoint1: CGPoint(x: 19.298, y: 13.2804),
+      controlPoint2: CGPoint(x: 20.25, y: 14.7556)
+    )
+    path.addCurve(
+      to: CGPoint(x: 19.5, y: 17.75),
+      controlPoint1: CGPoint(x: 20.25, y: 17.4142),
+      controlPoint2: CGPoint(x: 19.9142, y: 17.75)
+    )
+    path.addCurve(
+      to: CGPoint(x: 18.75, y: 17.0),
+      controlPoint1: CGPoint(x: 19.0858, y: 17.75),
+      controlPoint2: CGPoint(x: 18.75, y: 17.4142)
+    )
+    path.addCurve(
+      to: CGPoint(x: 17.1868, y: 13.6087),
+      controlPoint1: CGPoint(x: 18.75, y: 15.2444),
+      controlPoint2: CGPoint(x: 18.0353, y: 14.2196)
+    )
+    path.addCurve(
+      to: CGPoint(x: 14.5, y: 12.75),
+      controlPoint1: CGPoint(x: 16.3, y: 12.9702),
+      controlPoint2: CGPoint(x: 15.2133, y: 12.75)
+    )
+    path.addLine(to: CGPoint(x: 6.31066, y: 12.75))
+    path.addLine(to: CGPoint(x: 10.0303, y: 16.4697))
+    path.addCurve(
+      to: CGPoint(x: 10.0303, y: 17.5303),
+      controlPoint1: CGPoint(x: 10.3232, y: 16.7626),
+      controlPoint2: CGPoint(x: 10.3232, y: 17.2374)
+    )
+    path.addCurve(
+      to: CGPoint(x: 8.96967, y: 17.5303),
+      controlPoint1: CGPoint(x: 9.73744, y: 17.8232),
+      controlPoint2: CGPoint(x: 9.26256, y: 17.8232)
+    )
+    path.addLine(to: CGPoint(x: 3.96967, y: 12.5303))
+    path.addCurve(
+      to: CGPoint(x: 3.96967, y: 11.4697),
+      controlPoint1: CGPoint(x: 3.67678, y: 12.2374),
+      controlPoint2: CGPoint(x: 3.67678, y: 11.7626)
+    )
+    path.addLine(to: CGPoint(x: 8.96967, y: 6.46967))
+    path.addCurve(
+      to: CGPoint(x: 10.0303, y: 6.46967),
+      controlPoint1: CGPoint(x: 9.26256, y: 6.17678),
+      controlPoint2: CGPoint(x: 9.73744, y: 6.17678)
+    )
+    path.close()
+
+    let scale = min(rect.width / 24.0, rect.height / 24.0)
+    path.apply(CGAffineTransform(translationX: -12.0, y: -12.0))
+    path.apply(CGAffineTransform(rotationAngle: .pi))
+    path.apply(CGAffineTransform(scaleX: scale, y: scale))
+    path.apply(CGAffineTransform(translationX: rect.midX, y: rect.midY))
+    return path
   }
 }
 
@@ -6513,6 +6642,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var groupExtraLeading: CGFloat = 0.0
   /// Reserved top space for the name label when it is shown (0 otherwise).
   private var groupNameReservedHeight: CGFloat = 0.0
+  /// Empty air before a sender run. This is separate from the name strip because the
+  /// name belongs inside the plate while the run gap belongs on the wallpaper.
+  private var groupTopReservedSpacing: CGFloat = 0.0
+  /// Banner palette for the compact quoted-reply preview only (never the whole bubble).
+  private var replyAccentColors: (UIColor, UIColor)?
 
   private let messageLabel = AgentStreamingLabel()
   // The real interleaved step/narration/diff renderer, bubble-shelled — the live content
@@ -6756,11 +6890,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     groupSenderNameLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
     groupSenderNameLabel.lineBreakMode = .byTruncatingTail
     groupSenderNameLabel.isHidden = true
-    // Legible over any wallpaper tone (esp. the near-white Codex tint).
-    groupSenderNameLabel.layer.shadowColor = UIColor.black.cgColor
-    groupSenderNameLabel.layer.shadowOpacity = 0.35
-    groupSenderNameLabel.layer.shadowRadius = 1.5
-    groupSenderNameLabel.layer.shadowOffset = CGSize(width: 0, height: 0.5)
+    // No text shadow: the name now sits INSIDE the bubble plate, where the tinted
+    // background already carries it. The shadow existed only to keep it legible when it
+    // floated over the wallpaper.
 
     mediaContainerView.clipsToBounds = true
     mediaContainerView.layer.cornerCurve = .continuous
@@ -6982,6 +7114,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     agentActionBarView.isHidden = true
   }
 
+  /// The pinned header date currently REPRESENTS this separator, so fade the in-list
+  /// capsule: exactly one date capsule is on screen and it is the one attached under the
+  /// header. Alpha only — the row keeps its height, so nothing shifts.
+  func setDaySeparatorRepresentedByPinnedDate(_ represented: Bool) {
+    let target: CGFloat = represented ? 0.0 : 1.0
+    guard abs(dayLabel.alpha - target) > 0.01 else { return }
+    dayLabel.alpha = target
+  }
+
   required init?(coder: NSCoder) {
     return nil
   }
@@ -7081,7 +7222,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     groupExtraLeading: CGFloat = 0.0,
     groupSenderName: String? = nil,
     groupSenderColor: UIColor? = nil,
-    groupSenderNameHeight: CGFloat = 0.0
+    groupSenderNameHeight: CGFloat = 0.0,
+    groupTopSpacing: CGFloat = 0.0,
+    replyAccentColors: (UIColor, UIColor)? = nil
   ) {
     let previousRow = self.row
     if previousRow.map({ ($0.messageId ?? $0.key) != (row.messageId ?? row.key) }) == true {
@@ -7120,6 +7263,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // for the first message of a sender-run; the gutter is reserved for every incoming
     // group message so consecutive bubbles stay aligned under the floating avatar.
     self.groupExtraLeading = max(0.0, groupExtraLeading)
+    groupTopReservedSpacing = max(0.0, groupTopSpacing)
+    // Palette belongs only to the quoted reply preview, not the sender name strip.
+    self.replyAccentColors = replyAccentColors
     if let groupSenderName, !groupSenderName.isEmpty {
       groupSenderNameLabel.text = groupSenderName
       groupSenderNameLabel.textColor = groupSenderColor ?? .secondaryLabel
@@ -7382,8 +7528,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let resolveTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
       let displayText = bubbleDisplayAttributedString(
         for: row, font: messageFont, textColor: resolveTextColor)
-      messageLabel.textAlignment = .natural
-      messageLabel.semanticContentAttribute = .unspecified
+      // Telegram: RTL body is always right-aligned inside the plate (reading edge),
+      // independent of bubble side. LTR stays natural/left.
+      let rtlBody = isRTL(displayText.string)
+      messageLabel.textAlignment = rtlBody ? .right : .natural
+      messageLabel.semanticContentAttribute = rtlBody ? .forceRightToLeft : .unspecified
       if messageLabel.isHidden {
         messageLabel.resetStreamingState()
       } else {
@@ -7403,7 +7552,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           title: replyPreviewTitle(for: row),
           text: replyPreviewText(for: row),
           appearance: appearance,
-          isMe: row.isMe
+          isMe: row.isMe,
+          accentColors: replyAccentColors
         )
       } else {
         replyPreviewView.reset()
@@ -7588,10 +7738,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     selectionMode = false
     isSelectionChecked = false
     cachedLayoutMetrics = nil
+    // A day separator faded by the pinned date pill must not stay invisible when the
+    // cell is recycled for a DIFFERENT day row — that painted as a random empty gap
+    // in the list (the separator row was there, its label just had alpha 0).
+    dayLabel.alpha = 1.0
     // Clear group decoration so a reused group cell doesn't keep a stale gutter
     // when dequeued for a DM (or the reverse: DM→group without reconfigure).
     groupExtraLeading = 0.0
     groupNameReservedHeight = 0.0
+    groupTopReservedSpacing = 0.0
+    replyAccentColors = nil
     groupSenderNameLabel.text = nil
     groupSenderNameLabel.isHidden = true
     groupSenderNameLabel.frame = .zero
@@ -7783,7 +7939,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // Top-corner glass chip is overlay-only and does not reserve cell height.
     let outerReserve = metrics.tallOuterToggleReserve
     let availableBubbleHeight = max(
-      1.0, bounds.height - groupNameReservedHeight - outerReserve)
+      1.0, bounds.height - groupNameReservedHeight - groupTopReservedSpacing - outerReserve)
     let isTallHeightMorphing =
       metrics.tallToggleVisible && abs(availableBubbleHeight - metrics.bubbleHeight) > 1.0
     let bubbleHeight =
@@ -7809,9 +7965,36 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         width: ceil(bubbleWidth),
         height: ceil(bubbleHeight)
       ))
-    lastBubbleFrame = bubbleFrame
+    // The group sender name reads as part of the message, so the PLATE grows up over the
+    // reserved strip and the name sits inside it (Telegram-style) instead of floating on
+    // the wallpaper above a detached bubble. Only the plate moves: `bubbleFrame` stays the
+    // content anchor every element below is positioned against, so no measurement, height
+    // cache or cell height changes — the same total row height is just enclosed now.
+    let inBubbleNameReserve =
+      (!groupSenderNameLabel.isHidden && groupNameReservedHeight > 0) ? groupNameReservedHeight : 0.0
+    let bubblePlateFrame =
+      inBubbleNameReserve > 0
+      ? pixelAlignedRect(
+        CGRect(
+          x: bubbleFrame.minX,
+          y: max(0.0, bubbleFrame.minY - inBubbleNameReserve),
+          width: bubbleFrame.width,
+          height: bubbleFrame.height + min(bubbleFrame.minY, inBubbleNameReserve)
+        ))
+      : bubbleFrame
+    lastBubbleFrame = bubblePlateFrame
     lastTallToggleVisible = metrics.tallToggleVisible
     lastTallCollapsed = metrics.tallCollapsed
+    // Names the cell-vs-bubble disagreement behind "bubbles overlap the next cell":
+    // the slot the layout granted vs the height this configure actually renders.
+    if bubbleFrame.maxY > bounds.height + 2.0 {
+      NSLog(
+        "[CellFit] OVERFLOW key=%@ cellH=%.0f bubbleH=%.0f overflow=%.0f rtl=%@ bottomMeta=%@ w=%.0f",
+        String(row.key.suffix(14)), bounds.height, metrics.bubbleHeight,
+        bubbleFrame.maxY - bounds.height,
+        usesRTLColumnLayout(row) ? "Y" : "N",
+        metrics.usesBottomMetaLayout ? "Y" : "N", layoutWidth)
+    }
 
     // Tall rows clip overflow so full content under a short plate doesn't paint the next
     // cell. Soft fade mask on the body communicates "more below" (not a hard cut).
@@ -7826,21 +8009,22 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     CATransaction.begin()
     CATransaction.setDisableActions(true)
 
-    bubbleView.frame = bubbleFrame
+    bubbleView.frame = bubblePlateFrame
 
-    // Group sender name sits immediately above the bubble, left-aligned to it. During
-    // the navigation presentation seed the cell can be taller than the exactly measured
-    // bubble; anchoring the label to the cell's y=0 exposed that estimate slack as a large
-    // name-to-bubble gap until the authoritative layout reconciled.
-    if !groupSenderNameLabel.isHidden, groupNameReservedHeight > 0 {
-      let nameX = bubbleFrame.minX + 6.0
-      let nameMaxX = bounds.width - bubbleSideMargin
+    // Group sender name: first line INSIDE the plate, aligned with the bubble's own text
+    // padding (it used to sit on the wallpaper above the bubble, which read as a caption
+    // belonging to nothing). The strip it occupies is the same one the layout already
+    // reserved, so nothing below shifts. No palette tint on the name strip — banner
+    // colors belong only to the quoted reply preview.
+    if inBubbleNameReserve > 0 {
+      let nameX = bubblePlateFrame.minX + bubbleHorizontalPadding
+      let nameMaxX = min(bubblePlateFrame.maxX - bubbleHorizontalPadding, bounds.width - bubbleSideMargin)
       groupSenderNameLabel.frame = pixelAlignedRect(
         CGRect(
           x: nameX,
-          y: max(1.0, bubbleFrame.minY - groupNameReservedHeight + 1.0),
+          y: bubblePlateFrame.minY + 6.0,
           width: max(0.0, nameMaxX - nameX),
-          height: max(0.0, groupNameReservedHeight - 2.0)
+          height: max(0.0, inBubbleNameReserve - 8.0)
         ))
     } else {
       groupSenderNameLabel.frame = .zero
@@ -8228,8 +8412,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         let metaTop = metrics.hasLinkPreview
           ? linkPreviewView.frame.maxY + bubbleMetaTopSpacing
           : textBottom + bubbleMetaTopSpacing
-        // Meta (time / sent) stays trailing. Expand/collapse is a list-level glass chip.
-        let metaX = bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
+        // Meta (time / sent) stays trailing for LTR. RTL bodies mirror it to the
+        // bubble's LEADING edge like Telegram: text reads from the right, the time
+        // tucks bottom-left. Expand/collapse is a list-level glass chip.
+        let metaX =
+          usesRTLColumnLayout(row)
+          ? bubbleFrame.minX + bubbleHorizontalPadding
+          : bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
         let metaFrame = pixelAlignedRect(
           CGRect(
             x: metaX,
@@ -10997,10 +11186,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   /// 9-part version of the plate raster: cap insets cover the corner radii so
   /// the send morph's width/height animation stretches only the flat middle
-  /// bands — the baked corners (including a grouped 8pt top-trailing one) stay
+  /// bands — the baked destination corners stay
   /// pixel-true at every intermediate size instead of being scaled with the
   /// bounds. This is also what keeps the tail lobe's splice arc stable: the
-  /// bottom corner it rides is the real 18pt arc for the whole flight.
+  /// bottom corner it rides is the real destination arc for the whole flight.
   private func resizableTransitionPlateImage(_ image: UIImage) -> UIImage {
     let radii = bubbleView.transitionCornerRadii()
     var top = max(radii.topLeft, radii.topRight) + 1.0

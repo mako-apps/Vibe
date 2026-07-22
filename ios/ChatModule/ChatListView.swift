@@ -856,13 +856,59 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let h: Double
     let v: String
     let sig: String
-    /// Per-field short hashes of the content signature (agent-turn rows only, else
-    /// nil), so a `reason=sig` miss can diff element-wise and NAME the field that
-    /// flipped between measure-time and reopen instead of guessing. Optional →
-    /// old on-disk entries decode fine.
+    /// Per-field short hashes of the content signature (every row), so a `reason=sig`
+    /// miss can diff element-wise and NAME the field that flipped between
+    /// measure-time and reopen instead of guessing. Optional → old on-disk entries
+    /// decode fine.
     let f: [String]?
   }
+  /// Bump on ANY change to bubble layout math (paddings, meta placement, RTL rules,
+  /// grouped-name reserves, …). Persisted heights measured under a different revision
+  /// describe cells that no longer exist; content signatures cannot catch that (the
+  /// rows never changed), and trusting them renders bubbles taller or shorter than
+  /// their cells — the overlapping-RTL-bubbles bug. Restore discards mismatched files
+  /// wholesale; the next open re-measures fresh behind the reopen raster.
+  private static let bubbleLayoutRevision = "r2"
+  private struct PersistedHeightsFile: Codable {
+    let rev: String
+    let e: [String: PersistedHeightEntry]
+  }
   private var persistedHeightsByKey: [String: PersistedHeightEntry] = [:]
+  /// Trust-then-verify seed sizing. During the presentation seed's mount, a persisted
+  /// height is promoted on a WIDTH match alone — a dictionary lookup — instead of
+  /// validating the ~50-field content signature per row (String(describing:) over
+  /// large agent payloads; measured as the posMs≈215 bulk of the mount, which is why
+  /// the transcript kept landing AFTER the push animation instead of during it).
+  /// Signatures still gate correctness: `auditSeedTrustedHeights` re-checks every
+  /// trusted key OFF-MAIN after the push settles and reloads only rows whose content
+  /// actually changed since their height was persisted — which is almost always none.
+  private var seedTrustsPersistedHeights = false
+  /// Keys promoted on trust during the current seed, with the state signature and
+  /// content version captured at promote time (both are main-thread-derived, so the
+  /// off-main audit compares captured values instead of recomputing them).
+  private var seedTrustedHeightKeys: [String: (state: String, contentVersion: String)] = [:]
+  /// One-open profiler for the seed mount: posMs/layoutMs kept refusing to shrink no
+  /// matter which per-row cost was "obviously" responsible, so the seed now counts
+  /// where its milliseconds actually go and prints them in the presentation-seed log.
+  /// Active only between seed start and the seed log line — zero cost otherwise.
+  private var seedSizeProfilingActive = false
+  private var seedProfSizeCalls = 0
+  private var seedProfSizeNs: UInt64 = 0
+  private var seedProfTrustHits = 0
+  private var seedProfSigHits = 0
+  private var seedProfCacheHits = 0
+  private var seedProfMeasures = 0
+  private var seedProfMeasureNs: UInt64 = 0
+  private var seedProfConfigures = 0
+  private var seedProfConfigureNs: UInt64 = 0
+  /// Whole cell-provider cost (dequeue + subview build + configure) — configure alone
+  /// explained only ~40 of layoutMs≈145, so the provider gets its own meter.
+  private var seedProfCellCalls = 0
+  private var seedProfCellNs: UInt64 = 0
+  /// Position-phase split: inset / contentSize(prepare) / setContentOffset(didScroll).
+  private var seedProfInsetNs: UInt64 = 0
+  private var seedProfContentSizeNs: UInt64 = 0
+  private var seedProfOffsetNs: UInt64 = 0
   /// Per-open cap on `height-promote MISS` diagnostics (reset at heights restore).
   private var persistedHeightMissLogBudget = 0
   private var persistedHeightsChatId = ""
@@ -1188,7 +1234,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var lastScrollDeltaY: CGFloat = 0.0
   /// Pending linger fade-out for the sticky date pill after scrolling settles.
   private var scrollingDatePillHideWorkItem: DispatchWorkItem?
-  private let nativeSendMorphTopRightRadius: CGFloat = 8.0
+  /// De-dupes the `[ChatOpen] date-pin` log across the per-frame update calls.
+  private var lastScrollingDatePillLogSignature: String?
+  /// BubbleShape row payloads still use 18pt as their primary-radius basis. Keeping
+  /// the native send's top-right corner at that full basis makes it resolve to the
+  /// current appearance radius (16pt by default) instead of the old compact 8pt.
+  private let nativeSendMorphTopRightLegacyRadius: CGFloat = 18.0
+  /// Must match ChatEngine's merged payload radius so the preceding bubble does
+  /// not change shape when an optimistic outgoing row becomes authoritative.
+  private let nativeSendMorphMergedBottomRightLegacyRadius: CGFloat = 12.0
 
   // --- Debug animation tuning ---
   private var debugAnimDuration: CGFloat = 0.4
@@ -1220,6 +1274,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var wallpaperSnapshotSize: CGSize = .zero
   private var wallpaperSnapshotCacheKey: String = ""
   private var wallpaperScrollPhaseBucket: Int = -1
+  /// Set when a wallpaper re-raster was skipped during an internal (programmatic)
+  /// scroll adjustment; flushed asynchronously after presentation completes.
+  private var pendingWallpaperSnapshotRefresh = false
 
   // Floating activity overlay (typing / agent progress) — lives OUTSIDE the collection view
   private let activityOverlay = UIView()
@@ -1286,6 +1343,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     var showsName: Bool = false
     var senderName: String? = nil
     var senderColor: UIColor? = nil
+    var topSpacing: CGFloat = 0.0
     var isLastOfRun: Bool = false
     var senderKey: String? = nil
     var avatarUrl: String? = nil
@@ -1325,7 +1383,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   static let groupAvatarGap: CGFloat = 6.0
   static var groupIncomingExtraLeading: CGFloat { groupAvatarSize + groupAvatarGap }
   /// Vertical space reserved above a bubble for the sender's name (first msg of a run).
-  static let groupSenderNameHeight: CGFloat = 17.0
+  static let groupSenderNameHeight: CGFloat = 25.0
+  /// Telegram-like separation between different sender runs. The flow layout already
+  /// contributes 2pt between every cell; this additional air appears only before a new
+  /// incoming run, keeping consecutive bubbles compact without pressing authors together.
+  static let groupRunTopSpacing: CGFloat = 6.0
 
   /// Known local-agent shadow-user ids (also matched by name/handle) so an agent's
   /// messages render in its brand colour even before the directory loads.
@@ -1433,7 +1495,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   func groupCellContext(at indexPath: IndexPath) -> GroupCellContext {
-    guard isGroupOrChannel, indexPath.item < rows.count else { return .none }
+    // A CHANNEL is not a group: every post speaks as the channel itself, so it gets none
+    // of the per-sender chrome — no avatar gutter, no name label, no floating avatars.
+    // This is the one choke point all three are built from, so excluding channels here
+    // is what stops a channel rendering as a group (it previously fell through on
+    // `isGroupOrChannel` and `isChannel` was read nowhere that mattered).
+    guard isGroupOrChannel, !isChannel, indexPath.item < rows.count else { return .none }
     let row = rows[indexPath.item]
     guard row.kind == .message, !row.isMe,
       row.messageType != "agent_actions", row.messageType != "typing"
@@ -1463,11 +1530,71 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     ctx.showsName = isFirst
     ctx.senderName = isFirst ? name : nil
     ctx.senderColor = color
+    ctx.topSpacing = isFirst ? Self.groupRunTopSpacing : 0.0
     ctx.isLastOfRun = isLast
     ctx.senderKey = key
     ctx.avatarUrl = info?.avatarUrl
     ctx.provider = provider
     return ctx
+  }
+
+  /// Resolve the referenced author's banner palette for the compact reply preview only.
+  /// Order: denormalized `replyPreviewUserId` → loaded row by `replyToId` → exact
+  /// directory-name fallback. No reply preview means no palette.
+  private func replyPreviewAccentColors(for row: ChatListRow) -> (UIColor, UIColor)? {
+    // Mirrors hasReplyPreview / replyPreviewTitle in ChatListViewCells (file-private there).
+    guard row.kind == .message, row.visualKind == .text else { return nil }
+    guard !row.isEventNotification, !row.hiddenFromTranscript else { return nil }
+    guard row.replyToId != nil else { return nil }
+    let title: String = {
+      if let value = row.replyPreviewTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+        !value.isEmpty
+      {
+        return value
+      }
+      return "Reply"
+    }()
+    // A reply palette is identity-owned. Do not synthesize a user color from the
+    // display title when the referenced author cannot be resolved; the reply view's
+    // normal theme accent is a safer fallback than coloring two same-named members alike.
+    guard let resolvedId = resolvedReplyPreviewUserId(for: row, title: title) else {
+      return nil
+    }
+    return ChatProfileAppearanceStore.bannerColors(
+      title: title,
+      peerUserId: resolvedId,
+      chatId: nil
+    )
+  }
+
+  private func resolvedReplyPreviewUserId(for row: ChatListRow, title: String) -> String? {
+    if let id = groupNonEmpty(row.replyPreviewUserId) {
+      return id
+    }
+    if let replyToId = groupNonEmpty(row.replyToId) {
+      if let referenced = rows.first(where: {
+        groupNonEmpty($0.messageId) == replyToId
+      }) {
+        if referenced.isMe {
+          return groupNonEmpty(engineMyUserId)
+        }
+        return resolvedSenderKey(referenced)
+          ?? groupNonEmpty(referenced.senderUserId)
+          ?? groupNonEmpty(referenced.agentUserId)
+      }
+    }
+    // Exact directory-name fallback only when identity is otherwise missing.
+    let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !normalizedTitle.isEmpty, normalizedTitle != "you", normalizedTitle != "reply" else {
+      return nil
+    }
+    if let match = groupSenderDirectory.first(where: {
+      $0.value.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        == normalizedTitle
+    }) {
+      return match.value.userId
+    }
+    return nil
   }
 
   /// Width available for the bubble body + extra top for the sender name (first of run).
@@ -1478,7 +1605,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let width = max(0.0, bounds.width - (messageHorizontalInset * 2.0))
     let ctx = groupCellContext(at: indexPath)
     let extraLeading = ctx.reservesGutter ? Self.groupIncomingExtraLeading : 0.0
-    let extraTop = ctx.showsName ? Self.groupSenderNameHeight : 0.0
+    let extraTop = (ctx.showsName ? Self.groupSenderNameHeight : 0.0) + ctx.topSpacing
     return (max(1.0, width - extraLeading), extraTop, extraLeading)
   }
 
@@ -1500,6 +1627,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // repeat the work. Log only slow passes (covers every configure call site).
     let configureStartedAt = ProcessInfo.processInfo.systemUptime
     defer {
+      if seedSizeProfilingActive {
+        seedProfConfigures += 1
+        seedProfConfigureNs &+= UInt64(
+          max(0.0, ProcessInfo.processInfo.systemUptime - configureStartedAt) * 1_000_000_000)
+      }
       let configureMs = Int((ProcessInfo.processInfo.systemUptime - configureStartedAt) * 1000)
       if configureMs >= 8 {
         NSLog(
@@ -1549,7 +1681,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       groupExtraLeading: groupContext.reservesGutter ? Self.groupIncomingExtraLeading : 0.0,
       groupSenderName: groupContext.senderName,
       groupSenderColor: groupContext.senderColor,
-      groupSenderNameHeight: Self.groupSenderNameHeight
+      groupSenderNameHeight: Self.groupSenderNameHeight,
+      groupTopSpacing: groupContext.topSpacing,
+      replyAccentColors: replyPreviewAccentColors(for: row)
     )
   }
 
@@ -1600,41 +1734,41 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       reason, collectionView.visibleCells.count, isGroupOrChannel ? "Y" : "N")
   }
 
+  @objc private func handleChatProfileAppearanceChanged(_ notification: Notification) {
+    guard isGroupOrChannel, !isChannel else { return }
+    let changedPeer = (notification.userInfo?["peerUserId"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    if let changedPeer, !changedPeer.isEmpty,
+      groupSenderDirectory[changedPeer] == nil,
+      !rows.contains(where: { resolvedSenderKey($0) == changedPeer })
+    {
+      return
+    }
+    reconfigureVisibleMessageCells(reason: "profileAppearanceChanged")
+    updateFloatingSenderAvatars()
+  }
+
   private func shortenedIdentifier(_ key: String) -> String {
     let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.count <= 8 { return trimmed }
     return "Member"
   }
 
-  private func groupSenderColor(key: String, name: String, provider: String?) -> UIColor {
-    switch provider {
-    case "claude":
-      // Claude terracotta / warm orange.
-      return UIColor(red: 0.85, green: 0.44, blue: 0.29, alpha: 1.0)
-    case "codex":
-      // Codex reads as near-white (kept legible on the wallpaper via the label shadow).
-      return UIColor(white: 0.96, alpha: 1.0)
-    case "grok":
-      // Grok / xAI near-black with slight blue lift.
-      return UIColor(red: 0.55, green: 0.72, blue: 0.95, alpha: 1.0)
-    case "agy", "antigravity":
-      // Antigravity / Agy purple-blue.
-      return UIColor(red: 0.62, green: 0.48, blue: 0.98, alpha: 1.0)
-    default:
-      let base = ChatProfileAppearanceStore.avatarColors(
-        title: name, peerUserId: key, chatId: engineChatId
-      ).0
-      // Nudge toward a legible, saturated author tint regardless of the source gradient.
-      var hue: CGFloat = 0
-      var sat: CGFloat = 0
-      var bri: CGFloat = 0
-      var alpha: CGFloat = 0
-      if base.getHue(&hue, saturation: &sat, brightness: &bri, alpha: &alpha) {
-        return UIColor(
-          hue: hue, saturation: max(0.5, sat), brightness: max(0.72, bri), alpha: 1.0)
-      }
-      return base
+  private func groupSenderColor(key: String, name: String, provider _: String?) -> UIColor {
+    let base = ChatProfileAppearanceStore.avatarColors(
+      title: name, peerUserId: key, chatId: nil
+    ).0
+    // The sender name and fallback avatar share the profile's user-ID palette. Lift only
+    // luminance/saturation for label contrast; hue remains exactly profile-owned.
+    var hue: CGFloat = 0
+    var sat: CGFloat = 0
+    var bri: CGFloat = 0
+    var alpha: CGFloat = 0
+    if base.getHue(&hue, saturation: &sat, brightness: &bri, alpha: &alpha) {
+      return UIColor(
+        hue: hue, saturation: max(0.5, sat), brightness: max(0.74, bri), alpha: 1.0)
     }
+    return base
   }
 
   static func resolveGroupSenderProvider(userId: String?, name: String?, username: String?)
@@ -1819,6 +1953,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       name: Notification.Name("AgentIntegrationPackOpenPanelNotification"),
       object: nil
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleChatProfileAppearanceChanged(_:)),
+      name: ChatProfileAppearanceStore.didChangeNotification,
+      object: nil
+    )
 
   }
 
@@ -1895,6 +2035,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     updateChatEngineBinding()
     updateChatEngineChannelBinding()
     if window != nil {
+      // A disk decode that landed while this view was still detached had nowhere to
+      // attach (the callback requires a window) and never retried — the cover was lost
+      // for exactly the opens that need it most. Retry at attach; self-guarded.
+      installReopenSnapshotOverlayIfAvailable()
       mountDeferredPresentationSeedAfterFirstFrame()
       revalidateListRenderOnAttach()
       hydrateRowsFromNativeHistoryIfReady(trigger: "didMoveToWindow")
@@ -1929,6 +2073,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         Int((ProcessInfo.processInfo.systemUptime - self.deferredPresentationSeedStashedAt) * 1000))
       self.installPresentationSeedIfNeeded(
         sourceRows: sourceRows, preferredParsedRows: preferred)
+      // Hand off ONLY if the mount actually produced rows. An install that bails (source
+      // parsed to nothing, or a live setRows beat it) used to peel the raster off anyway
+      // and leave bare wallpaper behind — the cover must outlive a failed mount.
+      guard !self.rows.isEmpty else { return }
       self.removeReopenSnapshotOverlay(reason: "seed-mounted", animated: false)
     }
   }
@@ -1942,7 +2090,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // not traitCollection — a detached view's traits don't reflect dark mode yet.
     let width = Int(UIScreen.main.bounds.width.rounded())
     let theme = appearance.isDark ? "dark" : "light"
-    return NSString(string: "\(chatId)|w\(width)|\(theme)")
+    // v2: orphan every raster captured before the materialized-cells guard existed.
+    // A capture of a rows-set-but-zero-cells view is just wallpaper, and the doodle
+    // wallpaper PASSES the luma spread check — that poisoned raster then covered the
+    // first ~500ms of every open with a convincing "empty chat" (the reported bug,
+    // screenshot-confirmed). Old files are never read again and age out of Caches.
+    return NSString(string: "\(chatId)|w\(width)|\(theme)|v2")
   }
 
   // userInitiated, not utility: the per-open disk decode races the shell commit
@@ -1969,8 +2122,30 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// makes the FIRST open after a relaunch frame-1 too, not just same-session reopens.
   func captureReopenSnapshot() {
     guard window != nil, !rows.isEmpty, let key = reopenSnapshotKey() else { return }
+    // Rows in the MODEL are not pixels on screen: a teardown/empty-render state has
+    // rows set but zero materialized cells, and drawHierarchy of that view is pure
+    // wallpaper — which the doodle wallpaper's luma spread happily passes. Requiring
+    // at least one live cell is the guard that actually matches "there are bubbles
+    // in this raster".
+    guard !collectionView.indexPathsForVisibleItems.isEmpty else {
+      NSLog(
+        "[ChatOpen] reopen-snapshot CAPTURE-SKIP chat=%@ — rows=%d but 0 cells on screen",
+        String(engineChatId.prefix(12)), rows.count)
+      return
+    }
     let size = collectionView.bounds.size
     guard size.width > 1, size.height > 1 else { return }
+    // The overlay replays this image BOTTOM-PINNED against a resting viewport (composer
+    // only, insetB≈0). Captured with the keyboard up, the content ends ~a keyboard's
+    // height above the image bottom — the next open then draws the transcript that far
+    // too high with bare wallpaper beneath it, and the live mount snaps it back down.
+    // That is the reported "extra gap from the bottom on open, then the list shifts".
+    guard collectionView.adjustedContentInset.bottom <= 40 else {
+      NSLog(
+        "[ChatOpen] reopen-snapshot CAPTURE-SKIP chat=%@ — keyboard inset %.0f (bottom-pinned replay would gap)",
+        String(engineChatId.prefix(12)), collectionView.adjustedContentInset.bottom)
+      return
+    }
     let visibleBottom = collectionView.contentOffset.y + collectionView.bounds.height
     let contentBottom = collectionView.contentSize.height + collectionView.adjustedContentInset.bottom
     // Mid-history closes are captured too: scroll memory now restores the SAME viewport
@@ -2020,6 +2195,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       NSLog(
         "[ChatOpen] reopen-snapshot CAPTURE-BLANK chat=%@ luma=%d — kept previous",
         String(engineChatId.prefix(12)), Self.rasterLumaRange(image) ?? -1)
+      return
+    }
+    // The overlay is BOTTOM-pinned (`contentMode = .bottom`), so a raster captured
+    // mid-history is pasted against the bottom of a list that opens at the true bottom:
+    // the image shows one set of rows, the mount replaces it with another, and the swap
+    // reads as a small jump right after the chat appears. Only a bottom capture can be
+    // bottom-pinned honestly; a mid-history close simply keeps whatever bottom raster it
+    // already had (or none — the seed mounts in ~85ms anyway).
+    guard capturedAtBottom else {
+      NSLog(
+        "[ChatOpen] reopen-snapshot CAPTURE-SKIP chat=%@ — captured mid-history (bottom-pinned overlay would shift)",
+        String(engineChatId.prefix(12)))
       return
     }
     Self.reopenSnapshotCache.setObject(image, forKey: key)
@@ -2095,8 +2282,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           Self.reopenSnapshotCache.setObject(image, forKey: key)
           NSLog("[ChatOpen] reopen-snapshot DISK-HIT chat=%@", String(chatId.prefix(12)))
           // The shell may already be committed (fast push, slow disk): attach late —
-          // still better than popping in with the mount.
-          if self.deferredPresentationSeedSourceRows != nil, self.window != nil {
+          // still better than popping in with the mount. Attach whenever the view is on
+          // screen: requiring a pending SEED here meant a COLD open (engine cache still
+          // restoring, so no stash exists) never installed the raster at all — bare
+          // wallpaper for 1-2s with a valid capture of that chat sitting on disk.
+          if self.window != nil {
             self.installReopenSnapshotOverlayIfAvailable()
           }
         }
@@ -2117,6 +2307,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // An unread landing scrolls to the first-unread anchor, not the captured viewport —
     // the raster would flash the wrong rows. Let the shell show instead.
     guard openingUnreadCount == 0 else { return }
+    // Same rule on the read side: rasters are only ever captured at the bottom, so an
+    // open that will restore a MID-HISTORY viewport must not be covered by one — the
+    // bottom-pinned image would show the newest rows and then hand off to a list sitting
+    // somewhere else. That handoff is the "slight shift when I open the chat".
+    guard persistedOpeningViewport?.atBottom != false else {
+      // The jump-to-bottom control used to be painted as part of this raster; keep it on
+      // screen from the first frame now that a mid-history open has no raster at all.
+      setJumpButtonVisible(true)
+      NSLog(
+        "[ChatOpen] reopen-snapshot SKIP chat=%@ — this open restores a mid-history viewport",
+        String(engineChatId.prefix(12)))
+      return
+    }
     // Size sanity: a snapshot whose point width disagrees with the live list would
     // render as a zoomed/offset transcript — never show it, and drop it so the next
     // close re-captures cleanly.
@@ -2135,7 +2338,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // every image reaching this cache is known-good. Probing here cost 83ms of main
     // thread at the push's first frame (measured decorateMs=83) — never again.
     let overlay = UIImageView(image: image)
-    overlay.frame = collectionView.frame
+    // The raster is a capture of the collection view's OWN bounds, so that frame is its
+    // only honest home — but installs now happen as early as viewWillAppear, when the
+    // scroll view has no frame at all. Falling back to the list's bounds keeps a
+    // degenerate frame from bottom-anchoring the image into a short box (content drawn
+    // high, wallpaper below it, then a jump when the live list mounts at full height).
+    overlay.frame = collectionView.frame.height > 1 ? collectionView.frame : bounds
+    overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     // Bottom-anchored: if the reopened viewport height differs slightly (banner,
     // inset settle) the newest messages stay pinned exactly like the real list.
     overlay.contentMode = .bottom
@@ -2144,24 +2353,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     insertSubview(overlay, aboveSubview: collectionView)
     reopenSnapshotOverlay = overlay
     removeSeedLoadingIndicator(reason: "raster")
-    // A mid-history reopen shows a mid-history raster — the jump-to-bottom button
-    // belongs on screen from this very frame (layoutSubviews keeps it above the
-    // overlay). Waiting for the seed mount to place it was the "scroll-to-bottom
-    // toggle has a delay to appear".
-    if let viewport = persistedOpeningViewport, viewport.atBottom == false,
-      openingUnreadCount == 0
-    {
-      setJumpButtonVisible(true)
-    }
-    NSLog("[ChatOpen] reopen-snapshot SHOW chat=%@", String(engineChatId.prefix(12)))
+    // Mid-history opens return above (no raster), so nothing here needs the jump button:
+    // this overlay is always a bottom capture covering a bottom landing.
+    NSLog(
+      "[ChatOpen] reopen-snapshot SHOW chat=%@ img=%.0fx%.0f cv=%.0fx%.0f self=%.0fx%.0f overlay=%.0fx%.0f insetB=%.0f",
+      String(engineChatId.prefix(12)), image.size.width, image.size.height,
+      collectionView.frame.width, collectionView.frame.height,
+      bounds.width, bounds.height, overlay.frame.width, overlay.frame.height,
+      collectionView.adjustedContentInset.bottom)
   }
 
   private func removeReopenSnapshotOverlay(reason: String, animated: Bool) {
     guard let overlay = reopenSnapshotOverlay else { return }
     reopenSnapshotOverlay = nil
     NSLog(
-      "[ChatOpen] reopen-snapshot REMOVE chat=%@ reason=%@",
-      String(engineChatId.prefix(12)), reason)
+      "[ChatOpen] reopen-snapshot REMOVE chat=%@ reason=%@ overlay=%.0fx%.0f cv=%.0fx%.0f",
+      String(engineChatId.prefix(12)), reason, overlay.frame.width, overlay.frame.height,
+      collectionView.frame.width, collectionView.frame.height)
     guard animated else {
       overlay.removeFromSuperview()
       return
@@ -2310,6 +2518,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     layoutCachedHistoryPullIndicator()
     layoutScrollingDatePill()
+    // The pinned date is part of the chrome, not a scroll-only affordance: re-derive it
+    // on every layout so it is already attached under the header when a chat opens and
+    // stays attached at rest, instead of only existing while a finger is on the list.
+    updateScrollingDatePill(visible: true)
     layoutDebugPanel()
     updateTallBubbleGlassToggles(animatedIcons: false)
 
@@ -2342,7 +2554,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let currentWidth = collectionView.bounds.width
     lastKnownViewportHeight = currentHeight
     lastKnownViewportWidth = currentWidth
-    reopenSnapshotOverlay?.frame = collectionView.frame
+    if let overlay = reopenSnapshotOverlay {
+      // A raster whose box is shorter than the capture draws bottom-anchored content
+      // too high with bare wallpaper beneath it, then jumps when the live list mounts.
+      // Log every resize while the cover is up so that geometry is never guesswork.
+      let target = collectionView.frame.height > 1 ? collectionView.frame : bounds
+      if abs(overlay.frame.height - target.height) > 0.5
+        || abs(overlay.frame.width - target.width) > 0.5
+      {
+        NSLog(
+          "[ChatOpen] raster-frame chat=%@ %.0fx%.0f -> %.0fx%.0f (cv=%.0fx%.0f self=%.0fx%.0f img=%.0fx%.0f)",
+          String(engineChatId.prefix(12)), overlay.frame.width, overlay.frame.height,
+          target.width, target.height, collectionView.frame.width,
+          collectionView.frame.height, bounds.width, bounds.height,
+          overlay.image?.size.width ?? -1, overlay.image?.size.height ?? -1)
+      }
+      overlay.frame = target
+    }
 
     if abs(previousWidth - currentWidth) > 0.5 {
       collectionView.collectionViewLayout.invalidateLayout()
@@ -2368,14 +2596,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // materialize immediately as the chat appears, closing the "empty for ~1s then
       // pops in" gap.
       if rows.isEmpty {
+        // The raster's precondition is "nothing on screen", NOT "a seed is pending".
+        // Intentional for the deferred case: the shell commits empty so the slide starts
+        // instantly and the stashed seed mounts on the next tick (seed-mount POST-COMMIT).
+        // But a COLD first open — engine cache still restoring, so there is no stash —
+        // took the else branch and showed BARE WALLPAPER for 1-2s while a valid capture
+        // of that exact chat sat on disk. Both branches cover now; the install
+        // self-guards (rows.isEmpty, bottom landing, no unread anchor, width match), and
+        // the spinner only appears if neither raster nor seed lands within the grace.
+        installReopenSnapshotOverlayIfAvailable()
+        installSeedLoadingIndicatorIfNeeded()
         if deferredPresentationSeedSourceRows != nil {
-          // Intentional: the shell commits empty so the slide starts instantly; the
-          // stashed seed mounts on the next tick (seed-mount POST-COMMIT). If the last
-          // close left a snapshot, the shell's first frame already shows the transcript.
-          installReopenSnapshotOverlayIfAvailable()
-          // No raster to cover the shell → deliberate loading affordance, never a bare
-          // empty transcript. Replaced by the raster (late disk decode) or the seed.
-          installSeedLoadingIndicatorIfNeeded()
           NSLog(
             "[ChatOpen] firstRealBounds seed-deferred chat=%@ — shell committed",
             String(engineChatId.prefix(12)))
@@ -2507,6 +2738,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // isolated historical view (process-lifetime `bridgeFreshOwnSentIdsByChat` alone
   // would re-surface every earlier follow-up on this DM).
   private var bridgeHistoryFollowUpSentIds: Set<String> = []
+  // De-dupes the [AgentScope] trim log across the many setRows passes a single open makes.
+  private var lastBridgeSessionScopeLogSig: String?
 
   /// Register an outgoing message id so the fresh-surface filter never hides it.
   func noteBridgeFreshOwnSentId(_ messageId: String) {
@@ -2550,15 +2783,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     bridgeHistoryLoadInFlight
   }
 
-  /// Latest model/effort reported by the rows currently visible in the default chat.
-  /// ChatMainView uses this for its two-line agent header.
+  /// Latest configuration reported by the rows currently visible in the default chat.
+  /// ChatMainView uses this for its stable model/effort/repository subtitle.
   func visibleBridgeRunConfiguration(provider: String) -> (
-    model: String?, reasoningEffort: String?, status: String?
+    model: String?, reasoningEffort: String?, status: String?, repoName: String?, cwd: String?
   ) {
     let wantedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     var model: String?
     var effort: String?
     var status: String?
+    var repoName: String?
+    var cwd: String?
     for row in rows.reversed() {
       guard let runtime = row.agentRuntime else { continue }
       let runtimeProvider = runtime.provider?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
@@ -2577,9 +2812,54 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let value = runtime.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !value.isEmpty { status = value }
       }
-      if model != nil && effort != nil && status != nil { break }
+      if repoName == nil {
+        let value = runtime.repoName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !value.isEmpty { repoName = value }
+      }
+      if cwd == nil {
+        let value = runtime.cwd?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !value.isEmpty { cwd = value }
+      }
+      if model != nil && effort != nil && status != nil && repoName != nil && cwd != nil {
+        break
+      }
     }
-    return (model, effort, status)
+
+    // Reconstructed history message runtimes contain per-turn diff state but do not
+    // duplicate the session-level model/project metadata. The History panel already
+    // has that metadata in the cached list payload; use the same session row rather
+    // than falling back to the provider name (`claude`, `codex`) in the chat header.
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if model == nil || effort == nil || repoName == nil || cwd == nil,
+      !chatId.isEmpty,
+      let payload = ChatEngine.shared.latestAgentBridgeHistoryList(
+        chatId: chatId, provider: wantedProvider)
+    {
+      let cachedSessions = AgentBridgeHistoryInlineView.sessionItems(from: payload["sessions"])
+        .compactMap { AgentBridgeHistoryInlineView.parseSession($0) }
+      let preferredSessionId =
+        bridgeLoadedSessionId
+        ?? ChatEngine.shared.liveBridgeSessionId(chatId: chatId)
+        ?? activeBridgeSessionId
+      let cachedSession = preferredSessionId.flatMap { sessionId in
+        cachedSessions.first { $0.resolvedSessionId == sessionId || $0.id == sessionId }
+      } ?? (rows.contains(where: bridgeRowIsLive)
+        ? cachedSessions.first(where: \.isRunning)
+        : nil)
+      if let cachedSession {
+        if model == nil { model = cachedSession.model }
+        if effort == nil { effort = cachedSession.reasoningEffort }
+        if repoName == nil {
+          let value = cachedSession.projectName.trimmingCharacters(in: .whitespacesAndNewlines)
+          if !value.isEmpty { repoName = value }
+        }
+        if cwd == nil {
+          let value = cachedSession.projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+          if !value.isEmpty { cwd = value }
+        }
+      }
+    }
+    return (model, effort, status, repoName, cwd)
   }
 
   func hasActiveBridgeRun() -> Bool {
@@ -2609,23 +2889,31 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func bridgeRowIsLive(_ row: ChatListRow) -> Bool {
-    // The terminal runtime is the bridge's authoritative acknowledgement. It must
-    // override stale `isStreamingText`, top-level `running`, or `canCancel` hints
-    // left on an out-of-order packet.
-    if let runtimeStatus = row.agentRuntime?.status
-      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-      Self.bridgeTerminalRuntimeStatuses.contains(runtimeStatus)
-    {
-      return false
+    let hasExplicitLiveProgress = row.agentProgressNodes.contains { node in
+      let status = node.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      return Self.bridgeActiveRuntimeStatuses.contains(status)
     }
+    if let runtime = row.agentRuntime {
+      let runtimeStatus = runtime.status
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      if Self.bridgeTerminalRuntimeStatuses.contains(runtimeStatus) {
+        // A reconstructed history diff is sealed as `done` even while the bridge
+        // live-tail marks the same turn with a fresh running progress node. That
+        // history card describes completed edits, not the turn lifecycle. A real
+        // live/terminal runtime remains authoritative over stale row hints.
+        let historyWorkMode = (runtime.workMode ?? "")
+          .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let isHistorySnapshot = historyWorkMode == "history"
+        if !isHistorySnapshot || !hasExplicitLiveProgress { return false }
+      }
+    }
+    if hasExplicitLiveProgress { return true }
     if row.isStreamingText { return true }
     let status = (row.status ?? "").lowercased()
-    if status == "running" || status == "streaming" { return true }
+    if Self.bridgeActiveRuntimeStatuses.contains(status) { return true }
     if let runtime = row.agentRuntime {
       let runtimeStatus = runtime.status.lowercased()
-      if runtimeStatus == "running" || runtimeStatus == "streaming"
-        || runtimeStatus == "starting" || runtimeStatus == "pending"
-      {
+      if Self.bridgeActiveRuntimeStatuses.contains(runtimeStatus) {
         return true
       }
       // Bridge can advertise cancel while status is still mid-flight.
@@ -2635,6 +2923,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     return false
   }
+
+  private static let bridgeActiveRuntimeStatuses: Set<String> = [
+    "running", "streaming", "starting", "pending", "in_progress", "active",
+  ]
 
   private static let bridgeTerminalRuntimeStatuses: Set<String> = [
     "done", "complete", "completed", "success", "ok", "finished",
@@ -2791,8 +3083,61 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // appear twice — once as its live stream row, once as its `bridge-` card). When a
     // historical session is picked, show ONLY that session's rows.
     let historicalSessionPicked = bridgeLoadedSessionId != nil
-    return parsed.filter { row in
+    // An agent DM is a SESSION surface, not a rolling transcript. Claude/Codex open CLEAN
+    // and stay clean until a conversation is MOUNTED — picked from History, still live, or
+    // started right here by sending. Persisting their settled turns (so a session survives a
+    // cold launch) must never turn a plain open into "the default chat": every session on
+    // this provider shares one chatId, so the durable transcript is the whole cross-session
+    // pile, and painting it is exactly what must not happen.
+    //   • nothing mounted → show nothing persisted (own sends + live rows only)
+    //   • a session mounted → show THAT session: drop everything up to and including the
+    //     last row belonging to a DIFFERENT one. The cut lands on the last FOREIGN row,
+    //     never on the first row OF the session — the user's prompt that opened it carries
+    //     no session id, and a first-turn cut would hide exactly that message.
+    // Older sessions stay reachable through History; nothing is deleted, only scoped.
+    let mountedSessionId: String? = {
+      guard !historicalSessionPicked, currentBridgeProvider != nil else { return nil }
+      guard let sid = effectiveLoadedSessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+        !sid.isEmpty
+      else { return nil }
+      return sid
+    }()
+    // No session on this surface: a plain agent DM open renders empty (the "Recent
+    // sessions" capsule), never the restored pile.
+    let agentSurfaceIsClean =
+      currentBridgeProvider != nil && !historicalSessionPicked && mountedSessionId == nil
+    var foreignSessionCutIndex = -1
+    if let scopedSessionId = mountedSessionId {
+      let scopedPrefix = "bridge-\(scopedSessionId)"
+      for (index, row) in parsed.enumerated() {
+        let id = row.messageId ?? ""
+        let belongs: Bool
+        if id.hasPrefix("bridge-") {
+          belongs = id.hasPrefix(scopedPrefix)
+        } else if let sid = bridgeRowSessionId(row) {
+          belongs = sid == scopedSessionId
+        } else {
+          continue  // unattributed (user sends, separators) — never defines the boundary
+        }
+        if !belongs { foreignSessionCutIndex = index }
+      }
+    }
+    if let scopedSessionId = mountedSessionId, foreignSessionCutIndex >= 0 {
+      let sig = "\(scopedSessionId)|\(foreignSessionCutIndex)|\(parsed.count)"
+      if sig != lastBridgeSessionScopeLogSig {
+        lastBridgeSessionScopeLogSig = sig
+        NSLog(
+          "[AgentScope] chat=%@ session=%@ trimmed rows 0…%d of %d (older sessions live in History)",
+          String(chatKey.suffix(12)), String(scopedSessionId.prefix(8)),
+          foreignSessionCutIndex, parsed.count)
+      }
+    }
+    return parsed.enumerated().filter { indexed in
+      let (index, row) = indexed
       let id = row.messageId ?? ""
+      // Belongs to an older session than the one this surface is on. The user's own
+      // just-sent rows are never hidden (a send must always be visible where it was typed).
+      if index <= foreignSessionCutIndex, !ownSentIds.contains(id) { return false }
       // Session transcripts opened from History are ingested under this DM chatId keyed
       // `bridge-<sessionId>-…`. Show them only for the explicitly-loaded session; never
       // surface other sessions in the fresh default chat.
@@ -2846,8 +3191,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       if ownSentIds.contains(id) { return true }
       if hiddenIds.contains(id) { return false }
       if bridgeRowIsLive(row) { return true }
+      // Clean agent surface: the restored transcript stays out of the view until a session
+      // is mounted. Persistence still runs underneath (a picked session paints instantly,
+      // offline, from the same store) — it just isn't what a plain open renders.
+      if agentSurfaceIsClean { return false }
       return true
-    }
+    }.map { $0.element }
   }
 
   // Message ids of bridge command results we've already reported to the host, so a
@@ -4361,9 +4710,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Match the live list pipeline before parsing. Cached engine rows carry replyToId,
     // but older rows may not persist the denormalized preview fields; resolving them
     // here prevents the first post-push flush from treating every reply as changed.
+    // Launch prewarm has no live current-user id; isMe referenced rows leave
+    // replyPreviewUserId unset until the live attach path denormalizes it.
     let resolvedSourceRows = rowsByResolvingReplyPreviews(
       sourceRows,
-      peerDisplayName: peerDisplayName
+      peerDisplayName: peerDisplayName,
+      currentUserId: nil
     )
     let parsed = resolvedSourceRows.compactMap { ChatListRow(raw: $0) }
     guard !parsed.isEmpty else { return }
@@ -4393,7 +4745,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let width = Int(UIScreen.main.bounds.width.rounded())
     let screenScale = UIScreen.main.scale
     for theme in ["dark", "light"] {
-      let key = NSString(string: "\(trimmed)|w\(width)|\(theme)")
+      // Keep in sync with reopenSnapshotKey() — including the v2 poisoned-raster bump.
+      let key = NSString(string: "\(trimmed)|w\(width)|\(theme)|v2")
       guard reopenSnapshotCache.object(forKey: key) == nil,
         let url = reopenSnapshotFileURL(for: key)
       else { continue }
@@ -4422,9 +4775,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   /// Pure reply-preview normalization shared by launch prewarm and the live rows merge.
   /// Keeping both callers on this exact transform makes their raw rows reusable byte-for-byte.
+  /// `currentUserId` is optional so launch prewarm can run without a session id; when present,
+  /// referenced `isMe` rows denormalize as `replyPreviewUserId` for palette resolution.
   private static func rowsByResolvingReplyPreviews(
     _ rows: [[String: Any]],
-    peerDisplayName: String
+    peerDisplayName: String,
+    currentUserId: String? = nil
   ) -> [[String: Any]] {
     func nonEmptyString(_ raw: Any?) -> String? {
       if let value = raw as? String {
@@ -4457,7 +4813,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         ?? nonEmptyString(extra?["reply_to_id"])
     }
 
-    func descriptor(for row: [String: Any]) -> (title: String, text: String)? {
+    func senderUserId(from message: [String: Any], isMe: Bool) -> String? {
+      if isMe {
+        return nonEmptyString(currentUserId)
+      }
+      let metadata = message["metadata"] as? [String: Any]
+      let extra = message["extra"] as? [String: Any]
+      let dictionaries: [[String: Any]?] = [message, metadata, extra]
+      let senderKeys = [
+        "from_id", "fromId", "senderId", "sender_id", "userId", "user_id",
+        "agentUserId", "agent_user_id",
+      ]
+      for dictionary in dictionaries {
+        guard let dictionary else { continue }
+        for key in senderKeys {
+          if let value = nonEmptyString(dictionary[key]) { return value }
+        }
+      }
+      return nil
+    }
+
+    func descriptor(for row: [String: Any]) -> (title: String, text: String, userId: String?)? {
       guard (row["kind"] as? String) == "message",
         let message = row["message"] as? [String: Any],
         messageId(from: row) != nil
@@ -4477,45 +4853,61 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           ?? nonEmptyString(metadata?["senderName"])
           ?? nonEmptyString(metadata?["sender_name"])
           ?? (trimmedPeerName.isEmpty ? "Reply" : trimmedPeerName))
+      let userId = senderUserId(from: message, isMe: isMe)
 
       if let text = nonEmptyString(message["text"])
         ?? nonEmptyString(message["caption"])
         ?? nonEmptyString(metadata?["caption"])
       {
-        return (title, text)
+        return (title, text, userId)
       }
       if let fileName = nonEmptyString(message["fileName"])
         ?? nonEmptyString(message["file_name"])
         ?? nonEmptyString(metadata?["fileName"])
         ?? nonEmptyString(metadata?["file_name"])
       {
-        return (title, fileName)
+        return (title, fileName, userId)
       }
 
       switch type {
-      case "image", "gif": return (title, "Photo")
-      case "video": return (title, "Video")
-      case "voice", "audio", "music", "mp3": return (title, "Voice message")
-      case "sticker": return (title, "Sticker")
-      case "file": return (title, "File")
-      default: return (title, "Message")
+      case "image", "gif": return (title, "Photo", userId)
+      case "video": return (title, "Video", userId)
+      case "voice", "audio", "music", "mp3": return (title, "Voice message", userId)
+      case "sticker": return (title, "Sticker", userId)
+      case "file": return (title, "File", userId)
+      default: return (title, "Message", userId)
       }
     }
 
-    var previewsById: [String: (title: String, text: String)] = [:]
+    var previewsById: [String: (title: String, text: String, userId: String?)] = [:]
     previewsById.reserveCapacity(rows.count)
     for row in rows {
       guard let id = messageId(from: row), let preview = descriptor(for: row) else { continue }
       previewsById[id] = preview
     }
 
-    return rows.map { row in
+    var resolvedRows: [[String: Any]] = []
+    resolvedRows.reserveCapacity(rows.count)
+    for row in rows {
       guard (row["kind"] as? String) == "message",
         var message = row["message"] as? [String: Any],
         let replyToId = replyToId(from: message)
-      else { return row }
+      else {
+        resolvedRows.append(row)
+        continue
+      }
 
       message["replyToId"] = replyToId
+      let metadata = message["metadata"] as? [String: Any]
+      let extra = message["extra"] as? [String: Any]
+      let replyPreview =
+        (message["replyPreview"] as? [String: Any])
+        ?? (message["reply_preview"] as? [String: Any])
+        ?? (metadata?["replyPreview"] as? [String: Any])
+        ?? (metadata?["reply_preview"] as? [String: Any])
+        ?? (extra?["replyPreview"] as? [String: Any])
+        ?? (extra?["reply_preview"] as? [String: Any])
+
       if let preview = previewsById[replyToId] {
         if (nonEmptyString(message["replyPreviewTitle"])
           ?? nonEmptyString(message["reply_preview_title"])) == nil
@@ -4527,12 +4919,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         {
           message["replyPreviewText"] = preview.text
         }
+        // Same reason as `senderUserId` above: keep the candidate walk out of the type
+        // checker's chain solver.
+        let existingUserIdCandidates: [Any?] = [
+          message["replyPreviewUserId"], message["reply_preview_user_id"],
+          message["replyAuthorId"], message["reply_author_id"],
+          replyPreview?["replyPreviewUserId"], replyPreview?["reply_preview_user_id"],
+          replyPreview?["senderId"], replyPreview?["userId"],
+        ]
+        let hasExistingUserId = existingUserIdCandidates.contains { nonEmptyString($0) != nil }
+        if !hasExistingUserId, let userId = preview.userId {
+          message["replyPreviewUserId"] = userId
+        }
       }
 
       var resolvedRow = row
       resolvedRow["message"] = message
-      return resolvedRow
+      resolvedRows.append(resolvedRow)
     }
+    return resolvedRows
   }
 
   // MARK: - Persisted row heights (disk)
@@ -4565,13 +4970,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     persistedHeightsChatId = chatId
     guard !chatId.isEmpty,
       let url = Self.persistedHeightsFileURL(chatId: chatId),
-      let data = try? Data(contentsOf: url),
-      let decoded = try? JSONDecoder().decode([String: PersistedHeightEntry].self, from: data)
+      let data = try? Data(contentsOf: url)
     else { return }
-    persistedHeightsByKey = decoded
+    guard let decoded = try? JSONDecoder().decode(PersistedHeightsFile.self, from: data),
+      decoded.rev == Self.bubbleLayoutRevision
+    else {
+      // Pre-revision file (legacy bare dict) or one written under different layout
+      // math — see bubbleLayoutRevision. Never trust it, never keep it.
+      try? FileManager.default.removeItem(at: url)
+      NSLog(
+        "[ChatOpen] heights RESTORE chat=%@ DISCARDED — stale layout revision",
+        String(chatId.prefix(12)))
+      return
+    }
+    persistedHeightsByKey = decoded.e
     NSLog(
       "[ChatOpen] heights RESTORE chat=%@ entries=%d",
-      String(chatId.prefix(12)), decoded.count)
+      String(chatId.prefix(12)), decoded.e.count)
   }
 
   /// Exact-height fallback consulted only after the in-memory caches miss. On a hit the
@@ -4597,10 +5012,30 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return nil
     }
     let widthMatches = abs(entry.w - Double(rowWidth)) < 0.5
+    // Seed fast path: trust the height on a width match and skip the signature
+    // entirely — it is the per-row cost that made the mount lose its race with the
+    // push animation. The entry stays in `persistedHeightsByKey` so the post-appear
+    // audit can still compare its signature against the live row and reload the rare
+    // row that changed while its persisted height slept.
+    if seedTrustsPersistedHeights, widthMatches, !isEphemeralPreview {
+      let height = CGFloat(entry.h)
+      let cacheEntry = RowHeightCacheEntry(
+        row: row, rowWidth: rowWidth, state: state, height: height,
+        contentVersion: contentVersion)
+      if contentVersion.isEmpty {
+        messageHeightCache[row.key] = cacheEntry
+      } else {
+        agentTurnHeightCache[row.key] = cacheEntry
+      }
+      seedTrustedHeightKeys[row.key] = (Self.bubbleStateSignature(state), contentVersion)
+      if seedSizeProfilingActive { seedProfTrustHits += 1 }
+      return height
+    }
     let contentMatches =
       entry.v == contentVersion
       && entry.s == Self.bubbleStateSignature(state)
       && entry.sig == chatListRowContentSignature(row)
+    if seedSizeProfilingActive, widthMatches, contentMatches { seedProfSigHits += 1 }
     // Transient preview: the content is identical, only the card width differs.
     // Reuse the real-width height as a close-enough estimate rather than
     // re-measuring the whole tail on the main thread mid-hold. Pure read — the
@@ -4703,13 +5138,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           h: Double(cached.height),
           v: cached.contentVersion,
           sig: chatListRowContentSignature(cached.row),
-          // Fingerprint agent-turn rows only (the ones that thrash reason=sig).
-          f: bubbleUsesAgentTurnContent(cached.row)
-            ? chatListRowSignatureFieldHashes(cached.row) : nil)
+          // Fingerprint every row so a reason=sig stale can name the flipped field
+          // (agent-only before — non-agent staleness printed flipped=[-]).
+          f: chatListRowSignatureFieldHashes(cached.row))
       }
       for (key, cached) in messageEntries { admit(key, cached) }
       for (key, cached) in agentEntries { admit(key, cached) }
-      guard !entries.isEmpty, let data = try? JSONEncoder().encode(entries) else { return }
+      guard !entries.isEmpty,
+        let data = try? JSONEncoder().encode(
+          PersistedHeightsFile(rev: Self.bubbleLayoutRevision, e: entries))
+      else { return }
       try? data.write(to: url, options: [.atomic])
       NSLog(
         "[ChatOpen] heights PERSIST chat=%@ total=%d carried=%d fresh=%d rejLive=%d rejStream=%d rejKeys=[%@]",
@@ -4944,17 +5382,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         "[ChatOpen] viewport LOAD chat=%@ dropped sameRun=N atBottom=%@ hasAnchor=%@ age=%.0fs",
         String(chatId.prefix(12)), viewport.atBottom ? "Y" : "N",
         (viewport.messageId?.isEmpty == false) ? "Y" : "N", ageSeconds)
-      if viewport.atBottom == false, let key = reopenSnapshotKey() {
-        // The raster captured at that close shows the dropped record's mid-history
-        // viewport; this open lands at the bottom, so the raster would flash the wrong
-        // rows. Runs before preloadReopenSnapshotFromDiskIfNeeded, so the disk twin is
-        // gone before it could decode. Bottom-captured rasters stay: bottom ↔ bottom
-        // is aligned and still buys the frame-one cover after a relaunch.
-        Self.reopenSnapshotCache.removeObject(forKey: key)
-        if let url = Self.reopenSnapshotFileURL(for: key) {
-          Self.reopenSnapshotIOQueue.async { try? FileManager.default.removeItem(at: url) }
-        }
-      }
+      // The raster is NOT deleted here anymore: captures are bottom-gated and the
+      // launch prewarm renders bottom rasters, so every v2 raster shows the newest
+      // rows — exactly where a dropped-viewport open lands. Deleting it destroyed the
+      // fresh prewarm raster and left the whole mount uncovered (the "empty saved
+      // messages for a second" open).
       // Clean up the dead record so every later open of this chat skips the decode.
       UserDefaults.standard.removeObject(forKey: Self.persistedViewportKey(chatId: chatId))
       persistedOpeningViewport = nil
@@ -5095,6 +5527,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// (estimated) sizing, search, or an anchor outside this seed window all return false
   /// with the restore flag still armed, so the post-appear flush restores exactly as
   /// before once the complete transcript is in.
+  /// Side-effect-free mirror of the guard below, so the seed can decide WHERE it will
+  /// land before it materializes anything. Keep the two in step.
+  private var seedWillRestoreSavedViewport: Bool {
+    guard shouldApplyOpeningViewport, searchQuery.isEmpty, openingUnreadCount == 0,
+      !usesProgressiveTranscriptSizing,
+      let viewport = persistedOpeningViewport, viewport.atBottom == false,
+      let messageId = viewport.messageId, !messageId.isEmpty
+    else { return false }
+    return rows.contains(where: { $0.messageId == messageId })
+  }
+
   private func applySavedViewportAtSeedIfPossible() -> Bool {
     guard shouldApplyOpeningViewport, searchQuery.isEmpty, openingUnreadCount == 0,
       !usesProgressiveTranscriptSizing,
@@ -5667,6 +6110,46 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         // Load accepted (store-served or network started). Spinner / timeout already armed;
         // prepend arming happens when the grown payload arrives via setRows/applyRows.
+        // But an accepted load that comes back with ZERO rows — the last page, i.e. "the
+        // whole history is now in the view" — produces no payload at all, so nothing ever
+        // consumes the expectation and the loader sat there spinning until the 10s
+        // timeout. Watch for the engine flipping to exhausted and clear it immediately.
+        self.scheduleOlderHistorySettleCheck(chatId: chatId, baselineRowCount: rowCount)
+      }
+    }
+  }
+
+  /// Backstop for an accepted older-history load that yields nothing (history fully
+  /// loaded). Polls the engine's `hasOlderChatHistory` a few times; the first `false`
+  /// retires the spinner and latches exhausted so the trigger stops re-firing.
+  private func scheduleOlderHistorySettleCheck(
+    chatId: String, baselineRowCount: Int, attempt: Int = 0
+  ) {
+    guard attempt < 5 else { return }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+      guard let self, self.olderHistoryLoadInFlight,
+        self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines) == chatId
+      else { return }
+      // Rows already grew — the normal prepend path owns the finish.
+      guard self.rows.count <= baselineRowCount else { return }
+      chatListEngineBindingQueue.async {
+        let hasOlder = ChatEngine.shared.hasOlderChatHistory(chatId: chatId)
+        DispatchQueue.main.async {
+          guard self.olderHistoryLoadInFlight,
+            self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines) == chatId
+          else { return }
+          guard hasOlder else {
+            self.olderHistoryExhaustedForChat = true
+            self.clearOlderHistoryExpectation()
+            self.finishOlderHistoryLoadBookkeeping(hideSpinner: true)
+            NSLog(
+              "[ChatOpen] older-history EXHAUSTED chat=%@ — whole history loaded, loader cleared",
+              String(chatId.prefix(12)))
+            return
+          }
+          self.scheduleOlderHistorySettleCheck(
+            chatId: chatId, baselineRowCount: baselineRowCount, attempt: attempt + 1)
+        }
       }
     }
   }
@@ -5750,6 +6233,188 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       String(engineChatId.prefix(12)))
     refreshRowsFromEngineDelta()
     scheduleProgressiveHeightWarmup()
+    auditSeedTrustedHeights()
+    flushDeferredWallpaperSnapshotRefresh()
+    logViewportCoverage("complete")
+    // The "list is there but the screen looks empty until I nudge it" report: sample once
+    // more after everything has settled, since the gap only shows up at rest.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+      self?.logViewportCoverage("settled")
+    }
+  }
+
+  /// How much of the visible viewport is actually covered by materialized cells. A healthy
+  /// open is ~100%; a low number with rows>0 is the blank-until-you-scroll bug — cells
+  /// exist in the data source but the offset points at empty layout space (over-tall
+  /// trusted heights, an offset past the content, or a layout that never materialized).
+  private func logViewportCoverage(_ stage: String) {
+    let boundsH = collectionView.bounds.height
+    guard boundsH > 1.0, !rows.isEmpty else { return }
+    let visibleRect = CGRect(origin: collectionView.contentOffset, size: collectionView.bounds.size)
+    var covered: CGFloat = 0
+    var spanTop = CGFloat.greatestFiniteMagnitude
+    var spanBottom = -CGFloat.greatestFiniteMagnitude
+    for cell in collectionView.visibleCells {
+      let overlap = cell.frame.intersection(visibleRect)
+      guard !overlap.isNull, overlap.height > 0 else { continue }
+      covered += overlap.height
+      spanTop = min(spanTop, cell.frame.minY)
+      spanBottom = max(spanBottom, cell.frame.maxY)
+    }
+    let percent = Int((covered / boundsH) * 100.0)
+    NSLog(
+      "[ChatOpen] viewport-cover %@ chat=%@ rows=%d cells=%d cover=%d%% off=%.0f contentH=%.0f boundsH=%.0f span=%.0f…%.0f",
+      stage, String(engineChatId.prefix(12)), rows.count,
+      collectionView.visibleCells.count, percent,
+      collectionView.contentOffset.y, collectionView.contentSize.height, boundsH,
+      spanTop == .greatestFiniteMagnitude ? -1 : spanTop,
+      spanBottom == -.greatestFiniteMagnitude ? -1 : spanBottom)
+    logViewportVisibility(stage)
+  }
+
+  /// Second half of the blank-open probe. Coverage says the cells EXIST and sit under the
+  /// viewport (measured 87% on a chat the user saw as empty), so whatever is wrong is
+  /// visibility, not layout: something is hidden, transparent, masked, or the layer tree
+  /// is not being presented. Report the whole chain in one line.
+  private func logViewportVisibility(_ stage: String) {
+    var hiddenCells = 0
+    var clearCells = 0
+    var hiddenBubbles = 0
+    var clearBubbles = 0
+    var ghostCells = 0
+    for case let cell as ChatListCell in collectionView.visibleCells {
+      if cell.isHidden { hiddenCells += 1 }
+      if cell.alpha < 0.02 { clearCells += 1 }
+      if cell.contentView.isHidden { ghostCells += 1 }
+      if cell.bubbleView.isHidden { hiddenBubbles += 1 }
+      if cell.bubbleView.alpha < 0.02 { clearBubbles += 1 }
+    }
+    let host = superview
+    NSLog(
+      "[ChatOpen] viewport-vis %@ chat=%@ list(a=%.2f h=%@ speed=%.1f) cv(a=%.2f h=%@ speed=%.1f) host(a=%.2f h=%@) window=%@ cells(hidden=%d clear=%d ghost=%d) bubbles(hidden=%d clear=%d) snapshotOverlay=%@ defersPresentation=%@",
+      stage, String(engineChatId.prefix(12)),
+      alpha, isHidden ? "Y" : "N", layer.speed,
+      collectionView.alpha, collectionView.isHidden ? "Y" : "N", collectionView.layer.speed,
+      host?.alpha ?? -1, (host?.isHidden ?? false) ? "Y" : "N",
+      window == nil ? "N" : "Y",
+      hiddenCells, clearCells, ghostCells, hiddenBubbles, clearBubbles,
+      reopenSnapshotOverlay == nil ? "N" : "Y",
+      defersTranscriptUpdatesForPresentation ? "Y" : "N")
+  }
+
+  /// The verify half of the seed's trust-then-verify sizing. The mount promoted
+  /// persisted heights on width alone; here every trusted key's full content signature
+  /// is recomputed OFF-MAIN (rows are value types) against the persisted entry and the
+  /// state/version captured at promote time. Keys that validate consume their persisted
+  /// entry exactly as an eager promote would have; keys that fail drop both caches and
+  /// reload just those rows, whose heights then re-measure exactly. Runs after
+  /// presentation-complete, so none of this cost can touch the push.
+  private func auditSeedTrustedHeights() {
+    guard !seedTrustedHeightKeys.isEmpty else { return }
+    let audits = seedTrustedHeightKeys
+    seedTrustedHeightKeys = [:]
+    var rowsByKey: [String: ChatListRow] = [:]
+    for row in rows where rowsByKey[row.key] == nil { rowsByKey[row.key] = row }
+    var pending:
+      [(key: String, row: ChatListRow, entry: PersistedHeightEntry, state: String, version: String)] =
+        []
+    for (key, captured) in audits {
+      guard let entry = persistedHeightsByKey[key] else { continue }
+      guard let row = rowsByKey[key] else {
+        // The reconcile dropped the row; its persisted entry stays for a future open.
+        continue
+      }
+      pending.append((key, row, entry, captured.state, captured.contentVersion))
+    }
+    guard !pending.isEmpty else { return }
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+      var validatedKeys: [String] = []
+      var staleKeys: [String] = []
+      // Which of the three gates rejected, and (when the row carries per-field hashes)
+      // WHICH field flipped. A 100%-stale audit means every open re-measures on screen —
+      // the "cells shift a few pixels after the chat appears" — so the breakdown has to
+      // name the unstable field instead of leaving it to inference.
+      var versionMisses = 0
+      var stateMisses = 0
+      var sigMisses = 0
+      var flippedFieldTally: [String: Int] = [:]
+      for item in pending {
+        let versionOK = item.entry.v == item.version
+        let stateOK = item.entry.s == item.state
+        let sigOK = item.entry.sig == chatListRowContentSignature(item.row)
+        if versionOK && stateOK && sigOK {
+          validatedKeys.append(item.key)
+          continue
+        }
+        if !versionOK { versionMisses += 1 }
+        if !stateOK { stateMisses += 1 }
+        if !sigOK {
+          sigMisses += 1
+          if let persistedFields = item.entry.f, !persistedFields.isEmpty {
+            for name in chatListRowSignatureFlippedFieldNames(item.row, against: persistedFields) {
+              flippedFieldTally[name, default: 0] += 1
+            }
+          }
+        }
+        staleKeys.append(item.key)
+      }
+      let flippedSummary =
+        flippedFieldTally.isEmpty
+        ? "-"
+        : flippedFieldTally.sorted { $0.value > $1.value }.prefix(6)
+          .map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+      DispatchQueue.main.async {
+        guard let self else { return }
+        // Validated: migrate out of the persisted file exactly like an eager promote.
+        for key in validatedKeys {
+          self.persistedHeightsByKey.removeValue(forKey: key)
+        }
+        guard !staleKeys.isEmpty else { return }
+        let staleSet = Set(staleKeys)
+        var trustedHeightByKey: [String: CGFloat] = [:]
+        for item in pending where staleSet.contains(item.key) {
+          trustedHeightByKey[item.key] = CGFloat(item.entry.h)
+        }
+        for key in staleKeys {
+          self.persistedHeightsByKey.removeValue(forKey: key)
+          self.messageHeightCache.removeValue(forKey: key)
+          self.agentTurnHeightCache.removeValue(forKey: key)
+        }
+        // Measure-first: a flipped signature only earns a visible reload when the fresh
+        // measurement actually disagrees with the height the seed trusted. Most flips
+        // are render-inert fields resolving late (reply enrichment, adjacency), and
+        // reloading every flagged row nudged the whole list ~0.5s after each open. The
+        // caches were just cleared, so estimateMessageHeight measures fresh here and
+        // re-installs the result for the following layout passes.
+        var shiftedIndexPaths: [IndexPath] = []
+        var shiftedNet: CGFloat = 0
+        for (index, row) in self.rows.enumerated() where staleSet.contains(row.key) {
+          let indexPath = IndexPath(item: index, section: 0)
+          guard row.kind == .message else {
+            shiftedIndexPaths.append(indexPath)
+            continue
+          }
+          let width = self.groupMeasurementExtras(at: indexPath).measurementWidth
+          let exact = self.estimateMessageHeight(row, rowWidth: width)
+          guard let trusted = trustedHeightByKey[row.key], abs(exact - trusted) > 0.5 else {
+            continue
+          }
+          shiftedIndexPaths.append(indexPath)
+          shiftedNet += exact - trusted
+        }
+        NSLog(
+          "[ChatOpen] height-audit chat=%@ stale=%d of %d shifted=%d dh=%.0f (version=%d state=%d sig=%d flipped=[%@])",
+          String(self.engineChatId.prefix(12)), staleKeys.count, pending.count,
+          shiftedIndexPaths.count, shiftedNet,
+          versionMisses, stateMisses, sigMisses, flippedSummary)
+        if !shiftedIndexPaths.isEmpty {
+          UIView.performWithoutAnimation {
+            self.collectionView.reloadItems(at: shiftedIndexPaths)
+          }
+        }
+        self.schedulePersistRowHeights()
+      }
+    }
   }
 
   /// Called from the destination controller's `viewDidAppear`, after UIKit has released
@@ -5926,14 +6591,75 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     pruneAgentTurnState(for: seedRows)
     pruneStopCancelRequestedKeys(using: seedRows)
     syncComposerStopState()
+    var seedPositionMs = 0
+    var seedLayoutMs = 0
+    // Trust-then-verify sizing for THIS mount only (never for ephemeral previews,
+    // which must not touch the caches): the audit after presentation-complete
+    // re-validates every trusted key off-main.
+    seedTrustsPersistedHeights = !isEphemeralPreview
+    seedTrustedHeightKeys = [:]
+    seedSizeProfilingActive = true
+    seedProfSizeCalls = 0
+    seedProfSizeNs = 0
+    seedProfTrustHits = 0
+    seedProfSigHits = 0
+    seedProfCacheHits = 0
+    seedProfMeasures = 0
+    seedProfMeasureNs = 0
+    seedProfConfigures = 0
+    seedProfConfigureNs = 0
+    seedProfCellCalls = 0
+    seedProfCellNs = 0
+    seedProfInsetNs = 0
+    seedProfContentSizeNs = 0
+    seedProfOffsetNs = 0
+    defer {
+      seedTrustsPersistedHeights = false
+      seedSizeProfilingActive = false
+    }
     UIView.performWithoutAnimation {
       flowLayout.invalidateLayout()
       collectionView.reloadData()
       if collectionView.bounds.width > 1.0, collectionView.bounds.height > 1.0 {
+        // POSITION BEFORE MATERIALIZING. A collection view builds cells for wherever the
+        // offset currently points, and after `reloadData` that is the TOP — the OLDEST
+        // message. Laying out here and jumping to the bottom afterwards therefore builds
+        // two full viewports of cells and throws the first one away. That was nearly free
+        // while the seed was a 16-row tail (top ≈ bottom on a barely-scrollable list); on
+        // a full-window mount the two ends are thousands of points apart, so it doubles
+        // the heaviest work in the open. The LAYOUT's `collectionViewContentSize` runs
+        // prepare() — item attributes only, no cells — so the landing offset is knowable
+        // before a single cell exists.
+        let seedPositionStart = ProcessInfo.processInfo.systemUptime
+        if lastKnownViewportHeight > 0.5, !seedWillRestoreSavedViewport {
+          var mark = DispatchTime.now().uptimeNanoseconds
+          // Inset only — no cell materialization while the offset still points at the
+          // top; the post-offset pass below builds the real viewport exactly once.
+          updateBottomAnchorInset(materialize: false)
+          var now = DispatchTime.now().uptimeNanoseconds
+          seedProfInsetNs = now &- mark
+          mark = now
+          let layoutContentHeight =
+            collectionView.collectionViewLayout.collectionViewContentSize.height
+          now = DispatchTime.now().uptimeNanoseconds
+          seedProfContentSizeNs = now &- mark
+          mark = now
+          let bottomOffsetY = pixelAlignedValue(
+            max(0.0, layoutContentHeight - collectionView.bounds.height))
+          if abs(collectionView.contentOffset.y - bottomOffsetY) > 0.5 {
+            performInternalScrollAdjustment {
+              collectionView.setContentOffset(CGPoint(x: 0.0, y: bottomOffsetY), animated: false)
+            }
+          }
+          seedProfOffsetNs = DispatchTime.now().uptimeNanoseconds &- mark
+        }
+        seedPositionMs = Int((ProcessInfo.processInfo.systemUptime - seedPositionStart) * 1000)
         // Avatar placement consumes visible-item layout attributes. Materialize the
         // bounded seed layout now so group avatars join the first painted frame instead
         // of appearing only after the authoritative transcript reconciliation.
+        let seedLayoutStart = ProcessInfo.processInfo.systemUptime
         collectionView.layoutIfNeeded()
+        seedLayoutMs = Int((ProcessInfo.processInfo.systemUptime - seedLayoutStart) * 1000)
         if lastKnownViewportHeight > 0.5 {
           // Post-commit mount: the first real layout already ran on the empty shell
           // and owned the initial positioning, so this pass must land the freshly
@@ -5962,15 +6688,28 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     let seedMountMs = seedPhaseMs()
     NSLog(
-      "[ChatOpen] presentation-seed chat=%@ visible=%d retained=%d cachedHeights=%d sizing=%@ window=%@ normMs=%d parseMs=%d filterMs=%d mountMs=%d totalMs=%d sinceOpenMs=%d",
+      "[ChatOpen] presentation-seed chat=%@ visible=%d retained=%d cachedHeights=%d sizing=%@ window=%@ normMs=%d parseMs=%d filterMs=%d posMs=%d layoutMs=%d mountMs=%d totalMs=%d sinceOpenMs=%d",
       String(engineChatId.prefix(12)), seedRows.count, sourceRows.count,
       messageHeightCache.count + agentTurnHeightCache.count,
       usesProgressiveTranscriptSizing ? "estimated" : "exact",
       fullWindow ? "full" : "tail",
-      seedNormalizeMs, seedParseMs, seedFilterMs, seedMountMs,
+      seedNormalizeMs, seedParseMs, seedFilterMs, seedPositionMs, seedLayoutMs, seedMountMs,
       Int((ProcessInfo.processInfo.systemUptime - seedStartedAt) * 1000),
       chatOpenStartedAt > 0
         ? Int((ProcessInfo.processInfo.systemUptime - chatOpenStartedAt) * 1000) : -1)
+    // One-open attribution for posMs/layoutMs: how many sizeForItemAt calls and where
+    // their time went (trust promotes vs signature-validated promotes vs in-memory
+    // cache hits vs fresh measurement), and the cell-configure share of layout.
+    NSLog(
+      "[ChatOpen] seed-profile chat=%@ sizeCalls=%d sizeMs=%d trust=%d sig=%d cacheHit=%d measure=%d measureMs=%d configure=%d configureMs=%d cell=%d cellMs=%d insetMs=%d contentMs=%d offsetMs=%d",
+      String(engineChatId.prefix(12)),
+      seedProfSizeCalls, Int(seedProfSizeNs / 1_000_000),
+      seedProfTrustHits, seedProfSigHits, seedProfCacheHits,
+      seedProfMeasures, Int(seedProfMeasureNs / 1_000_000),
+      seedProfConfigures, Int(seedProfConfigureNs / 1_000_000),
+      seedProfCellCalls, Int(seedProfCellNs / 1_000_000),
+      Int(seedProfInsetNs / 1_000_000), Int(seedProfContentSizeNs / 1_000_000),
+      Int(seedProfOffsetNs / 1_000_000))
     // The seed just mounted the real transcript (positioned at bottom or the restored
     // anchor). Hand off from the raster NOW — every actual mount path runs through
     // here, whereas the POST-COMMIT wrapper's removal only covered its own path, so
@@ -5986,6 +6725,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // nothing re-evaluating ("it's not at the very bottom, needs a slight scroll").
     // Verify twice after things settle; each check logs the drift it repairs.
     scheduleBottomIntegrityChecks()
+    logViewportCoverage("seed")
   }
 
   private var userHasScrolledSinceOpen = false
@@ -8665,28 +9405,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     scrollingDatePillHideWorkItem = nil
   }
 
-  /// Scroll settled: keep the date visible for a beat, then fade it out — instead of the
-  /// old instant blink-out the moment the finger lifted.
+  /// Scroll settled. The date is a PINNED element now — it stays attached under the
+  /// header instead of fading out a beat after the finger lifts, which is what made it
+  /// read as "a date sitting in the list" rather than a floating header attachment. The
+  /// only thing that removes it is having no dated row at the top (handled in
+  /// `updateScrollingDatePill`), and the hand-off to an in-list separator parked in the
+  /// slot. Kept as a hook so the call sites still describe the settle moment.
   private func scheduleScrollingDatePillLinger() {
     cancelScrollingDatePillLinger()
-    guard !scrollingDatePill.isHidden else { return }
-    let workItem = DispatchWorkItem { [weak self] in
-      guard let self else { return }
-      self.scrollingDatePillHideWorkItem = nil
-      UIView.animate(
-        withDuration: 0.22,
-        delay: 0.0,
-        options: [.beginFromCurrentState, .curveEaseOut]
-      ) {
-        self.scrollingDatePill.alpha = 0.0
-      } completion: { finished in
-        guard finished, self.scrollingDatePillHideWorkItem == nil else { return }
-        self.scrollingDatePill.isHidden = true
-        self.scrollingDatePill.alpha = 1.0
-      }
-    }
-    scrollingDatePillHideWorkItem = workItem
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: workItem)
+    // Re-assert against the settled viewport: a fling can end between updates.
+    updateScrollingDatePill(visible: true)
   }
 
   private func updateScrollingDatePill(visible: Bool) {
@@ -8722,25 +9450,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
-    // Shared-element hand-off: while the in-list day separator that owns this label sits
-    // at/under the sticky slot, IT is the pill — showing the overlay too would render the
-    // same capsule twice. The overlay takes over the moment the separator slides behind
-    // the header chrome.
+    // ONE capsule, and it lives under the header. The pinned pill always shows the current
+    // date; the in-list separator it represents fades out (alpha only — the row keeps its
+    // height, so nothing moves). Previously this branch did the opposite: whenever that
+    // separator was anywhere on screen below the slot, the PINNED pill hid and the date
+    // scrolled away with the list — which is exactly "the date is stuck in the list
+    // instead of attached to the header". The next day's separator keeps its capsule as it
+    // rises, so you watch it travel up, shove this one behind the header, and take over.
     let slotY = scrollingDatePillSlotY()
     let offsetY = collectionView.contentOffset.y
     for candidate in visibleItems {
-      guard candidate.item < rows.count, rows[candidate.item].kind == .day else { continue }
-      guard rows[candidate.item].label == label else { break }
-      guard let attrs = collectionView.layoutAttributesForItem(at: candidate) else { break }
-      let pillHeight = ceil(scrollingDateLabel.font.lineHeight) + (dayPillVerticalPadding * 2.0)
-      let cellPillMinY = attrs.frame.midY - offsetY - (pillHeight / 2.0)
-      if cellPillMinY > slotY - 4.0 {
-        cancelScrollingDatePillLinger()
-        scrollingDatePill.isHidden = true
-        scrollingDatePill.alpha = 1.0
-        return
-      }
-      break
+      guard candidate.item < rows.count, rows[candidate.item].kind == .day,
+        let cell = collectionView.cellForItem(at: candidate) as? ChatListCell
+      else { continue }
+      cell.setDaySeparatorRepresentedByPinnedDate(rows[candidate.item].label == label)
     }
 
     cancelScrollingDatePillLinger()
@@ -8791,6 +9514,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     } else {
       scrollingDatePill.transform = .identity
       scrollingDatePill.alpha = 1.0
+    }
+    // One line per state change (label / shown-ness / slot), so "the date isn't sticking"
+    // is answerable from a log instead of from the screen.
+    let stateSignature = "\(label)|\(Int(slotY))|\(Int(shoveUp))"
+    if stateSignature != lastScrollingDatePillLogSignature {
+      lastScrollingDatePillLogSignature = stateSignature
+      NSLog(
+        "[ChatOpen] date-pin chat=%@ label=%@ slotY=%.0f pillY=%.0f shove=%.0f safeTop=%.0f padTop=%.0f",
+        String(engineChatId.prefix(12)), label, slotY, scrollingDatePill.frame.minY, shoveUp,
+        safeAreaInsets.top, contentPaddingTop)
     }
   }
 
@@ -8885,6 +9618,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   public func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath)
     -> UICollectionViewCell
   {
+    let cellProfStart = seedSizeProfilingActive ? DispatchTime.now().uptimeNanoseconds : 0
+    defer {
+      if seedSizeProfilingActive {
+        seedProfCellCalls += 1
+        seedProfCellNs &+= DispatchTime.now().uptimeNanoseconds &- cellProfStart
+      }
+    }
     guard indexPath.item < rows.count else {
       // Reconfigure paths may request an index that has just shifted during a
       // batched delete+reload. Return the existing cell when present to avoid
@@ -10348,6 +11088,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if row.kind == .day {
       return CGSize(width: width, height: 30.0)
     }
+    let profStart = seedSizeProfilingActive ? DispatchTime.now().uptimeNanoseconds : 0
     // Group rows reserve a leading avatar gutter (narrows the bubble) and, on the first
     // message of a sender-run, extra top space for the name label. Both must match what
     // the cell lays out — same helper as the setRows height-delta check.
@@ -10356,6 +11097,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       usesProgressiveTranscriptSizing
       ? presentationSeedMessageHeight(row, rowWidth: extras.measurementWidth)
       : estimateMessageHeight(row, rowWidth: extras.measurementWidth)
+    if seedSizeProfilingActive {
+      seedProfSizeCalls += 1
+      seedProfSizeNs &+= DispatchTime.now().uptimeNanoseconds &- profStart
+    }
     return CGSize(width: width, height: bubbleHeight + extras.extraTop)
   }
 
@@ -10519,7 +11264,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// frame-exact) rides an existing avatar to its new spot with a short additive ease
   /// instead of snapping.
   private func updateFloatingSenderAvatars(animateShift _: Bool = false) {
-    guard isGroupOrChannel, !rows.isEmpty else {
+    // Channels carry no per-sender identity — skip the whole pass rather than let it
+    // run and find nothing (this fires on every scroll tick).
+    guard isGroupOrChannel, !isChannel, !rows.isEmpty else {
       if !senderAvatarViews.isEmpty {
         senderAvatarViews.values.forEach { $0.removeFromSuperview() }
         senderAvatarViews.removeAll()
@@ -10671,10 +11418,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // them drift relative to an anchored prepend/stream relayout and look detached.
       avatarView.layer.removeAnimation(forKey: "avatarDataShift")
       let info = ctx.senderKey.flatMap { groupSenderDirectory[$0] }
+      let avatarColors = ChatProfileAppearanceStore.avatarColors(
+        title: info?.name ?? ctx.senderName,
+        peerUserId: info?.userId ?? key,
+        chatId: nil
+      )
       avatarView.configure(
         name: info?.name ?? ctx.senderName ?? "",
         avatarUrl: ctx.avatarUrl,
-        tint: ctx.senderColor ?? .systemGray,
+        peerUserId: info?.userId ?? key,
+        gradientColors: avatarColors,
         provider: ctx.provider)
       // A newly-created overlay view has never participated in a hierarchy layout pass.
       // Resolve its gradient/image/initials frames synchronously so the fallback avatar is
@@ -10821,7 +11574,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     persistViewportState()
   }
 
-  private func updateBottomAnchorInset() {
+  /// `materialize: false` updates the inset + invalidates WITHOUT `layoutIfNeeded`.
+  /// The seed's position phase must use it: with the offset still at the TOP, the
+  /// eager layout here built a full viewport of top-of-transcript cells that the
+  /// jump-to-bottom immediately discarded — measured as insetMs=169 of posMs=170 and
+  /// 45 cells created for a ~12-cell screen. The caller's own post-offset layout pass
+  /// materializes the one viewport that actually shows.
+  private func updateBottomAnchorInset(materialize: Bool = true) {
     // Re-entry guard: this method invalidates layout and calls layoutIfNeeded,
     // which can trigger layoutSubviews → updateBottomAnchorInset again, causing
     // a visible bounce as insets oscillate.
@@ -10849,6 +11608,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     flowLayout.sectionInset = UIEdgeInsets(
       top: desiredTop, left: baseInsets.left, bottom: baseInsets.bottom, right: baseInsets.right)
     flowLayout.invalidateLayout()
+    guard materialize else { return }
     collectionView.layoutIfNeeded()
     updateScrollToneOverlay(offsetY: collectionView.contentOffset.y)
   }
@@ -11007,6 +11767,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       cached.state == state,
       chatListRowContentEqual(cached.row, row)
     {
+      if seedSizeProfilingActive { seedProfCacheHits += 1 }
       return cached.height
     }
     if let persisted = promotePersistedHeightIfAvailable(
@@ -11014,9 +11775,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     {
       return persisted
     }
+    let measureStart = seedSizeProfilingActive ? DispatchTime.now().uptimeNanoseconds : 0
     let metrics = measureMessageBubbleLayout(
       row: row, rowWidth: rowWidth, agentTurnState: state
     )
+    if seedSizeProfilingActive {
+      seedProfMeasures += 1
+      seedProfMeasureNs &+= DispatchTime.now().uptimeNanoseconds &- measureStart
+    }
     let height = metrics.bubbleHeight + metrics.tallOuterToggleReserve
     messageHeightCache[row.key] = RowHeightCacheEntry(
       row: row, rowWidth: rowWidth, state: state, height: height)
@@ -11243,7 +12009,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
 
   private func rowsByAttachingReplyPreviews(_ rows: [[String: Any]]) -> [[String: Any]] {
-    Self.rowsByResolvingReplyPreviews(rows, peerDisplayName: enginePeerDisplayName)
+    let myId = groupNonEmpty(engineMyUserId)
+    return Self.rowsByResolvingReplyPreviews(
+      rows,
+      peerDisplayName: enginePeerDisplayName,
+      currentUserId: myId
+    )
   }
 
   private func normalizedMessageId(_ raw: Any?) -> String? {
@@ -11337,14 +12108,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         patchedRows[rowIndex] = patchBubbleShape(
           in: patchedRows[rowIndex],
           showTail: !nextSameSender,
-          topRightRadius: previousSameSender ? nativeSendMorphTopRightRadius : 18.0,
-          bottomRightRadius: nextSameSender ? 5.0 : 18.0
+          topRightRadius: previousSameSender ? nativeSendMorphTopRightLegacyRadius : 18.0,
+          bottomRightRadius:
+            nextSameSender ? nativeSendMorphMergedBottomRightLegacyRadius : 18.0
         )
       } else if nextSameSender && nextIsNativeOutgoing {
         patchedRows[rowIndex] = patchBubbleShape(
           in: patchedRows[rowIndex],
           showTail: false,
-          bottomRightRadius: 5.0
+          bottomRightRadius: nativeSendMorphMergedBottomRightLegacyRadius
         )
       }
     }
@@ -11989,7 +12761,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       return false
     }()
-    let borderTopRightRadius: CGFloat = isPreviousMe ? nativeSendMorphTopRightRadius : 18.0
+    let borderTopRightRadius: CGFloat =
+      isPreviousMe ? nativeSendMorphTopRightLegacyRadius : 18.0
 
     // Sealed bridge image attachments must surface as media so the list shows a
     // thumbnail immediately (type "text" alone renders as an empty-looking bubble).
@@ -12068,7 +12841,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       return false
     }()
-    let borderTopRightRadius: CGFloat = isPreviousMe ? nativeSendMorphTopRightRadius : 18.0
+    let borderTopRightRadius: CGFloat =
+      isPreviousMe ? nativeSendMorphTopRightLegacyRadius : 18.0
     // No fake seed progress — a tiny constant looked like a frozen ring. Until real
     // byte progress arrives the cell shows an indeterminate Settings-style spinner.
     var metadata: [String: Any] = [
@@ -12308,6 +13082,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       frame: CGRect(x: messageHorizontalInset, y: 0.0, width: rowWidth, height: max(1.0, rowHeight))
     )
     renderCell.applyAppearance(appearance)
+    let replyColors = replyPreviewAccentColors(for: row)
     if isGroupOrChannel, let indexPath {
       // Snapshot-only cells bypass configureMessageCell, so pass its group context explicitly.
       let groupContext = groupCellContext(at: indexPath)
@@ -12318,11 +13093,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         groupExtraLeading: groupContext.reservesGutter ? Self.groupIncomingExtraLeading : 0.0,
         groupSenderName: groupContext.senderName,
         groupSenderColor: groupContext.senderColor,
-        groupSenderNameHeight: Self.groupSenderNameHeight
+        groupSenderNameHeight: Self.groupSenderNameHeight,
+        groupTopSpacing: groupContext.topSpacing,
+        replyAccentColors: replyColors
       )
     } else {
-      // Preserve the direct-chat snapshot configuration byte-for-byte.
-      renderCell.configure(row: row, hiddenMessageId: nil)
+      // Preserve the direct-chat snapshot configuration, plus reply palette when present.
+      renderCell.configure(
+        row: row,
+        hiddenMessageId: nil,
+        replyAccentColors: replyColors
+      )
     }
     bindWallpaperBackdrop(to: renderCell)
     transitionOverlayHost.addSubview(renderCell)
@@ -12965,6 +13746,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
+    // A cache MISS here means a full-screen 3x layer render (~200ms) — measured as the
+    // posMs≈215 bulk of every cold chat open: the seed's programmatic jump-to-bottom
+    // lands in a new scroll-phase bucket, and the re-raster ran synchronously inside
+    // setContentOffset. During any internal adjustment, keep the (one-bucket-stale,
+    // visually indistinguishable) snapshot and re-raster after the push settles.
+    if !force, isInternalScrollAdjustment {
+      pendingWallpaperSnapshotRefresh = true
+      return
+    }
+
+    let renderStartedAt = ProcessInfo.processInfo.systemUptime
     let format = UIGraphicsImageRendererFormat.default()
     format.scale = scale
     format.opaque = false
@@ -12975,11 +13767,29 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         wallpaperPatternLayer.render(in: context.cgContext)
       }
     }
+    let renderMs = Int((ProcessInfo.processInfo.systemUptime - renderStartedAt) * 1000)
+    if renderMs >= 8 {
+      NSLog(
+        "[ChatOpen] wallpaper-raster %dms key=%@ internal=%@",
+        renderMs, cacheKey, isInternalScrollAdjustment ? "Y" : "N")
+    }
     guard let cgImage = image.cgImage else { return }
     Self.wallpaperSnapshotCache[cacheKey] = cgImage
     wallpaperSnapshot = cgImage
     wallpaperSnapshotSize = bounds.size
     wallpaperSnapshotCacheKey = cacheKey
+  }
+
+  /// Runs the wallpaper re-raster a mount jump deferred (see above), once the push has
+  /// settled. Async so it never extends the presentation-complete flush itself.
+  private func flushDeferredWallpaperSnapshotRefresh() {
+    guard pendingWallpaperSnapshotRefresh else { return }
+    pendingWallpaperSnapshotRefresh = false
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.refreshWallpaperSnapshotIfNeeded()
+      self.updateVisibleWallpaperBackdropLayouts()
+    }
   }
 
   private func bindWallpaperBackdrop(to cell: ChatListCell) {
@@ -18219,16 +19029,14 @@ private final class CachedHistoryPullIndicatorView: UIView {
 /// Small circular avatar used by the floating group-sender overlay. Shows the member's
 /// photo when there is one, otherwise a coloured initials tile in the sender's tint.
 final class SenderRunAvatarView: UIView {
-  private let imageView = UIImageView()
-  private let initialsLabel = UILabel()
-  private let gradientLayer = CAGradientLayer()
-  private var loadedURL: String?
-  private var loadingURL: String?
-  private var loadToken = UUID()
-  private var configuredName: String?
+  /// Shared avatar renderer used by Home, headers, previews, and now group sender runs.
+  /// The outer view only owns scroll/run bookkeeping; image/fallback rendering stays in
+  /// one component so a profile palette cannot diverge between surfaces.
+  private let avatarNode = ChatAvatarNodeView()
+  private var configuredName = ""
   private var configuredAvatarURL: String?
-  private var configuredProvider: String?
-  private var configuredTint: UIColor?
+  private var configuredPeerUserId: String?
+  private var configuredGradientColors: (UIColor, UIColor)?
 
   // Run bookkeeping owned by ChatListView.updateFloatingSenderAvatars: which sender-run
   // this view is glued to, so run identity churn (temp→server rekey, index shift, run
@@ -18256,20 +19064,7 @@ final class SenderRunAvatarView: UIView {
     super.init(frame: frame)
     clipsToBounds = true
     isUserInteractionEnabled = false
-    // Gradient tile behind the initials (matches the home-list fallback look) instead of
-    // a flat fill. The photo (imageView) covers it whenever one is available.
-    gradientLayer.startPoint = CGPoint(x: 0.5, y: 0.0)
-    gradientLayer.endPoint = CGPoint(x: 0.5, y: 1.0)
-    layer.insertSublayer(gradientLayer, at: 0)
-    imageView.contentMode = .scaleAspectFill
-    imageView.clipsToBounds = true
-    initialsLabel.textAlignment = .center
-    initialsLabel.textColor = .white
-    initialsLabel.font = .systemFont(ofSize: 12, weight: .semibold)
-    initialsLabel.adjustsFontSizeToFitWidth = true
-    initialsLabel.minimumScaleFactor = 0.6
-    addSubview(imageView)
-    addSubview(initialsLabel)
+    addSubview(avatarNode)
     layer.borderWidth = 1.0 / UIScreen.main.scale
     layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
   }
@@ -18279,144 +19074,78 @@ final class SenderRunAvatarView: UIView {
   override func layoutSubviews() {
     super.layoutSubviews()
     layer.cornerRadius = bounds.height / 2.0
-    gradientLayer.frame = bounds
-    imageView.frame = bounds
-    initialsLabel.frame = bounds
+    avatarNode.frame = bounds
   }
 
-  func configure(name: String, avatarUrl: String?, tint: UIColor, provider: String?) {
+  func configure(
+    name: String,
+    avatarUrl: String?,
+    peerUserId: String?,
+    gradientColors: (UIColor, UIColor),
+    provider: String?
+  ) {
     let explicitURL = avatarUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
-    // Fall back to the known agent image when the payload carried no URL (root cause of
-    // Claude/Codex showing a "C" tile even though their profile images exist).
-    let trimmedURL =
+    let resolvedURL =
       (explicitURL?.isEmpty ?? true)
       ? SenderRunAvatarView.agentAvatarURL(for: provider)
       : explicitURL
-    let identityUnchanged =
+    let unchanged =
       configuredName == name
-      && configuredAvatarURL == trimmedURL
-      && configuredProvider == provider
-      && (configuredTint?.isEqual(tint) ?? false)
-    if identityUnchanged {
-      let noImageNeeded = trimmedURL == nil || trimmedURL?.isEmpty == true
-      let imageReady = trimmedURL == loadedURL && imageView.image != nil
-      let imageLoading = trimmedURL == loadingURL
-      if noImageNeeded || imageReady || imageLoading { return }
-    }
+      && configuredAvatarURL == resolvedURL
+      && configuredPeerUserId == peerUserId
+      && (configuredGradientColors.map {
+        $0.0.isEqual(gradientColors.0) && $0.1.isEqual(gradientColors.1)
+      } ?? false)
+    if unchanged { return }
     configuredName = name
-    configuredAvatarURL = trimmedURL
-    configuredProvider = provider
-    configuredTint = tint
-    initialsLabel.text = SenderRunAvatarView.initials(from: name, provider: provider)
-    // Home-style gradient behind the initials, seeded from the sender colour.
-    let base = SenderRunAvatarView.tileColor(for: tint, provider: provider)
-    let (top, bottom) = SenderRunAvatarView.gradientColors(base: base)
-    gradientLayer.colors = [top.cgColor, bottom.cgColor]
-    backgroundColor = .clear
-
-    guard let url = trimmedURL, !url.isEmpty else {
-      loadToken = UUID()
-      loadedURL = nil
-      loadingURL = nil
-      imageView.image = nil
-      imageView.isHidden = true
-      initialsLabel.isHidden = false
-      return
-    }
-
-    if url == loadedURL, imageView.image != nil {
-      imageView.isHidden = false
-      initialsLabel.isHidden = true
-      return
-    }
-
-    if let cached = ChatAvatarImageStore.cached(for: url) {
-      loadToken = UUID()
-      loadedURL = url
-      loadingURL = nil
-      imageView.image = cached
-      imageView.isHidden = false
-      initialsLabel.isHidden = true
-      return
-    }
-
-    // `configure` runs as the floating avatar follows a scroll. Do not start another
-    // identical network/cache task on every frame while the first request is in flight.
-    if loadingURL == url {
-      return
-    }
-
-    // No cached image yet: show the initials tile now, swap in the photo when it lands.
-    // [AvatarPop] this branch IS the initials→photo flash: memory AND sync disk seed both
-    // missed. Firing repeatedly for the same sender across opens means the disk cache is
-    // not retaining (the reported avatar flicker) — name it.
-    NSLog(
-      "[AvatarPop] cache-miss name=%@ inWindow=%@ url=%@",
-      name, window != nil ? "Y" : "N", String(url.suffix(40)))
-    imageView.image = nil
-    imageView.isHidden = true
-    initialsLabel.isHidden = false
-    let token = UUID()
-    loadToken = token
-    loadedURL = nil
-    loadingURL = url
-    let requestedAt = ProcessInfo.processInfo.systemUptime
-    Task { [weak self] in
-      let image = await ChatAvatarImageStore.load(from: url)
-      await MainActor.run {
-        guard let self, self.loadToken == token else { return }
-        self.loadingURL = nil
-        guard let image else { return }
-        if self.window != nil {
-          NSLog(
-            "[AvatarPop] late name=%@ afterMs=%d",
-            self.configuredName ?? "?",
-            Int((ProcessInfo.processInfo.systemUptime - requestedAt) * 1000))
-        }
-        self.loadedURL = url
-        self.imageView.image = image
-        self.imageView.isHidden = false
-        self.initialsLabel.isHidden = true
-      }
-    }
+    configuredAvatarURL = resolvedURL
+    configuredPeerUserId = peerUserId
+    configuredGradientColors = gradientColors
+    avatarNode.configure(
+      with: ChatAvatarDescriptor(
+        title: name,
+        rawAvatarURI: resolvedURL,
+        peerUserId: peerUserId,
+        chatId: nil,
+        kind: .standard,
+        isGroup: false,
+        members: [],
+        preferPushAvatar: false,
+        gradientColors: gradientColors
+      ),
+      isDark: traitCollection.userInterfaceStyle == .dark,
+      renderingSide: max(bounds.width, bounds.height)
+    )
   }
 
-  private static func tileColor(for tint: UIColor, provider: String?) -> UIColor {
-    if provider == "codex" { return UIColor(white: 0.32, alpha: 1.0) }
-    if provider == "grok" { return UIColor(red: 0.12, green: 0.14, blue: 0.18, alpha: 1.0) }
-    if provider == "agy" || provider == "antigravity" { return UIColor(red: 0.18, green: 0.10, blue: 0.32, alpha: 1.0) }
-    var white: CGFloat = 0
-    var alpha: CGFloat = 0
-    if tint.getWhite(&white, alpha: &alpha), white > 0.82 {
-      return UIColor(white: 0.4, alpha: 1.0)
+  /// Compatibility path for agent-kit worker avatars. Rendering still goes through the
+  /// shared node; callers that know a user identity use the palette-aware overload above.
+  func configure(name: String, avatarUrl: String?, tint: UIColor, provider: String?) {
+    var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
+    let colors: (UIColor, UIColor)
+    if tint.getHue(
+      &hue, saturation: &saturation, brightness: &brightness, alpha: &alpha)
+    {
+      colors = (
+        UIColor(
+          hue: hue, saturation: saturation, brightness: min(1.0, brightness * 1.12),
+          alpha: alpha),
+        UIColor(
+          hue: hue, saturation: saturation, brightness: max(0.0, brightness * 0.82),
+          alpha: alpha)
+      )
+    } else {
+      colors = (tint, tint)
     }
-    return tint
+    configure(
+      name: name,
+      avatarUrl: avatarUrl,
+      peerUserId: nil,
+      gradientColors: colors,
+      provider: provider
+    )
   }
 
-  /// Two shades of the base colour for the fallback gradient (slightly lighter on top,
-  /// darker on the bottom) — the same soft top-down look the home list uses.
-  private static func gradientColors(base: UIColor) -> (UIColor, UIColor) {
-    var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-    guard base.getHue(&h, saturation: &s, brightness: &b, alpha: &a) else {
-      return (base, base)
-    }
-    let top = UIColor(hue: h, saturation: s, brightness: min(1.0, b * 1.16), alpha: a)
-    let bottom = UIColor(hue: h, saturation: s, brightness: max(0.0, b * 0.82), alpha: a)
-    return (top, bottom)
-  }
-
-  private static func initials(from name: String, provider: String?) -> String {
-    let parts = name.split(whereSeparator: { $0 == " " || $0 == "-" || $0 == "_" })
-    if parts.isEmpty {
-      // Never a bare "?": prefer the provider name's first two letters, else nothing
-      // (a clean gradient tile reads better than a question mark).
-      if let provider, !provider.isEmpty { return String(provider.prefix(2)).uppercased() }
-      return ""
-    }
-    // Single-word names (e.g. "Codex") show two letters, not one.
-    if parts.count == 1 { return String(parts[0].prefix(2)).uppercased() }
-    return (String(parts[0].prefix(1)) + String(parts[1].prefix(1))).uppercased()
-  }
 }
 
 // MARK: - Bridge task banner page

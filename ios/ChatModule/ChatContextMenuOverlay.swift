@@ -16,12 +16,18 @@ func makeChatContextLiquidGlassView(
   style: UIBlurEffect.Style = .systemMaterial,
   cornerRadius: CGFloat,
   capsuleCorners: Bool = false,
-  interactive: Bool = false
+  interactive: Bool = false,
+  // A non-nil tint mutes the glass: pure UIGlassEffect(.regular) REFRACTS moving
+  // content behind it (the home preview's scrolling bubbles swam through the
+  // menu). A tint gives it a stable, Telegram-style surface that reads through
+  // the refraction instead of the live content. Ignored on the < iOS 26 blur.
+  glassTint: UIColor? = nil
 ) -> UIVisualEffectView {
   let view = UIVisualEffectView(effect: nil)
   if #available(iOS 26.0, *) {
     let effect = UIGlassEffect(style: .regular)
     effect.isInteractive = interactive
+    if let glassTint { effect.tintColor = glassTint }
     view.effect = effect
     if capsuleCorners {
       view.cornerConfiguration = .capsule()

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Network
 import OSLog
 import Security
 import UIKit
@@ -417,6 +418,19 @@ final class ChatEngine {
   private var nativePendingCallSignals: [PendingCallSignal] = []
   private var nativePendingCallPushRefs: [String: String] = [:]
   private var nativeUserChannelDemandUntilMs = 0
+  /// True while the app is active in the foreground. Starts true: a cold launch runs this
+  /// initializer while becoming active, and the first willResignActive corrects it.
+  private var appIsForeground = true
+  /// Native reachability. Without it, a network flap (Wi-Fi↔cellular, tunnel, walking
+  /// between APs, airplane-mode toggle) is only noticed when a heartbeat write fails, and
+  /// then recovery waits out the reconnect backoff — up to ~8s of dead socket with no
+  /// live delivery. The path monitor fires the instant the OS has a usable route again, so
+  /// we can reset backoff and reconnect immediately. Touched only on `pathMonitorQueue`.
+  private var nwPathMonitor: NWPathMonitor?
+  private let pathMonitorQueue = DispatchQueue(label: "com.vibegram.chat.pathmonitor")
+  /// Last path satisfaction we acted on, so we kick a reconnect only on the
+  /// unsatisfied→satisfied EDGE, not on every interface reshuffle while already online.
+  private var lastNetworkPathSatisfied = true
   private var pendingOutboundDraftsByMessageId: [String: [String: Any]] = [:]
   private var pendingOutboundQueueByChat: [String: [String]] = [:]
   private var packetRuntimeStartInFlight = false
@@ -492,6 +506,19 @@ final class ChatEngine {
   // keyed by the FIRST streamId seen for it — never a second, duplicate row. Survives
   // socket resets by design; only cleared when the task reaches a terminal status.
   private var liveStreamTaskRowIdByChatId: [String: [String: String]] = [:]
+  /// Tasks whose live row has already been retired by the settled server message (chatId →
+  /// taskId → retiredAtMs). Frames keep arriving for a few seconds after a turn settles —
+  /// the bridge's own `done`, a slower cloud relay of a frame the LAN path already
+  /// delivered — and by then the taskId→row mapping is gone, so each late frame minted a
+  /// BRAND-NEW live row for a turn that is already on screen as a real message. That is the
+  /// duplicate reply per agent in a group (every model answering twice until the chat is
+  /// reopened, which drops the volatile rows). A retired task never gets a new row again;
+  /// updates to a row that still exists are unaffected.
+  private var retiredAgentTaskIdsByChatId: [String: [String: Int64]] = [:]
+  /// How long a retired taskId keeps refusing new rows. Comfortably longer than the
+  /// straggler window (seconds), far shorter than any chance of taskId reuse (task ids are
+  /// minted per dispatch from the outgoing messageId, so they are never reused at all).
+  private static let retiredAgentTaskTtlMs: Int64 = 15 * 60 * 1000
   /// teamRunId → teamWorkersStatus list when under-hood workers report before the lead cell exists.
   private var pendingTeamWorkersStatusByChatId: [String: [String: [[String: Any]]]] = [:]
   /// teamRunId → worker handle → progress node dicts (for multi-agent sheet).
@@ -573,6 +600,9 @@ final class ChatEngine {
   private var chatIngestGenerationByChat: [String: Int] = [:]
   private var historyFullyLoadedChats = Set<String>()
   private var historyRowsRestoredFromCacheChats = Set<String>()
+  // Run-scoped memo of chats whose SQLite store is known-empty, so repeated restore
+  // calls stop re-querying the store. Cleared by any successful store write.
+  private var historyRestoreMissChats = Set<String>()
   private var cachedSavedMessagesResponse: [[String: Any]]?
   private var historyLoadingChats = Set<String>()
   private var historyOlderExhaustedChats = Set<String>()
@@ -630,6 +660,25 @@ final class ChatEngine {
     ) { [weak self] _ in
       self?.clearCachedKeyOnBackground()
     }
+    // Foreground truth for the realtime-demand gate. Deliberately NOT willResignActive /
+    // willEnterForeground: resign-active fires for a Control Center pull or a banner, and
+    // willEnterForeground does not fire on a cold launch — that pairing would strand the
+    // flag false and silently kill the socket. didBecomeActive/didEnterBackground are the
+    // pair that always brackets a real background trip.
+    NotificationCenter.default.addObserver(
+      forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil
+    ) { [weak self] _ in
+      guard let self else { return }
+      self.queue.async {
+        self.appIsForeground = true
+        self.ensureNativeTransportIfDemandedLocked(trigger: "app_active")
+      }
+    }
+    NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil
+    ) { [weak self] _ in
+      self?.queue.async { self?.appIsForeground = false }
+    }
     // Reconnect immediately when the app returns to the foreground.
     // Without this, the reconnect backoff timer (up to 8s) plus the
     // WebSocket connect timeout (8s) can delay reconnection by 10-13s.
@@ -640,6 +689,7 @@ final class ChatEngine {
     ) { [weak self] _ in
       self?.reconnectOnForeground()
     }
+    startNetworkPathMonitor()
     queue.async { [weak self] in
       self?.restoreOutboundStateLocked()
       // A COLD launch (app was fully terminated) must open every agent DM CLEAN — no
@@ -863,6 +913,66 @@ final class ChatEngine {
     }
   }
 
+  /// Watch the OS network path and reconnect the moment a usable route returns.
+  /// This is the "native helper for the network issue": a flap (Wi-Fi↔cellular,
+  /// VPN toggle, roaming between APs, airplane mode) otherwise sits undetected until a
+  /// heartbeat write fails, then waits out the reconnect backoff. The monitor closes that
+  /// gap — on the unsatisfied→satisfied edge we reset backoff and kick a connect at once.
+  private func startNetworkPathMonitor() {
+    guard #available(iOS 13.0, *) else { return }
+    guard nwPathMonitor == nil else { return }
+    let monitor = NWPathMonitor()
+    nwPathMonitor = monitor
+    monitor.pathUpdateHandler = { [weak self] path in
+      self?.handleNetworkPathUpdate(satisfied: path.status == .satisfied)
+    }
+    monitor.start(queue: pathMonitorQueue)
+  }
+
+  /// Called on `pathMonitorQueue` for every path change; hops to the engine queue to touch
+  /// state. Acts only on the satisfaction EDGE so an interface reshuffle while already online
+  /// (a Wi-Fi handoff that never dropped the route) does not thrash reconnects.
+  private func handleNetworkPathUpdate(satisfied: Bool) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      let previouslySatisfied = self.lastNetworkPathSatisfied
+      guard satisfied != previouslySatisfied else { return }
+      self.lastNetworkPathSatisfied = satisfied
+
+      if !satisfied {
+        // Route just went away. A URLSession WebSocket does not survive a path loss, but the
+        // failure only surfaces when a read/write finally times out — seconds later — during
+        // which `state` still reads "connected" and would make the restore-edge reconnect
+        // below bail out. Mark the socket down NOW, reusing the transport's own network-error
+        // teardown so in-flight sends are requeued for replay (never lost) and the restore
+        // edge always finds clean state to reconnect from. Skip if we already know we're down.
+        let currentState = self.normalizedString(self.state["state"])?.lowercased() ?? ""
+        let liveish =
+          (self.state["connected"] as? Bool) == true
+          || currentState == "native-socket-open"
+          || currentState == "connecting-native-presence"
+        NSLog("[ChatEngine] network path lost — liveSocket=%@", liveish ? "Y" : "N")
+        if liveish {
+          self.handleNativeSocketError("network path unsatisfied")
+        }
+        return
+      }
+
+      // Route restored. The old socket is stale; reconnect on THIS tick rather than waiting
+      // out the backoff. Reset attempts, drop any pending timer, and kick a connect. If the
+      // route-loss teardown above already ran, state is disconnected and this reconnects; if
+      // it never ran (a brief blip that stayed "connected"), ensureNativeTransport no-ops.
+      let connected = (self.state["connected"] as? Bool) == true
+      NSLog(
+        "[ChatEngine] network path restored — kicking reconnect (wasConnected=%@)",
+        connected ? "Y" : "N")
+      self.appendJournalLocked(event: "network-path-restored", payload: ["connected": connected])
+      self.reconnectAttempt = 0
+      self.cancelReconnectLocked()
+      self.ensureNativeTransportIfDemandedLocked(trigger: "network_restored")
+    }
+  }
+
   private func loadNativeAuthSessionFromKeychain() -> [String: Any]? {
     // Expo SecureStore stores items with:
     //   kSecAttrService  = "<keychainService>:no-auth"  (default keychainService = "app")
@@ -991,6 +1101,15 @@ final class ChatEngine {
         "hasPublicKey": normalizedString(merged["publicKeyPem"] ?? merged["publicKey"]) != nil,
       ])
     return true
+  }
+
+  /// Queue-side connect kick: `ensureNativeTransport` hops queues itself, so a caller
+  /// already on the engine queue uses this to avoid re-entering it synchronously.
+  private func ensureNativeTransportIfDemandedLocked(trigger: String) {
+    guard hasRealtimeDemandLocked() else { return }
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+      self?.ensureNativeTransport(trigger: trigger)
+    }
   }
 
   private func ensureNativeTransport(trigger: String) {
@@ -1176,6 +1295,15 @@ final class ChatEngine {
   }
 
   private func hasRealtimeDemandLocked() -> Bool {
+    // A foregrounded, signed-in app IS realtime demand — this is the whole point of the
+    // user channel. Demand used to require a bound CHAT surface, so sitting on Home meant
+    // no socket at all: measured on device, the socket opened 25s after launch and only
+    // because a chat was opened. Until then nothing could be delivered, which is exactly
+    // "a new message doesn't show in the list until I open the chat". Home is the surface
+    // that most needs the live feed, and it was the one surface that never asked for it.
+    if appIsForeground, normalizedString(getConfigValueLocked("userId")) != nil {
+      return true
+    }
     if nativeUserChannelDemandUntilMs > nowMs() {
       return true
     }
@@ -1602,17 +1730,26 @@ final class ChatEngine {
   func prefetchChatHistories(chatIds: [String]) {
     queue.async { [weak self] in
       guard let self else { return }
+      let startedAt = ProcessInfo.processInfo.systemUptime
+      var kicked = 0
+      defer {
+        NSLog(
+          "[Launch] history prefetch kicked=%d of %d in %dms",
+          kicked, chatIds.count,
+          Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000))
+      }
       for rawChatId in chatIds {
         guard let chatId = self.normalizedString(rawChatId), !chatId.isEmpty else { continue }
-        guard !self.isBuiltInAgentChatId(chatId),
-          !self.isVolatileBridgeAgentChatLocked(chatId: chatId)
-        else {
+        // Only the built-in surface has no server-side chat behind it. Bridge DMs DO
+        // (their settled turns are canonical server messages) and prefetch like any chat.
+        guard !self.isBuiltInAgentChatId(chatId) else {
           self.appendJournalLocked(
             event: "native-chat-history-skip",
             payload: ["chatId": chatId, "reason": "agent_surface"]
           )
           continue
         }
+        kicked += 1
         self.loadChatHistoryIfNeededLocked(chatId: chatId)
       }
     }
@@ -1624,9 +1761,7 @@ final class ChatEngine {
     queue.async { [weak self] in
       guard let self else { return }
       guard let chatId = self.normalizedString(rawChatId), !chatId.isEmpty else { return }
-      guard !self.isBuiltInAgentChatId(chatId),
-        !self.isVolatileBridgeAgentChatLocked(chatId: chatId)
-      else { return }
+      guard !self.isBuiltInAgentChatId(chatId) else { return }
       _ = self.restoreCachedHistoryRowsLocked(chatId: chatId)
       guard !messages.isEmpty, !self.historyFullyLoadedChats.contains(chatId) else { return }
 
@@ -1667,10 +1802,6 @@ final class ChatEngine {
     syncOnQueue {
       for (rawChatId, messagesArray) in histories {
         guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { continue }
-        if isVolatileBridgeAgentChatLocked(chatId: chatId) {
-          clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "seed_chat_histories")
-          continue
-        }
         _ = restoreCachedHistoryRowsLocked(chatId: chatId)
         // We only seed if the full history hasn't already been loaded.
         if !historyFullyLoadedChats.contains(chatId) {
@@ -5321,7 +5452,6 @@ final class ChatEngine {
       guard let chatId = normalizedString(chatId), !chatId.isEmpty,
         chatId != "saved_messages",
         !isBuiltInAgentChatId(chatId),
-        !isVolatileBridgeAgentChatLocked(chatId: chatId),
         !historyOlderExhaustedChats.contains(chatId),
         let boundary = oldestHistoryBoundaryLocked(chatId: chatId)
       else { return false }
@@ -6103,6 +6233,18 @@ final class ChatEngine {
     } else if let taskId, !taskId.isEmpty {
       if let existingRowId = perTaskRowIds[taskId] {
         effectiveRowId = existingRowId
+      } else if isAgentTaskRetiredLocked(chatId: chatId, taskId: taskId),
+        liveMessageRowsByChat[chatId]?[streamId] == nil
+      {
+        // This turn already settled into a real message and its live row was retired.
+        // Frames keep trailing in for seconds afterwards (the bridge's own `done`, the
+        // cloud relay of a frame LAN already delivered); minting a row for them puts a
+        // second identical bubble next to the settled reply — one duplicate per agent in
+        // a group, which only "fixed itself" on reopen because the twin is volatile.
+        NSLog(
+          "[ChatEngine][AgentStream] drop late frame chat=%@ task=%@ stream=%@ — turn already settled",
+          String(chatId.suffix(12)), String(taskId.suffix(16)), String(streamId.prefix(24)))
+        return
       } else {
         perTaskRowIds[taskId] = streamId
         effectiveRowId = streamId
@@ -6737,6 +6879,16 @@ final class ChatEngine {
       }
     }
     if var perChatTaskRowIds = liveStreamTaskRowIdByChatId[chatId] {
+      // Tombstone every task whose row just went away: the settled message now represents
+      // that turn, so a straggler frame must never re-create a live twin next to it.
+      for (taskId, rowId) in perChatTaskRowIds where removedIds.contains(rowId) {
+        markAgentTaskRetiredLocked(chatId: chatId, taskId: taskId)
+      }
+      // A LAN row carries its task in the id itself (`lan-<taskId>`), so it is covered even
+      // if the mapping was already pruned by an earlier terminal frame.
+      for rowId in removedIds where rowId.hasPrefix("lan-") {
+        markAgentTaskRetiredLocked(chatId: chatId, taskId: String(rowId.dropFirst(4)))
+      }
       perChatTaskRowIds = perChatTaskRowIds.filter { !removedIds.contains($0.value) }
       if perChatTaskRowIds.isEmpty {
         liveStreamTaskRowIdByChatId.removeValue(forKey: chatId)
@@ -7832,6 +7984,15 @@ final class ChatEngine {
       }
 
       guard frame.topic == self.nativeUserTopic else { return }
+      if frame.event == "bridge-status" {
+        // Live bridge status off the socket. Replaces the client's repeated polling of
+        // /api/agent-bridge/status — the server pushes this on every Presence change.
+        let payload = frame.payload
+        DispatchQueue.main.async {
+          AgentPairingService.ingestSocketStatusSnapshot(payload)
+        }
+        return
+      }
       if frame.event == "new_message" {
         // A new message landed in one of this user's chats (from a peer, or mirrored
         // from the user's OWN other device). Devices only join a chat's realtime
@@ -8523,21 +8684,29 @@ final class ChatEngine {
     isSequenceStart: Bool,
     isSequenceEnd: Bool
   ) -> [String: Any] {
+    // Telegram-style radii: full 18 on open corners; consecutive "merged" corners
+    // use ~12 (was 5–8, which read as a sharp ~6pt notch next to the big round).
+    let full: CGFloat = 18
+    let merged: CGFloat = 12
     var shape: [String: Any] = [
       "isMe": isMe,
       "showTail": isSequenceEnd,
-      "borderTopLeftRadius": 18,
-      "borderTopRightRadius": 18,
-      "borderBottomLeftRadius": 18,
-      "borderBottomRightRadius": 18,
+      "borderTopLeftRadius": full,
+      "borderTopRightRadius": full,
+      "borderBottomLeftRadius": full,
+      "borderBottomRightRadius": full,
     ]
 
     if isMe {
-      shape["borderTopRightRadius"] = isSequenceStart ? 18 : 8
-      shape["borderBottomRightRadius"] = isSequenceEnd ? 18 : 5
+      // Keep the outgoing top-right corner full in every sequence position. The
+      // optimistic/send-morph row uses the same contract, so settling cannot shrink
+      // this corner. Only a bubble with another outgoing bubble below it tightens its
+      // bottom-right corner; therefore bottom-right is never larger than top-right.
+      shape["borderTopRightRadius"] = full
+      shape["borderBottomRightRadius"] = isSequenceEnd ? full : merged
     } else {
-      shape["borderTopLeftRadius"] = isSequenceStart ? 18 : 5
-      shape["borderBottomLeftRadius"] = isSequenceEnd ? 18 : 5
+      shape["borderTopLeftRadius"] = isSequenceStart ? full : merged
+      shape["borderBottomLeftRadius"] = isSequenceEnd ? full : merged
     }
 
     return shape
@@ -9098,8 +9267,31 @@ final class ChatEngine {
     return out
   }
 
+  /// Tombstone a task so a late frame can never mint a second live row for it.
+  private func markAgentTaskRetiredLocked(chatId: String, taskId: String) {
+    let id = taskId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty, !id.isEmpty else { return }
+    let now = Int64(nowMs())
+    var perChat = retiredAgentTaskIdsByChatId[chatId] ?? [:]
+    perChat[id] = now
+    // Bounded: drop entries past the TTL, then cap the newest 64 (a busy group run tops
+    // out at a handful of concurrent tasks).
+    perChat = perChat.filter { now - $0.value < Self.retiredAgentTaskTtlMs }
+    if perChat.count > 64 {
+      let newest = perChat.sorted { $0.value > $1.value }.prefix(64)
+      perChat = Dictionary(uniqueKeysWithValues: newest.map { ($0.key, $0.value) })
+    }
+    retiredAgentTaskIdsByChatId[chatId] = perChat
+  }
+
+  private func isAgentTaskRetiredLocked(chatId: String, taskId: String) -> Bool {
+    guard let retiredAt = retiredAgentTaskIdsByChatId[chatId]?[taskId] else { return false }
+    return Int64(nowMs()) - retiredAt < Self.retiredAgentTaskTtlMs
+  }
+
   private func removeBridgeTaskTrackingLocked(chatId: String, taskId: String) {
     let taskKey = "\(chatId):\(taskId)"
+    markAgentTaskRetiredLocked(chatId: chatId, taskId: taskId)
     cloudProgressAtMsByTask.removeValue(forKey: taskKey)
     if var taskRows = liveStreamTaskRowIdByChatId[chatId] {
       taskRows.removeValue(forKey: taskId)
@@ -10876,23 +11068,27 @@ final class ChatEngine {
   /// Persisting them poisons the cache — on the next open they resurrect as
   /// orphan plain-text bubbles that duplicate the settled card (with no sender
   /// meta, so they even group under the wrong agent name).
+  /// `bridge-…` ids are session-transcript MIRRORS: the bridge ingest re-emits a
+  /// prompt/turn the server already persists as a canonical row (the merge dedups the
+  /// pair at paint). Persisting the mirror would seed the durable store with synthetic
+  /// twins — and, when a History session is mounted, leak that old session's rows into
+  /// the DM's durable transcript. The store holds server truth only.
   private func isTransientStreamRow(_ row: [String: Any]) -> Bool {
     guard let id = messageId(fromRow: row) else { return false }
-    return id.hasPrefix("stream-") || id.hasPrefix("lan-")
+    return id.hasPrefix("stream-") || id.hasPrefix("lan-") || id.hasPrefix("bridge-")
   }
 
   private func restoreCachedHistoryRowsLocked(chatId: String) -> Bool {
     guard !chatId.isEmpty else { return false }
-    if isVolatileBridgeAgentChatLocked(chatId: chatId) {
-      // Classified as an agent/bridge DM, whose transcript is deliberately volatile.
-      // Say so: otherwise a misclassified normal DM looks identical to a chat that was
-      // never persisted, and this path also DELETES whatever was stored.
-      NSLog(
-        "[HistoryStore] restore SKIP-BRIDGE chat=%@ — classified as an agent DM (volatile)",
-        String(chatId.prefix(12)))
-      clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "restore_cache")
-      return false
-    }
+    // Agent/bridge DMs restore like every other chat. They used to SKIP here (their
+    // transcript was fully volatile), which is exactly why a Claude/Codex DM opened
+    // EMPTY on every cold launch — the one behavior left that broke "a chat has its
+    // content by default". The hazards that motivated the skip are each handled
+    // structurally now: session mirrors (`bridge-…`) and live placeholders
+    // (`stream-`/`lan-`) never persist, so nothing here can bleed a session across
+    // chatIds; the merge terminalizes any persisted row still claiming to stream, so a
+    // dead run can never repaint as a live cell. What restores is the settled,
+    // server-canonical transcript — which is precisely what a cold open should show.
     // The in-memory entry only counts as "already restored" when it actually HOLDS rows.
     // An EMPTY array here is a poison pill: a background history load whose server page
     // came back with zero rows installs `[]` plus the fullyLoaded flag, and from then on
@@ -10905,6 +11101,10 @@ final class ChatEngine {
     {
       return true
     }
+    // Known-empty store: an empty chat's open path calls restore from several places
+    // (engine bind, refreshRows, chat_joined) and each MISS was a fresh SQLite query —
+    // ~30 "restore MISS" lines for one open. One probe per run is enough.
+    if historyRestoreMissChats.contains(chatId) { return false }
     guard let userId = chatHistoryCacheUserIdLocked() else { return false }
     var decodedRows: [[String: Any]] = messageStore.recentMessagePayloads(
       userId: userId, chatId: chatId, limit: chatHistoryCacheRowLimit
@@ -10923,6 +11123,7 @@ final class ChatEngine {
         NSLog(
           "[HistoryStore] restore MISS chat=%@ — SQLite holds 0 rows and no legacy blob",
           String(chatId.prefix(12)))
+        historyRestoreMissChats.insert(chatId)
         return false
       }
       decodedRows = legacyRows
@@ -10938,6 +11139,7 @@ final class ChatEngine {
       NSLog(
         "[HistoryStore] restore DROPPED chat=%@ — all %d stored rows are transient (stream-/lan-)",
         String(chatId.prefix(12)), decodedRows.count)
+      historyRestoreMissChats.insert(chatId)
       return false
     }
 
@@ -10959,10 +11161,9 @@ final class ChatEngine {
   }
 
   private func storeCachedHistoryRowsLocked(chatId: String, rows: [[String: Any]]) {
-    if isVolatileBridgeAgentChatLocked(chatId: chatId) {
-      clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "store_cache")
-      return
-    }
+    // Bridge DMs persist like every chat — see restoreCachedHistoryRowsLocked for why
+    // the old skip is gone. The transient filter in persistHistoryRowsToStoreLocked
+    // keeps `stream-`/`lan-`/`bridge-` rows out, so only settled server rows land.
     guard !chatId.isEmpty, !rows.isEmpty else { return }
     let stored = persistHistoryRowsToStoreLocked(chatId: chatId, rows: rows)
     guard stored > 0 else { return }
@@ -10998,6 +11199,7 @@ final class ChatEngine {
     }
     guard !entries.isEmpty else { return 0 }
     messageStore.upsertMessages(userId: userId, chatId: chatId, entries: entries)
+    historyRestoreMissChats.remove(chatId)
     if let deletedIds = deletedMessageIdsByChat[chatId], !deletedIds.isEmpty {
       messageStore.deleteMessages(userId: userId, chatId: chatId, messageIds: Array(deletedIds))
     }
@@ -11167,30 +11369,22 @@ final class ChatEngine {
       source: "bridgeRestore")
   }
 
+  /// Resets the SESSION layer for a bridge DM: the mounted History-session payload,
+  /// per-provider session lists, and any in-flight session requests. It deliberately
+  /// does NOT touch the transcript (`historyRowsByChat` + flags + cursors) — the
+  /// settled transcript is durable, chat-keyed state that a new run appends to, exactly
+  /// like a normal chat. (The old version wiped the transcript too, which is why an
+  /// agent DM emptied at every send/classification tick and held content only for the
+  /// life of the process.) And it never touches the durable store: a runtime
+  /// classification may route, never destroy.
   private func clearVolatileBridgeHistoryLocked(chatId: String, reason: String) {
     guard !chatId.isEmpty else { return }
-    historyLoadingChats.remove(chatId)
-    historyRowsByChat.removeValue(forKey: chatId)
-    historyFullyLoadedChats.remove(chatId)
-    historyRowsRestoredFromCacheChats.remove(chatId)
-    historyOlderExhaustedChats.remove(chatId)
-    historyLoadingOlderChats.remove(chatId)
-    historyHasMoreByChat.removeValue(forKey: chatId)
-    historyNextCursorByChat.removeValue(forKey: chatId)
-    historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
     agentBridgeHistoryByChat.removeValue(forKey: chatId)
     let listPrefix = "\(chatId)|"
     agentBridgeHistoryListByChatProvider = agentBridgeHistoryListByChatProvider.filter {
       !$0.key.hasPrefix(listPrefix)
     }
     pendingAgentBridgeHistoryRequestsByChat.removeValue(forKey: chatId)
-    // Deliberately NOT clearing the durable store. This runs off a RUNTIME
-    // classification (`bridgeProviderForChatLocked`) whose maps are empty at t=0.1s and
-    // populated seconds later, so the same chat can classify differently within one run —
-    // and for a chat whose content is device-only, the delete is unrecoverable. Rendering
-    // hygiene is already handled by refusing to RESTORE for a bridge chat (see
-    // `restoreCachedHistoryRowsLocked`), which needs no bytes destroyed to work.
-    // Classification may route; it may not destroy.
     appendJournalLocked(
       event: "native-bridge-history-cleared",
       payload: ["chatId": chatId, "reason": reason]
@@ -11405,7 +11599,6 @@ final class ChatEngine {
     guard historyRowsByChat[chatId] != nil else { return }
     guard chatId != "saved_messages",
       !isBuiltInAgentChatId(chatId),
-      !isVolatileBridgeAgentChatLocked(chatId: chatId),
       !historyBackfillingChats.contains(chatId)
     else { return }
     let now = Int64(nowMs())
@@ -11594,7 +11787,6 @@ final class ChatEngine {
     guard !historyLoadingOlderChats.contains(chatId), !historyLoadingChats.contains(chatId),
       chatId != "saved_messages",
       !isBuiltInAgentChatId(chatId),
-      !isVolatileBridgeAgentChatLocked(chatId: chatId),
       !historyOlderExhaustedChats.contains(chatId),
       let boundary = oldestHistoryBoundaryLocked(chatId: chatId)
     else { return false }
@@ -11809,21 +12001,13 @@ final class ChatEngine {
 
   private func loadChatHistoryIfNeededLocked(chatId: String, force: Bool = false) {
     guard !chatId.isEmpty else { return }
-    guard !isBuiltInAgentChatId(chatId),
-      !isVolatileBridgeAgentChatLocked(chatId: chatId)
-    else {
+    // Only the built-in agent surface has no server chat to fetch. Bridge DMs are
+    // ordinary chats at the transcript layer: their settled turns are canonical server
+    // messages, and fetching them is what backfills SQLite so a cold open paints — the
+    // old skip here (plus the in-memory wipe it did) is why an agent DM could show
+    // content only for as long as the process lived.
+    guard !isBuiltInAgentChatId(chatId) else {
       historyLoadingChats.remove(chatId)
-      historyRowsByChat.removeValue(forKey: chatId)
-      historyFullyLoadedChats.remove(chatId)
-      historyRowsRestoredFromCacheChats.remove(chatId)
-      historyOlderExhaustedChats.remove(chatId)
-      historyLoadingOlderChats.remove(chatId)
-      historyHasMoreByChat.removeValue(forKey: chatId)
-      historyNextCursorByChat.removeValue(forKey: chatId)
-      historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
-      // In-memory only: same reason as `clearVolatileBridgeHistoryLocked` — this branch
-      // is reached by a runtime classification that can flip within a run, so it must
-      // never delete a chat's durable rows.
       appendJournalLocked(
         event: "native-chat-history-skip",
         payload: ["chatId": chatId, "reason": "agent_surface"]
@@ -11968,10 +12152,6 @@ final class ChatEngine {
   }
 
   private func applyChatHistoryResponseLocked(chatId: String, data: Data) {
-    if isVolatileBridgeAgentChatLocked(chatId: chatId) {
-      clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "history_response")
-      return
-    }
     guard let object = try? JSONSerialization.jsonObject(with: data) else {
       appendJournalLocked(
         event: "native-chat-history-load-error",
