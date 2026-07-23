@@ -209,34 +209,75 @@ defmodule Vibe.AI.Tools.YtDlp do
 
   # Run yt-dlp as subprocess
   defp run_ytdlp(args) do
-    Logger.info("[YtDlp] Running: yt-dlp #{Enum.join(args, " ")}")
+    case executable() do
+      nil ->
+        Logger.error("[YtDlp] yt-dlp binary not found on PATH or known locations")
+        {:error, "yt-dlp not available"}
 
-    task = Task.async(fn ->
-      try do
-        case System.cmd("yt-dlp", args, stderr_to_stdout: true) do
-          {output, 0} ->
-            {:ok, output}
+      bin ->
+        Logger.info("[YtDlp] Running: #{bin} #{Enum.join(args, " ")}")
 
-          {output, code} ->
-            Logger.warning("[YtDlp] Exit code #{code}: #{String.slice(output, 0, 500)}")
-            # Try to extract partial results even on error
-            if String.contains?(output, "\"id\":") do
-              {:ok, output}
-            else
-              {:error, "yt-dlp exited with code #{code}"}
+        task =
+          Task.async(fn ->
+            try do
+              case System.cmd(bin, args, stderr_to_stdout: true) do
+                {output, 0} ->
+                  {:ok, output}
+
+                {output, code} ->
+                  Logger.warning("[YtDlp] Exit code #{code}: #{String.slice(output, 0, 500)}")
+                  # Try to extract partial results even on error
+                  if String.contains?(output, "\"id\":") do
+                    {:ok, output}
+                  else
+                    {:error, "yt-dlp exited with code #{code}"}
+                  end
+              end
+            rescue
+              e ->
+                Logger.error("[YtDlp] Exception: #{inspect(e)}")
+                {:error, "yt-dlp not available"}
             end
-        end
-      rescue
-        e ->
-          Logger.error("[YtDlp] Exception: #{inspect(e)}")
-          {:error, "yt-dlp not available"}
-      end
-    end)
+          end)
 
-    case Task.yield(task, @timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, result} -> result
-      nil -> {:error, "Timeout after #{@timeout}ms"}
+        case Task.yield(task, @timeout) || Task.shutdown(task, :brutal_kill) do
+          {:ok, result} -> result
+          nil -> {:error, "Timeout after #{@timeout}ms"}
+        end
     end
+  end
+
+  @doc """
+  Absolute path to the `yt-dlp` binary, or nil if not installed.
+
+  Checks `YTDLP_PATH` / `VIBE_YTDLP_PATH`, then PATH, then common install locations
+  (Homebrew, pip --user, /usr/local).
+  """
+  def executable do
+    env =
+      System.get_env("YTDLP_PATH") ||
+        System.get_env("VIBE_YTDLP_PATH")
+
+    candidates =
+      [
+        env,
+        System.find_executable("yt-dlp"),
+        System.find_executable("youtube-dl"),
+        "/opt/homebrew/bin/yt-dlp",
+        "/usr/local/bin/yt-dlp",
+        "/usr/bin/yt-dlp",
+        Path.expand("~/Library/Python/3.12/bin/yt-dlp"),
+        Path.expand("~/Library/Python/3.11/bin/yt-dlp"),
+        Path.expand("~/Library/Python/3.10/bin/yt-dlp"),
+        Path.expand("~/Library/Python/3.9/bin/yt-dlp"),
+        Path.expand("~/.local/bin/yt-dlp")
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.reject(&(&1 == ""))
+
+    Enum.find(candidates, fn path ->
+      is_binary(path) and File.regular?(path) and File.exists?(path)
+    end)
   end
 
   # Parse flat playlist search results

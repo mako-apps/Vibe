@@ -205,16 +205,22 @@ defmodule VibeWeb.MusicController do
     task =
       Task.async(fn ->
         try do
-          case System.cmd("yt-dlp", args, stderr_to_stdout: true) do
-            {_output, 0} ->
-              {:ok, temp_path}
+          case YtDlp.executable() do
+            nil ->
+              {:error, "yt-dlp not available"}
 
-            {output, code} ->
-              Logger.warning(
-                "[MusicController] yt-dlp exit #{code}: #{String.slice(output, 0, 200)}"
-              )
+            bin ->
+              case System.cmd(bin, args, stderr_to_stdout: true) do
+                {_output, 0} ->
+                  {:ok, temp_path}
 
-              {:error, "Download failed with code #{code}"}
+                {output, code} ->
+                  Logger.warning(
+                    "[MusicController] yt-dlp exit #{code}: #{String.slice(output, 0, 200)}"
+                  )
+
+                  {:error, "Download failed with code #{code}"}
+              end
           end
         rescue
           e -> {:error, "Exception: #{inspect(e)}"}
