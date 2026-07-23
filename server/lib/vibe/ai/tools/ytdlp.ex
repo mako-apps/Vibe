@@ -13,6 +13,7 @@ defmodule Vibe.AI.Tools.YtDlp do
   require Logger
 
   @timeout 30_000  # 30 seconds max per request (fast mode should be <5s)
+  @download_timeout 120_000
 
   @doc """
   Search for music and get stream URL.
@@ -208,19 +209,35 @@ defmodule Vibe.AI.Tools.YtDlp do
   end
 
   # Run yt-dlp as subprocess
-  defp run_ytdlp(args) do
-    case executable() do
+  defp run_ytdlp(args), do: run_cmd(args)
+
+  @doc """
+  Run yt-dlp with the given CLI args.
+
+  Prefer a real binary (`YTDLP_PATH` / PATH). If only the Python package is
+  installed (common on Alpine/Railway), falls back to `python3 -m yt_dlp`.
+  """
+  def run_cmd(args, opts \\ [])
+
+  def run_cmd(args, opts) when is_list(args) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, @timeout)
+
+    case runner() do
       nil ->
-        Logger.error("[YtDlp] yt-dlp binary not found on PATH or known locations")
+        Logger.error(
+          "[YtDlp] yt-dlp not found (install binary or `pip install yt-dlp`; set YTDLP_PATH)"
+        )
+
         {:error, "yt-dlp not available"}
 
-      bin ->
-        Logger.info("[YtDlp] Running: #{bin} #{Enum.join(args, " ")}")
+      {cmd, cmd_args, label} ->
+        full_args = cmd_args ++ args
+        Logger.info("[YtDlp] Running: #{label} #{Enum.join(args, " ")}")
 
         task =
           Task.async(fn ->
             try do
-              case System.cmd(bin, args, stderr_to_stdout: true) do
+              case System.cmd(cmd, full_args, stderr_to_stdout: true) do
                 {output, 0} ->
                   {:ok, output}
 
@@ -240,18 +257,20 @@ defmodule Vibe.AI.Tools.YtDlp do
             end
           end)
 
-        case Task.yield(task, @timeout) || Task.shutdown(task, :brutal_kill) do
+        case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
           {:ok, result} -> result
-          nil -> {:error, "Timeout after #{@timeout}ms"}
+          nil -> {:error, "Timeout after #{timeout}ms"}
         end
     end
   end
 
+  def run_cmd(_, _), do: {:error, "invalid_args"}
+
   @doc """
-  Absolute path to the `yt-dlp` binary, or nil if not installed.
+  Absolute path to the `yt-dlp` binary, or nil if only the Python module is available.
 
   Checks `YTDLP_PATH` / `VIBE_YTDLP_PATH`, then PATH, then common install locations
-  (Homebrew, pip --user, /usr/local).
+  (Homebrew, pip --user, Alpine/Railway `/usr/local/bin`).
   """
   def executable do
     env =
@@ -278,6 +297,49 @@ defmodule Vibe.AI.Tools.YtDlp do
     Enum.find(candidates, fn path ->
       is_binary(path) and File.regular?(path) and File.exists?(path)
     end)
+  end
+
+  # {cmd, prefix_args, label}
+  defp runner do
+    case executable() do
+      bin when is_binary(bin) ->
+        {bin, [], bin}
+
+      nil ->
+        case python3_executable() do
+          py when is_binary(py) ->
+            if python_has_ytdlp?(py) do
+              {py, ["-m", "yt_dlp"], "#{py} -m yt_dlp"}
+            else
+              nil
+            end
+
+          _ ->
+            nil
+        end
+    end
+  end
+
+  defp python3_executable do
+    [
+      System.get_env("PYTHON_PATH"),
+      System.find_executable("python3"),
+      System.find_executable("python"),
+      "/usr/local/bin/python3",
+      "/usr/bin/python3"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.find(fn path -> File.exists?(path) end)
+  end
+
+  defp python_has_ytdlp?(python) when is_binary(python) do
+    case System.cmd(python, ["-c", "import yt_dlp"], stderr_to_stdout: true) do
+      {_, 0} -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
   end
 
   # Parse flat playlist search results

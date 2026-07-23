@@ -41,17 +41,22 @@ RUN mix release
 # ===========================================
 FROM alpine:3.18
 
-# Runtime dependencies + Python doc renderer stack
+# Runtime dependencies + yt-dlp (SoundCloud/YouTube) + Python doc renderer stack
 RUN apk add --no-cache libstdc++ openssl ncurses-libs python3 py3-pip ffmpeg curl \
   pango cairo gdk-pixbuf font-noto font-noto-arabic font-noto-extra \
   && pip3 install --break-system-packages \
-       yt-dlp \
+       "yt-dlp>=2024.1.0" \
        flask==3.1.* \
        waitress==3.0.* \
        weasyprint==63.* \
        openpyxl==3.1.* \
        pypdfium2==4.* \
-  && yt-dlp --version
+  && YT_BIN=$(command -v yt-dlp || true) \
+  && if [ -z "$YT_BIN" ]; then YT_BIN=$(python3 -c "import shutil; print(shutil.which('yt-dlp') or '')"); fi \
+  && if [ -n "$YT_BIN" ]; then ln -sf "$YT_BIN" /usr/local/bin/yt-dlp; fi \
+  && ln -sf /usr/bin/python3 /usr/local/bin/python3 \
+  && /usr/local/bin/yt-dlp --version \
+  && python3 -m yt_dlp --version
 
 WORKDIR /app
 RUN chown nobody /app && mkdir -p /tmp/.cache && chown nobody /tmp/.cache
@@ -59,6 +64,8 @@ RUN chown nobody /app && mkdir -p /tmp/.cache && chown nobody /tmp/.cache
 ENV MIX_ENV="prod"
 ENV FONTCONFIG_PATH=/etc/fonts
 ENV XDG_CACHE_HOME=/tmp/.cache
+ENV PATH="/usr/local/bin:/usr/bin:/bin:${PATH}"
+ENV YTDLP_PATH="/usr/local/bin/yt-dlp"
 
 # Copy the Elixir release
 COPY --from=elixir-build --chown=nobody:root /app/_build/prod/rel/vibe ./

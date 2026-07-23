@@ -201,67 +201,48 @@ defmodule VibeWeb.MusicController do
           source_url
         ]
 
-    # Run yt-dlp with timeout
-    task =
-      Task.async(fn ->
-        try do
-          case YtDlp.executable() do
-            nil ->
-              {:error, "yt-dlp not available"}
-
-            bin ->
-              case System.cmd(bin, args, stderr_to_stdout: true) do
-                {_output, 0} ->
-                  {:ok, temp_path}
-
-                {output, code} ->
-                  Logger.warning(
-                    "[MusicController] yt-dlp exit #{code}: #{String.slice(output, 0, 200)}"
-                  )
-
-                  {:error, "Download failed with code #{code}"}
-              end
-          end
-        rescue
-          e -> {:error, "Exception: #{inspect(e)}"}
-        end
-      end)
-
-    # 2 minute timeout for download
+    # 2 minute timeout for full audio download + convert
     result =
-      case Task.yield(task, 120_000) || Task.shutdown(task, :brutal_kill) do
-        {:ok, {:ok, path}} ->
-          # Get file size
-          case File.stat(path) do
-            {:ok, stat} ->
-              # Upload to Supabase Storage
-              case SupabaseStorage.upload(path, remote_path) do
-                {:ok, public_url} ->
-                  # Save URL to database
-                  save_to_database(video_id, public_url, stat.size)
-                  # Clean up temp file
-                  File.rm(path)
-                  {:ok, public_url}
+      case YtDlp.run_cmd(args, timeout: 120_000) do
+        {:ok, _output} ->
+          path =
+            cond do
+              File.exists?(temp_path) ->
+                temp_path
+
+              true ->
+                Path.wildcard(temp_path <> "*") |> Enum.sort() |> List.last()
+            end
+
+          case path do
+            nil ->
+              {:error, "Download produced no file"}
+
+            path ->
+              case File.stat(path) do
+                {:ok, stat} ->
+                  case SupabaseStorage.upload(path, remote_path) do
+                    {:ok, public_url} ->
+                      save_to_database(video_id, public_url, stat.size)
+                      File.rm(path)
+                      {:ok, public_url}
+
+                    {:error, reason} ->
+                      Logger.error("[MusicController] Supabase upload failed: #{reason}")
+                      {:error, "Supabase upload failed: #{reason}"}
+                  end
 
                 {:error, reason} ->
-                  Logger.error("[MusicController] Supabase upload failed: #{reason}")
-                  # Fallback: Keep local file and serve directly for this session
-                  {:error, "Supabase upload failed: #{reason}"}
+                  {:error, "Could not stat file: #{inspect(reason)}"}
               end
-
-            {:error, reason} ->
-              {:error, "Could not stat file: #{inspect(reason)}"}
           end
 
-        {:ok, {:error, reason}} ->
+        {:error, reason} ->
           {:error, reason}
-
-        nil ->
-          {:error, "Download timeout"}
       end
 
-    # Clean up temp file if it exists
     File.rm(temp_path)
+    Path.wildcard(temp_path <> "*") |> Enum.each(&File.rm/1)
 
     result
   end
