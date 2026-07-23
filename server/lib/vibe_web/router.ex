@@ -154,6 +154,7 @@ defmodule VibeWeb.Router do
 
     # Standalone Agents
     get "/agents", AgentsController, :index
+    get "/agents/model_registry", AgentsController, :model_registry
     get "/agents/tool_registry", AgentsController, :tool_registry
     get "/agents/username_available", AgentsController, :username_available
     post "/agents", AgentsController, :create

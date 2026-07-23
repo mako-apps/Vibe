@@ -58,6 +58,33 @@ are accepted; an old GPT-5 value is rejected in favor of `gpt-5.6-luna`.
 has already reached the client, the runtime ends that attempt instead of mixing
 two providers inside one mutable streaming row.
 
+## Per-agent model selection
+
+Standalone Vibe agents persist an owner-selected `model_provider` and
+`model_id`. API payloads expose the same pair as `modelProvider` and `modelId`.
+The server model registry is the authority for supported combinations; clients
+must render its catalog rather than accepting arbitrary model identifiers or
+provider credentials.
+
+New agents default to Anthropic Sonnet 5. Existing agents created before model
+selection retain their previous effective Anthropic Haiku 4.5 runtime until an
+owner changes it. The supported picker catalog is:
+
+| Provider | Models |
+| --- | --- |
+| Anthropic | Fable 5, Opus 4.8, Sonnet 5, Haiku 4.5 |
+| OpenAI | GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna |
+
+The exact stored IDs are pinned in the model registry and validated on both
+create and update. A provider-only update selects that provider's default; a
+model-only update infers its provider when the model ID is unambiguous. Invalid
+or mismatched pairs fail before an agent shadow user is created.
+
+The selection applies to standalone-agent direct replies, external invokes, and
+the same agent when attached to a group or channel. Internal builder workers and
+the legacy one-per-room GroupAgent use their own runtime configuration and are
+not changed by an agent owner's selection.
+
 Standalone invoke responses also carry `status` (`completed` or
 `waiting_for_user`) and `agent_turn_id`; the same turn id is copied into every
 finalized output part.

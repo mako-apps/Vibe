@@ -2473,6 +2473,12 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
     viewModel.onSavePromptVariables = { [weak self] variables, completion in
       self?.savePromptVariables(variables, completion: completion)
     }
+    viewModel.onLoadModelRegistry = { [weak self] completion in
+      self?.loadModelRegistry(completion: completion)
+    }
+    viewModel.onSaveModelSelection = { [weak self] provider, modelId, completion in
+      self?.saveModelSelection(provider: provider, modelId: modelId, completion: completion)
+    }
   }
 
   private func configureNavigation() {
@@ -2534,6 +2540,8 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
     promptStatus: String? = nil,
     promptPreview: String? = nil,
     systemPrompt: String? = nil,
+    modelProvider: String? = nil,
+    modelId: String? = nil,
     enabledTools: [String]? = nil,
     eventInboxMode: String? = nil,
     summaryWindowHours: Int? = nil,
@@ -2554,6 +2562,8 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
       promptStatus: promptStatus ?? card.promptStatus,
       promptPreview: promptPreview ?? card.promptPreview,
       systemPrompt: systemPrompt ?? card.systemPrompt,
+      modelProvider: modelProvider ?? card.modelProvider,
+      modelId: modelId ?? card.modelId,
       enabledTools: enabledTools ?? card.enabledTools,
       outputModes: card.outputModes,
       voiceProfile: card.voiceProfile,
@@ -3020,7 +3030,8 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
       id: c.id, style: c.style, agentId: c.agentId, agentUserId: c.agentUserId,
       displayName: c.displayName, username: c.username, identifier: c.identifier,
       avatarUrl: avatarUrl, status: c.status, promptStatus: c.promptStatus,
-      promptPreview: c.promptPreview, systemPrompt: c.systemPrompt, enabledTools: c.enabledTools,
+      promptPreview: c.promptPreview, systemPrompt: c.systemPrompt,
+      modelProvider: c.modelProvider, modelId: c.modelId, enabledTools: c.enabledTools,
       outputModes: c.outputModes, voiceProfile: c.voiceProfile, callbackURL: c.callbackURL,
       apiBaseURL: c.apiBaseURL, invokeURL: c.invokeURL, eventsURL: c.eventsURL,
       builderLink: c.builderLink, agentDMURL: c.agentDMURL, secretHint: c.secretHint,
@@ -3178,6 +3189,157 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
         self.updateCard(enabledTools: resolved)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         self.onToast?("Updated tools")
+        completion(true)
+      }
+    }
+    task.resume()
+  }
+
+  // MARK: - Model registry
+
+  private func loadModelRegistry(completion: @escaping (ChatAgentModelRegistry) -> Void) {
+    guard let url = apiRequestURL(path: "/api/agents/model_registry") else {
+      completion(.fallback)
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    apiHeaders(&request)
+
+    let task = ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
+      data, response, error in
+      DispatchQueue.main.async {
+        guard
+          error == nil,
+          (200..<300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
+          let data,
+          let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let registry = Self.parseModelRegistry(payload)
+        else {
+          completion(.fallback)
+          return
+        }
+        completion(registry)
+      }
+    }
+    task.resume()
+  }
+
+  private static func parseModelRegistry(
+    _ payload: [String: Any]
+  ) -> ChatAgentModelRegistry? {
+    guard
+      let defaultSelection = payload["default"] as? [String: Any],
+      let defaultProvider =
+        chatNativeAgentNormalizedString(defaultSelection["provider"]),
+      let defaultModelId =
+        chatNativeAgentNormalizedString(
+          defaultSelection["modelId"] ?? defaultSelection["model_id"]),
+      let rawProviders = payload["providers"] as? [[String: Any]]
+    else {
+      return nil
+    }
+
+    let providers: [ChatAgentModelProviderInfo] = rawProviders.compactMap { rawProvider in
+      guard
+        let id = chatNativeAgentNormalizedString(rawProvider["id"]),
+        let rawModels = rawProvider["models"] as? [[String: Any]]
+      else {
+        return nil
+      }
+      let models: [ChatAgentModelInfo] = rawModels.compactMap { rawModel in
+        guard let modelId = chatNativeAgentNormalizedString(rawModel["id"]) else {
+          return nil
+        }
+        return ChatAgentModelInfo(
+          id: modelId,
+          name: chatNativeAgentNormalizedString(rawModel["name"]) ?? modelId,
+          description: chatNativeAgentNormalizedString(rawModel["description"]) ?? "",
+          tier: chatNativeAgentNormalizedString(rawModel["tier"]) ?? "",
+          recommended: chatNativeAgentBoolean(rawModel["recommended"]) ?? false
+        )
+      }
+      let providerName: String
+      switch id.lowercased() {
+      case "anthropic":
+        providerName = "Anthropic"
+      case "openai":
+        providerName = "OpenAI"
+      default:
+        providerName = chatNativeAgentNormalizedString(rawProvider["name"]) ?? id
+      }
+      return ChatAgentModelProviderInfo(
+        id: id,
+        name: providerName,
+        available: chatNativeAgentBoolean(rawProvider["available"]) ?? false,
+        models: models
+      )
+    }
+
+    guard !providers.isEmpty else { return nil }
+    return ChatAgentModelRegistry(
+      defaultProvider: defaultProvider,
+      defaultModelId: defaultModelId,
+      providers: providers,
+      isFallback: false
+    )
+  }
+
+  private func saveModelSelection(
+    provider: String,
+    modelId: String,
+    completion: @escaping (Bool) -> Void
+  ) {
+    guard let url = apiRequestURL(path: "/api/agents/{agent_id}") else {
+      onToast?("Missing API session")
+      completion(false)
+      return
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "PUT"
+    apiHeaders(&request)
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(
+      withJSONObject: [
+        "model_provider": provider,
+        "model_id": modelId,
+      ])
+
+    let task = ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
+      [weak self] data, response, error in
+      DispatchQueue.main.async {
+        guard let self else {
+          completion(false)
+          return
+        }
+        guard
+          error == nil,
+          (200..<300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
+          let data,
+          let responsePayload =
+            (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+          self.onToast?("Could not update model")
+          completion(false)
+          return
+        }
+
+        let agentPayload =
+          (responsePayload["agent"] as? [String: Any])
+          ?? responsePayload
+        let resolvedProvider =
+          chatNativeAgentNormalizedString(
+            agentPayload["modelProvider"] ?? agentPayload["model_provider"])
+          ?? provider
+        let resolvedModelId =
+          chatNativeAgentNormalizedString(
+            agentPayload["modelId"] ?? agentPayload["model_id"])
+          ?? modelId
+
+        self.updateCard(modelProvider: resolvedProvider, modelId: resolvedModelId)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        self.onToast?("Updated model")
         completion(true)
       }
     }

@@ -10,7 +10,8 @@ defmodule Vibe.AI.AgentRuntime do
 
   defmodule Config do
     @enforce_keys [:model, :system_prompt, :tools, :execute_tools]
-    defstruct model: nil,
+    defstruct provider: "anthropic",
+              model: nil,
               max_tokens: 1600,
               max_depth: 3,
               system_prompt: nil,
@@ -32,15 +33,20 @@ defmodule Vibe.AI.AgentRuntime do
     config = opts |> normalize_config() |> apply_openai_environment()
 
     provider_state = %{
-      selected: nil,
+      selected: if(config.provider in [:openai, "openai"], do: :openai, else: nil),
       claude_api_key: System.get_env("ANTHROPIC_API_KEY") || System.get_env("CLAUDE_API_KEY"),
       openai_api_key: System.get_env("OPENAI_API_KEY")
     }
 
-    if is_nil(provider_state.claude_api_key) and is_nil(provider_state.openai_api_key) do
-      {:error, "#{config.missing_api_key_error}; OPENAI_API_KEY not configured"}
-    else
-      do_run(messages, config, provider_state, 0, "")
+    case provider_state do
+      %{selected: :openai, openai_api_key: nil} ->
+        {:error, "OPENAI_API_KEY not configured for selected OpenAI agent model"}
+
+      %{claude_api_key: nil, openai_api_key: nil} ->
+        {:error, "#{config.missing_api_key_error}; OPENAI_API_KEY not configured"}
+
+      _ ->
+        do_run(messages, config, provider_state, 0, "")
     end
   end
 
@@ -376,7 +382,7 @@ defmodule Vibe.AI.AgentRuntime do
   @doc false
   def openai_request_payload(messages, %Config{} = config) do
     %{
-      "model" => config.openai_fallback_model,
+      "model" => openai_model(config),
       "instructions" => resolve_system_prompt(config.system_prompt, config.state),
       "input" => openai_input(messages),
       "tools" => openai_tools(config.tools),
@@ -645,6 +651,12 @@ defmodule Vibe.AI.AgentRuntime do
 
     %{config | openai_fallback_model: model, openai_reasoning_effort: reasoning_effort}
   end
+
+  defp openai_model(%Config{provider: provider, model: model})
+       when provider in [:openai, "openai"],
+       do: model
+
+  defp openai_model(%Config{} = config), do: config.openai_fallback_model
 
   defp modern_gpt_family?(model) when is_binary(model) do
     String.starts_with?(model, "gpt-5.5") or String.starts_with?(model, "gpt-5.6")

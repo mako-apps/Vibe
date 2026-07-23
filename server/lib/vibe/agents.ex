@@ -15,6 +15,7 @@ defmodule Vibe.Agents do
   alias Vibe.AgentInvocation
   alias Vibe.AgentRun
   alias Vibe.AgentRunbook
+  alias Vibe.AI.ModelRegistry
   alias Vibe.Chat.Participant
   alias Vibe.Chat.Room
   alias Vibe.Subscriptions
@@ -96,7 +97,8 @@ defmodule Vibe.Agents do
   end
 
   def create_agent(owner_user_id, attrs \\ %{}) do
-    with :ok <- ensure_quota(owner_user_id),
+    with {:ok, model_selection} <- ModelRegistry.resolve_selection(attrs),
+         :ok <- ensure_quota(owner_user_id),
          {:ok, secret_tuple} <- generate_secret_tuple(),
          {:ok, shadow_user} <- create_shadow_user(owner_user_id, attrs),
          {:ok, agent} <-
@@ -106,6 +108,8 @@ defmodule Vibe.Agents do
              agent_user_id: shadow_user.id,
              status: "draft",
              display_name: display_name_from_attrs(attrs),
+             model_provider: model_selection.provider,
+             model_id: model_selection.model_id,
              system_prompt: string_attr(attrs, "system_prompt") || "",
              prompt_variables: Vibe.AI.PromptVariables.normalize(attrs["prompt_variables"] || attrs[:prompt_variables]),
              persona: string_attr(attrs, "persona"),
@@ -135,35 +139,43 @@ defmodule Vibe.Agents do
     if agent.owner_user_id != owner_user_id do
       {:error, :forbidden}
     else
-      Repo.transaction(fn ->
-        maybe_update_shadow_user!(agent, attrs)
+      with {:ok, model_selection} <-
+             ModelRegistry.resolve_selection(attrs, %{
+               provider: agent.model_provider,
+               model_id: agent.model_id
+             }) do
+        Repo.transaction(fn ->
+          maybe_update_shadow_user!(agent, attrs)
 
-        agent
-        |> Agent.changeset(%{
-          display_name: display_name_from_attrs(attrs, agent.display_name),
-          system_prompt: Map.get(attrs, "system_prompt", Map.get(attrs, :system_prompt, agent.system_prompt || "")),
-          prompt_variables: update_prompt_variables(agent, attrs),
-          persona: map_get(attrs, "persona", agent.persona),
-          avatar_url: map_get(attrs, "avatar_url", agent.avatar_url),
-          welcome_message: map_get(attrs, "welcome_message", agent.welcome_message),
-          enabled_tools: normalize_enabled_tools(Map.get(attrs, "enabled_tools", Map.get(attrs, :enabled_tools, agent.enabled_tools))),
-          output_modes: normalize_output_modes(Map.get(attrs, "output_modes", Map.get(attrs, :output_modes, agent.output_modes))),
-          voice_provider: map_get(attrs, "voice_provider", agent.voice_provider),
-          voice_profile: map_get(attrs, "voice_profile", agent.voice_profile),
-          callback_url: normalize_callback_url(Map.get(attrs, "callback_url", Map.get(attrs, :callback_url, agent.callback_url))),
-          autonomy_mode: normalize_autonomy_mode(Map.get(attrs, "autonomy_mode", Map.get(attrs, :autonomy_mode, agent.autonomy_mode))),
-          default_destination_chat_id: string_or_existing(agent.default_destination_chat_id, attrs, "default_destination_chat_id"),
-          event_types_enabled: normalize_optional_string_list(Map.get(attrs, "event_types_enabled", Map.get(attrs, :event_types_enabled, agent.event_types_enabled))),
-          cost_budget_daily: integer_or_existing(agent.cost_budget_daily, attrs, "cost_budget_daily"),
-          cost_budget_monthly: integer_or_existing(agent.cost_budget_monthly, attrs, "cost_budget_monthly"),
-          approval_rules: map_or_existing(agent.approval_rules || %{}, attrs, "approval_rules"),
-          status: normalize_status_update(agent, attrs)
-        })
-        |> Repo.update!()
-      end)
-      |> case do
-        {:ok, updated} -> {:ok, Repo.preload(updated, :agent_user)}
-        {:error, reason} -> {:error, reason}
+          agent
+          |> Agent.changeset(%{
+            display_name: display_name_from_attrs(attrs, agent.display_name),
+            model_provider: model_selection.provider,
+            model_id: model_selection.model_id,
+            system_prompt: Map.get(attrs, "system_prompt", Map.get(attrs, :system_prompt, agent.system_prompt || "")),
+            prompt_variables: update_prompt_variables(agent, attrs),
+            persona: map_get(attrs, "persona", agent.persona),
+            avatar_url: map_get(attrs, "avatar_url", agent.avatar_url),
+            welcome_message: map_get(attrs, "welcome_message", agent.welcome_message),
+            enabled_tools: normalize_enabled_tools(Map.get(attrs, "enabled_tools", Map.get(attrs, :enabled_tools, agent.enabled_tools))),
+            output_modes: normalize_output_modes(Map.get(attrs, "output_modes", Map.get(attrs, :output_modes, agent.output_modes))),
+            voice_provider: map_get(attrs, "voice_provider", agent.voice_provider),
+            voice_profile: map_get(attrs, "voice_profile", agent.voice_profile),
+            callback_url: normalize_callback_url(Map.get(attrs, "callback_url", Map.get(attrs, :callback_url, agent.callback_url))),
+            autonomy_mode: normalize_autonomy_mode(Map.get(attrs, "autonomy_mode", Map.get(attrs, :autonomy_mode, agent.autonomy_mode))),
+            default_destination_chat_id: string_or_existing(agent.default_destination_chat_id, attrs, "default_destination_chat_id"),
+            event_types_enabled: normalize_optional_string_list(Map.get(attrs, "event_types_enabled", Map.get(attrs, :event_types_enabled, agent.event_types_enabled))),
+            cost_budget_daily: integer_or_existing(agent.cost_budget_daily, attrs, "cost_budget_daily"),
+            cost_budget_monthly: integer_or_existing(agent.cost_budget_monthly, attrs, "cost_budget_monthly"),
+            approval_rules: map_or_existing(agent.approval_rules || %{}, attrs, "approval_rules"),
+            status: normalize_status_update(agent, attrs)
+          })
+          |> Repo.update!()
+        end)
+        |> case do
+          {:ok, updated} -> {:ok, Repo.preload(updated, :agent_user)}
+          {:error, reason} -> {:error, reason}
+        end
       end
     end
   end
@@ -658,6 +670,8 @@ defmodule Vibe.Agents do
       username: agent.agent_user && agent.agent_user.username,
       displayName: agent.display_name,
       status: agent.status,
+      modelProvider: agent.model_provider,
+      modelId: agent.model_id,
       systemPrompt: agent.system_prompt,
       promptVariables: Vibe.AI.PromptVariables.definitions(agent),
       persona: agent.persona,

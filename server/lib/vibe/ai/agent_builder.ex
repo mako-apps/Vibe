@@ -51,6 +51,15 @@ defmodule Vibe.AI.AgentBuilder do
             description: "Optional final system prompt to save immediately."
           },
           persona: %{type: "string", description: "Optional persona or character summary."},
+          model_provider: %{
+            type: "string",
+            enum: ["anthropic", "openai"],
+            description: "Optional runtime provider. The server model registry is authoritative."
+          },
+          model_id: %{
+            type: "string",
+            description: "Optional allowlisted model id for the selected provider."
+          },
           callback_url: %{
             type: "string",
             description:
@@ -105,6 +114,15 @@ defmodule Vibe.AI.AgentBuilder do
           },
           system_prompt: %{type: "string", description: "Updated final system prompt."},
           persona: %{type: "string", description: "Updated persona summary."},
+          model_provider: %{
+            type: "string",
+            enum: ["anthropic", "openai"],
+            description: "Updated runtime provider."
+          },
+          model_id: %{
+            type: "string",
+            description: "Updated allowlisted model id."
+          },
           callback_url: %{
             type: "string",
             description: "Updated callback URL. Use 'off' to disable callbacks."
@@ -983,6 +1001,8 @@ defmodule Vibe.AI.AgentBuilder do
     |> maybe_put("username", normalize_optional_string(Map.get(input, "username")))
     |> maybe_put("system_prompt", normalize_optional_string(Map.get(input, "system_prompt")))
     |> maybe_put("persona", normalize_optional_string(Map.get(input, "persona")))
+    |> maybe_put("model_provider", normalize_optional_string(Map.get(input, "model_provider")))
+    |> maybe_put("model_id", normalize_optional_string(Map.get(input, "model_id")))
     |> maybe_put("callback_url", normalize_callback_input(Map.get(input, "callback_url")))
     |> maybe_put("enabled_tools", normalize_string_list(Map.get(input, "enabled_tools")))
     |> maybe_put("output_modes", normalize_string_list(Map.get(input, "output_modes")))
@@ -995,6 +1015,8 @@ defmodule Vibe.AI.AgentBuilder do
     |> maybe_put("username", normalize_optional_string(Map.get(input, "username")))
     |> maybe_put("system_prompt", normalize_optional_string(Map.get(input, "system_prompt")))
     |> maybe_put("persona", normalize_optional_string(Map.get(input, "persona")))
+    |> maybe_put("model_provider", normalize_optional_string(Map.get(input, "model_provider")))
+    |> maybe_put("model_id", normalize_optional_string(Map.get(input, "model_id")))
     |> maybe_put("callback_url", normalize_callback_input(Map.get(input, "callback_url")))
     |> maybe_put("enabled_tools", normalize_string_list(Map.get(input, "enabled_tools")))
     |> maybe_put("output_modes", normalize_string_list(Map.get(input, "output_modes")))

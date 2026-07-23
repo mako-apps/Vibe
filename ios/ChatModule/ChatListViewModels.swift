@@ -318,6 +318,8 @@ struct ChatListRow {
     let promptStatus: String?
     let promptPreview: String?
     let systemPrompt: String?
+    let modelProvider: String?
+    let modelId: String?
     let enabledTools: [String]
     let outputModes: [String]
     let voiceProfile: String?
@@ -399,6 +401,8 @@ struct ChatListRow {
         promptStatus: parseNonEmptyString(raw["prompt_status"] ?? raw["promptStatus"]),
         promptPreview: parseNonEmptyString(raw["prompt_preview"] ?? raw["promptPreview"]),
         systemPrompt: parseNonEmptyString(raw["system_prompt"] ?? raw["systemPrompt"]),
+        modelProvider: parseNonEmptyString(raw["model_provider"] ?? raw["modelProvider"]),
+        modelId: parseNonEmptyString(raw["model_id"] ?? raw["modelId"]),
         enabledTools: parseStringArray(raw["enabled_tools"] ?? raw["enabledTools"]),
         outputModes: parseStringArray(raw["output_modes"] ?? raw["outputModes"]),
         voiceProfile: parseNonEmptyString(raw["voice_profile"] ?? raw["voiceProfile"]),
@@ -448,6 +452,8 @@ struct ChatListRow {
       if let promptStatus { raw["prompt_status"] = promptStatus }
       if let promptPreview { raw["prompt_preview"] = promptPreview }
       if let systemPrompt { raw["system_prompt"] = systemPrompt }
+      if let modelProvider { raw["model_provider"] = modelProvider }
+      if let modelId { raw["model_id"] = modelId }
       if let voiceProfile { raw["voice_profile"] = voiceProfile }
       if let callbackURL { raw["callback_url"] = callbackURL }
       if let apiBaseURL { raw["api_base_url"] = apiBaseURL }

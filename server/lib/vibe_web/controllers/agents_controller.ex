@@ -44,6 +44,11 @@ defmodule VibeWeb.AgentsController do
     json(conn, %{items: Vibe.AI.ToolRegistry.tools()})
   end
 
+  @doc "Returns the server-authoritative provider and model catalog."
+  def model_registry(conn, _params) do
+    json(conn, Vibe.AI.ModelRegistry.public_payload())
+  end
+
   @doc """
   Live availability check for an agent handle/username. Pass `username` and,
   when editing an existing agent, `agent_id` so the agent's own current handle

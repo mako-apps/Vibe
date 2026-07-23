@@ -175,6 +175,8 @@ defmodule Vibe.AI.StandaloneAgent do
                agent.owner_user_id,
                requester_user_id,
                agent.id,
+               agent.model_provider,
+               agent.model_id,
                system_prompt,
                agent.enabled_tools || [],
                conversation_history
@@ -382,6 +384,8 @@ defmodule Vibe.AI.StandaloneAgent do
          user_id,
          requester_user_id,
          agent_id,
+         model_provider,
+         model_id,
          system_prompt,
          enabled_tools,
          conversation_history
@@ -395,6 +399,8 @@ defmodule Vibe.AI.StandaloneAgent do
            user_id: user_id,
            requester_user_id: requester_user_id,
            agent_id: agent_id,
+           model_provider: model_provider,
+           model_id: model_id,
            system_prompt: system_prompt,
            enabled_tools: enabled_tools
          ) do

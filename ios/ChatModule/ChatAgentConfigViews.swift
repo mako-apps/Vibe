@@ -19,8 +19,103 @@ struct ChatAgentPromptVariable: Identifiable, Equatable {
     let locked: Bool
 }
 
+struct ChatAgentModelInfo: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let description: String
+    let tier: String
+    let recommended: Bool
+}
+
+struct ChatAgentModelProviderInfo: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let available: Bool
+    let models: [ChatAgentModelInfo]
+}
+
+struct ChatAgentModelRegistry: Equatable {
+    let defaultProvider: String
+    let defaultModelId: String
+    let providers: [ChatAgentModelProviderInfo]
+    let isFallback: Bool
+
+    func provider(id: String) -> ChatAgentModelProviderInfo? {
+        providers.first { $0.id.caseInsensitiveCompare(id) == .orderedSame }
+    }
+
+    func model(providerId: String, modelId: String) -> ChatAgentModelInfo? {
+        provider(id: providerId)?.models.first {
+            $0.id.caseInsensitiveCompare(modelId) == .orderedSame
+        }
+    }
+
+    static let fallback = ChatAgentModelRegistry(
+        defaultProvider: "anthropic",
+        defaultModelId: "claude-sonnet-5",
+        providers: [
+            ChatAgentModelProviderInfo(
+                id: "anthropic",
+                name: "Anthropic",
+                available: true,
+                models: [
+                    ChatAgentModelInfo(
+                        id: "claude-fable-5",
+                        name: "Fable 5",
+                        description: "Deep reasoning for complex decisions.",
+                        tier: "frontier",
+                        recommended: false),
+                    ChatAgentModelInfo(
+                        id: "claude-opus-4-8",
+                        name: "Opus 4.8",
+                        description: "Maximum capability for demanding work.",
+                        tier: "frontier",
+                        recommended: false),
+                    ChatAgentModelInfo(
+                        id: "claude-sonnet-5",
+                        name: "Sonnet 5",
+                        description: "Fast, capable, and recommended for most agents.",
+                        tier: "balanced",
+                        recommended: true),
+                    ChatAgentModelInfo(
+                        id: "claude-haiku-4-5-20251001",
+                        name: "Haiku 4.5",
+                        description: "Quick responses for lightweight tasks.",
+                        tier: "fast",
+                        recommended: false),
+                ]),
+            ChatAgentModelProviderInfo(
+                id: "openai",
+                name: "OpenAI",
+                available: true,
+                models: [
+                    ChatAgentModelInfo(
+                        id: "gpt-5.6-sol",
+                        name: "GPT-5.6 Sol",
+                        description: "Maximum capability for demanding work.",
+                        tier: "frontier",
+                        recommended: false),
+                    ChatAgentModelInfo(
+                        id: "gpt-5.6-terra",
+                        name: "GPT-5.6 Terra",
+                        description: "A strong balance of speed and capability.",
+                        tier: "balanced",
+                        recommended: true),
+                    ChatAgentModelInfo(
+                        id: "gpt-5.6-luna",
+                        name: "GPT-5.6 Luna",
+                        description: "Fast and efficient for everyday tasks.",
+                        tier: "fast",
+                        recommended: false),
+                ]),
+        ],
+        isFallback: true
+    )
+}
+
 class ChatAgentConfigViewModel: ObservableObject {
     @Published var card: ChatListRow.AgentCard
+    @Published var modelRegistry: ChatAgentModelRegistry = .fallback
 
     var onRename: ((String, @escaping (Bool) -> Void) -> Void)?
     var onSavePrompt: ((String, @escaping (Bool) -> Void) -> Void)?
@@ -44,6 +139,10 @@ class ChatAgentConfigViewModel: ObservableObject {
     var onLoadPromptVariables: ((@escaping ([ChatAgentPromptVariable]) -> Void) -> Void)?
     /// Persist updated prompt variable values. Returns success.
     var onSavePromptVariables: (([ChatAgentPromptVariable], @escaping (Bool) -> Void) -> Void)?
+    /// Load the server-authoritative provider/model catalog.
+    var onLoadModelRegistry: ((@escaping (ChatAgentModelRegistry) -> Void) -> Void)?
+    /// Persist one exact provider/model pair.
+    var onSaveModelSelection: ((String, String, @escaping (Bool) -> Void) -> Void)?
 
     init(card: ChatListRow.AgentCard) {
         self.card = card
@@ -54,6 +153,7 @@ struct ChatAgentSettingsView: View {
     @ObservedObject var viewModel: ChatAgentConfigViewModel
     @State private var draftName: String = ""
     @State private var isSavingName = false
+    @State private var didLoadModelRegistry = false
 
     private var promptSummary: String {
         let prompt = (viewModel.card.systemPrompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -67,6 +167,20 @@ struct ChatAgentSettingsView: View {
         case 1: return "1 tool"
         default: return "\(count) tools"
         }
+    }
+
+    private var modelSummary: String {
+        // A cached card without the new fields represents an existing agent,
+        // whose previous effective runtime was Anthropic Haiku 4.5.
+        let providerId = viewModel.card.modelProvider ?? "anthropic"
+        let modelId = viewModel.card.modelId ?? "claude-haiku-4-5-20251001"
+        let provider =
+            viewModel.modelRegistry.provider(id: providerId)
+            ?? ChatAgentModelRegistry.fallback.provider(id: providerId)
+        let model =
+            viewModel.modelRegistry.model(providerId: providerId, modelId: modelId)
+            ?? ChatAgentModelRegistry.fallback.model(providerId: providerId, modelId: modelId)
+        return "\(provider?.name ?? providerId) · \(model?.name ?? modelId)"
     }
 
     var body: some View {
@@ -137,6 +251,16 @@ struct ChatAgentSettingsView: View {
             }
 
             Section {
+                NavigationLink(destination: ChatAgentModelPickerView(viewModel: viewModel)) {
+                    HStack {
+                        Text("Model")
+                        Spacer()
+                        Text(modelSummary)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
                 NavigationLink(destination: ChatAgentPromptView(viewModel: viewModel)) {
                     HStack {
                         Text("System Prompt")
@@ -170,6 +294,11 @@ struct ChatAgentSettingsView: View {
         }
         .onAppear {
             draftName = viewModel.card.displayName
+            guard !didLoadModelRegistry else { return }
+            didLoadModelRegistry = true
+            viewModel.onLoadModelRegistry? { registry in
+                viewModel.modelRegistry = registry
+            }
         }
         .onChange(of: viewModel.card) { newCard in
             if !isSavingName {
@@ -186,6 +315,181 @@ struct ChatAgentSettingsView: View {
             isSavingName = false
             if !success {
                 draftName = viewModel.card.displayName
+            }
+        }
+    }
+}
+
+struct ChatAgentModelPickerView: View {
+    @ObservedObject var viewModel: ChatAgentConfigViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedProviderId = ""
+    @State private var selectedModelId = ""
+    @State private var isSaving = false
+
+    private var currentProviderId: String {
+        viewModel.card.modelProvider ?? "anthropic"
+    }
+
+    private var currentModelId: String {
+        viewModel.card.modelId ?? "claude-haiku-4-5-20251001"
+    }
+
+    private var selectedProvider: ChatAgentModelProviderInfo? {
+        viewModel.modelRegistry.provider(id: selectedProviderId)
+    }
+
+    private var selectedPairIsValid: Bool {
+        guard let provider = selectedProvider, provider.available else { return false }
+        return provider.models.contains { $0.id == selectedModelId }
+    }
+
+    private var isDirty: Bool {
+        selectedProviderId != currentProviderId || selectedModelId != currentModelId
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                ForEach(viewModel.modelRegistry.providers) { provider in
+                    Button {
+                        selectProvider(provider)
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(provider.name)
+                                    .foregroundColor(provider.available ? .primary : .secondary)
+                                if !provider.available {
+                                    Text("Unavailable — this provider is not configured.")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            Spacer()
+                            if selectedProviderId == provider.id {
+                                Image(systemName: "checkmark")
+                                    .font(.body.weight(.semibold))
+                            }
+                        }
+                    }
+                    .disabled(!provider.available)
+                }
+            } header: {
+                Text("Provider")
+            } footer: {
+                if viewModel.modelRegistry.isFallback {
+                    Text("Showing the built-in catalog while the live registry is unavailable. The server validates every selection.")
+                }
+            }
+
+            Section {
+                if let provider = selectedProvider {
+                    ForEach(provider.models) { model in
+                        Button {
+                            selectedModelId = model.id
+                        } label: {
+                            HStack(alignment: .center, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(spacing: 6) {
+                                        Text(model.name)
+                                            .foregroundColor(provider.available ? .primary : .secondary)
+                                        if model.recommended {
+                                            Text("Recommended")
+                                                .font(.caption2.weight(.semibold))
+                                                .foregroundColor(.accentColor)
+                                        }
+                                    }
+                                    Text(model.description)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .multilineTextAlignment(.leading)
+                                }
+                                Spacer()
+                                if selectedModelId == model.id {
+                                    Image(systemName: "checkmark")
+                                        .font(.body.weight(.semibold))
+                                }
+                            }
+                        }
+                        .disabled(!provider.available)
+                    }
+                } else {
+                    Text("Select an available provider first.")
+                        .foregroundColor(.secondary)
+                }
+            } header: {
+                Text("Model")
+            }
+        }
+        .navigationTitle("Model")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                if isSaving {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Save") { saveSelection() }
+                        .disabled(!isDirty || !selectedPairIsValid)
+                }
+            }
+        }
+        .onAppear {
+            resolveSelection()
+        }
+        .onChange(of: viewModel.modelRegistry) { _ in
+            resolveSelection()
+        }
+    }
+
+    private func resolveSelection() {
+        if let currentProvider = viewModel.modelRegistry.provider(id: currentProviderId) {
+            selectedProviderId = currentProvider.id
+            if currentProvider.models.contains(where: { $0.id == currentModelId }) {
+                selectedModelId = currentModelId
+            } else {
+                selectedModelId =
+                    currentProvider.models.first(where: \.recommended)?.id
+                    ?? currentProvider.models.first?.id
+                    ?? ""
+            }
+            return
+        }
+
+        guard
+            let fallbackProvider =
+                viewModel.modelRegistry.provider(id: viewModel.modelRegistry.defaultProvider)
+                ?? viewModel.modelRegistry.providers.first(where: \.available)
+                ?? viewModel.modelRegistry.providers.first
+        else {
+            selectedProviderId = ""
+            selectedModelId = ""
+            return
+        }
+        selectProvider(fallbackProvider)
+    }
+
+    private func selectProvider(_ provider: ChatAgentModelProviderInfo) {
+        guard provider.available else { return }
+        selectedProviderId = provider.id
+        if provider.id == currentProviderId,
+            provider.models.contains(where: { $0.id == currentModelId })
+        {
+            selectedModelId = currentModelId
+        } else {
+            selectedModelId =
+                provider.models.first(where: \.recommended)?.id
+                ?? provider.models.first?.id
+                ?? ""
+        }
+    }
+
+    private func saveSelection() {
+        guard selectedPairIsValid, !isSaving else { return }
+        isSaving = true
+        viewModel.onSaveModelSelection?(selectedProviderId, selectedModelId) { success in
+            isSaving = false
+            if success {
+                dismiss()
             }
         }
     }
