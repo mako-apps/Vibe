@@ -113,6 +113,116 @@ struct ChatAgentModelRegistry: Equatable {
     )
 }
 
+enum ChatAgentModelRegistryService {
+    static func load(
+        apiBaseURL: URL,
+        token: String,
+        completion: @escaping (ChatAgentModelRegistry) -> Void
+    ) {
+        let base = apiBaseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: "\(base)/api/agents/model_registry") else {
+            completion(.fallback)
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
+            data, response, error in
+            DispatchQueue.main.async {
+                guard
+                    error == nil,
+                    (200..<300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
+                    let data,
+                    let payload =
+                        (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                    let registry = parse(payload)
+                else {
+                    completion(.fallback)
+                    return
+                }
+                completion(registry)
+            }
+        }.resume()
+    }
+
+    static func parse(_ payload: [String: Any]) -> ChatAgentModelRegistry? {
+        guard
+            let defaultSelection = payload["default"] as? [String: Any],
+            let defaultProvider = normalizedString(defaultSelection["provider"]),
+            let defaultModelId = normalizedString(
+                defaultSelection["modelId"] ?? defaultSelection["model_id"]),
+            let rawProviders = payload["providers"] as? [[String: Any]]
+        else {
+            return nil
+        }
+
+        let providers: [ChatAgentModelProviderInfo] = rawProviders.compactMap { rawProvider in
+            guard
+                let id = normalizedString(rawProvider["id"]),
+                let rawModels = rawProvider["models"] as? [[String: Any]]
+            else {
+                return nil
+            }
+            let models: [ChatAgentModelInfo] = rawModels.compactMap { rawModel in
+                guard let modelId = normalizedString(rawModel["id"]) else { return nil }
+                return ChatAgentModelInfo(
+                    id: modelId,
+                    name: normalizedString(rawModel["name"]) ?? modelId,
+                    description: normalizedString(rawModel["description"]) ?? "",
+                    tier: normalizedString(rawModel["tier"]) ?? "",
+                    recommended: boolean(rawModel["recommended"]) ?? false
+                )
+            }
+            let providerName: String
+            switch id.lowercased() {
+            case "anthropic":
+                providerName = "Anthropic"
+            case "openai":
+                providerName = "OpenAI"
+            default:
+                providerName = normalizedString(rawProvider["name"]) ?? id
+            }
+            return ChatAgentModelProviderInfo(
+                id: id,
+                name: providerName,
+                available: boolean(rawProvider["available"]) ?? false,
+                models: models
+            )
+        }
+
+        guard !providers.isEmpty else { return nil }
+        return ChatAgentModelRegistry(
+            defaultProvider: defaultProvider,
+            defaultModelId: defaultModelId,
+            providers: providers,
+            isFallback: false
+        )
+    }
+
+    private static func normalizedString(_ raw: Any?) -> String? {
+        guard let value = raw as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func boolean(_ raw: Any?) -> Bool? {
+        if let value = raw as? Bool { return value }
+        if let value = raw as? NSNumber { return value.boolValue }
+        if let value = raw as? String {
+            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes": return true
+            case "false", "0", "no": return false
+            default: return nil
+            }
+        }
+        return nil
+    }
+}
+
 class ChatAgentConfigViewModel: ObservableObject {
     @Published var card: ChatListRow.AgentCard
     @Published var modelRegistry: ChatAgentModelRegistry = .fallback
@@ -322,21 +432,34 @@ struct ChatAgentSettingsView: View {
 
 struct ChatAgentModelPickerView: View {
     @ObservedObject var viewModel: ChatAgentConfigViewModel
+
+    var body: some View {
+        ChatProviderModelPickerView(
+            registry: viewModel.modelRegistry,
+            currentProviderId: viewModel.card.modelProvider ?? "anthropic",
+            currentModelId: viewModel.card.modelId ?? "claude-haiku-4-5-20251001"
+        ) { providerId, modelId, completion in
+            viewModel.onSaveModelSelection?(providerId, modelId, completion)
+        }
+    }
+}
+
+/// Reusable server-registry-backed provider/model picker. Standalone agent
+/// settings supply a server save closure; built-in VibeAgent supplies a local
+/// selection closure while using the exact same catalog and validation UI.
+struct ChatProviderModelPickerView: View {
+    let registry: ChatAgentModelRegistry
+    let currentProviderId: String
+    let currentModelId: String
+    let onSave: (String, String, @escaping (Bool) -> Void) -> Void
+
     @Environment(\.dismiss) private var dismiss
     @State private var selectedProviderId = ""
     @State private var selectedModelId = ""
     @State private var isSaving = false
 
-    private var currentProviderId: String {
-        viewModel.card.modelProvider ?? "anthropic"
-    }
-
-    private var currentModelId: String {
-        viewModel.card.modelId ?? "claude-haiku-4-5-20251001"
-    }
-
     private var selectedProvider: ChatAgentModelProviderInfo? {
-        viewModel.modelRegistry.provider(id: selectedProviderId)
+        registry.provider(id: selectedProviderId)
     }
 
     private var selectedPairIsValid: Bool {
@@ -351,7 +474,7 @@ struct ChatAgentModelPickerView: View {
     var body: some View {
         Form {
             Section {
-                ForEach(viewModel.modelRegistry.providers) { provider in
+                ForEach(registry.providers) { provider in
                     Button {
                         selectProvider(provider)
                     } label: {
@@ -377,7 +500,7 @@ struct ChatAgentModelPickerView: View {
             } header: {
                 Text("Provider")
             } footer: {
-                if viewModel.modelRegistry.isFallback {
+                if registry.isFallback {
                     Text("Showing the built-in catalog while the live registry is unavailable. The server validates every selection.")
                 }
             }
@@ -436,13 +559,13 @@ struct ChatAgentModelPickerView: View {
         .onAppear {
             resolveSelection()
         }
-        .onChange(of: viewModel.modelRegistry) { _ in
+        .onChange(of: registry) { _ in
             resolveSelection()
         }
     }
 
     private func resolveSelection() {
-        if let currentProvider = viewModel.modelRegistry.provider(id: currentProviderId) {
+        if let currentProvider = registry.provider(id: currentProviderId) {
             selectedProviderId = currentProvider.id
             if currentProvider.models.contains(where: { $0.id == currentModelId }) {
                 selectedModelId = currentModelId
@@ -457,9 +580,9 @@ struct ChatAgentModelPickerView: View {
 
         guard
             let fallbackProvider =
-                viewModel.modelRegistry.provider(id: viewModel.modelRegistry.defaultProvider)
-                ?? viewModel.modelRegistry.providers.first(where: \.available)
-                ?? viewModel.modelRegistry.providers.first
+                registry.provider(id: registry.defaultProvider)
+                ?? registry.providers.first(where: \.available)
+                ?? registry.providers.first
         else {
             selectedProviderId = ""
             selectedModelId = ""
@@ -486,7 +609,7 @@ struct ChatAgentModelPickerView: View {
     private func saveSelection() {
         guard selectedPairIsValid, !isSaving else { return }
         isSaving = true
-        viewModel.onSaveModelSelection?(selectedProviderId, selectedModelId) { success in
+        onSave(selectedProviderId, selectedModelId) { success in
             isSaving = false
             if success {
                 dismiss()

@@ -14607,6 +14607,10 @@ final class ChatAgentConversationController: UIViewController {
     agentView.onStreamingStateChanged = { [weak self] streaming in
       self?.mainView.setAgentStreaming(streaming)
     }
+    agentView.onHeaderStateChanged = { [weak self] title, subtitle in
+      self?.mainView.setHeaderTitle(title)
+      self?.mainView.setHeaderSubtitle(subtitle)
+    }
     agentView.onNativeEvent.handler = { [weak self] payload in
       self?.handleAgentEvent(payload)
     }
@@ -14635,9 +14639,7 @@ final class ChatAgentConversationController: UIViewController {
     mainView.setStatusAuthorityEnabled(false)
     mainView.setAppearance(appearance)
     mainView.setHeaderMode("default")
-    mainView.setHeaderTitle("Vibe AI")
     mainView.setProfileName("Vibe AI")
-    mainView.setHeaderSubtitle("AI agent")
     mainView.setIsGroupOrChannel(false)
     mainView.setAgentChatMode(true)
     mainView.setInputPlaceholder("Message Vibe AI")
@@ -14660,6 +14662,8 @@ final class ChatAgentConversationController: UIViewController {
       onClose?()
     case "headerAvatarPressed":
       pushAgentProfile(animated: true)
+    case "agentModelPressed":
+      agentView.presentModelPicker(from: self)
     case "profileAppearanceUpdated":
       mainView.refreshProfileAppearance()
     case "sendMessage":

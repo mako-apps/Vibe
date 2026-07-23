@@ -4,6 +4,7 @@ defmodule Vibe.AgentTurnContractTest do
   alias Vibe.Accounts.User
   alias Vibe.Agent
   alias Vibe.AI.Agent, as: ChatAgent
+  alias Vibe.AI.AgenticEventShape
   alias Vibe.AI.StandaloneAgent
   alias Vibe.AI.ToolRegistry
   alias Vibe.AI.Tools.Channel
@@ -279,6 +280,52 @@ defmodule Vibe.AgentTurnContractTest do
     assert text_part.metadata["agentPartIndex"] == 0
     assert question_part.metadata["agentPartIndex"] == 1
     assert question_part.metadata["status"] == "waiting_for_user"
+  end
+
+  test "agentic events expose canonical short activity states" do
+    for {event, expected_state} <- [
+          {"chunk", "typing"},
+          {"progress", "working"},
+          {"done", "ready"},
+          {"error", "ready"}
+        ] do
+      enriched = AgenticEventShape.enrich(event, %{})
+
+      assert enriched.activityState == expected_state
+      assert enriched.activity_state == expected_state
+    end
+  end
+
+  test "agentic progress labels are single-line and capped at 32 graphemes" do
+    long_label = "  Inspecting\n" <> String.duplicate("é", 40) <> "\twith details  "
+    detailed_result = %{"content" => String.duplicate("full result ", 20)}
+
+    enriched =
+      AgenticEventShape.enrich("progress", %{
+        label: long_label,
+        progressNodes: [
+          %{label: long_label, result: detailed_result},
+          %{"title" => long_label, "detail" => "keep\nthis detail intact"}
+        ],
+        activity: [%{title: long_label, detail: "keep activity detail"}]
+      })
+
+    assert String.length(enriched.label) == 32
+    assert String.ends_with?(enriched.label, "…")
+    refute String.contains?(enriched.label, "\n")
+
+    [first_node, second_node] = enriched.progressNodes
+    assert String.length(first_node.label) == 32
+    assert String.ends_with?(first_node.label, "…")
+    assert first_node.result == detailed_result
+    assert String.length(second_node["title"]) == 32
+    assert String.ends_with?(second_node["title"], "…")
+    assert second_node["detail"] == "keep\nthis detail intact"
+
+    [activity] = enriched.activity
+    assert String.length(activity.title) == 32
+    assert String.ends_with?(activity.title, "…")
+    assert activity.detail == "keep activity detail"
   end
 
   defp insert_user(prefix) do

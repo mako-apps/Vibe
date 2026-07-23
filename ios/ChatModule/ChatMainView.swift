@@ -231,6 +231,7 @@ public final class ChatMainView: UIView,
   private var appearance = ChatListAppearance.fallback
   private var lastRawAppearance: [String: Any]?
   private var headerMode: ChatMainHeaderMode = .default
+  private var builtInAgentChatMode = false
   private var bridgeProvider: String = ""
   private var isOnline = false
   private var surfacePresenceOnline: Bool?
@@ -807,7 +808,9 @@ public final class ChatMainView: UIView,
   }
 
   func setAgentChatMode(_ enabled: Bool) {
+    builtInAgentChatMode = enabled
     chatListView.setAgentChatMode(enabled)
+    updateHeaderTexts()
   }
 
   func setAgentStreaming(_ streaming: Bool) {
@@ -4025,7 +4028,11 @@ public final class ChatMainView: UIView,
     // agent is blocked on the user, which is the most actionable thing to surface.
     let resolvedApproval =
       (!bridgeProvider.isEmpty && agentAwaitingApproval) ? "Waiting for approval" : nil
-    let resolvedAgentProgress = resolvedAgentProgressSubtitle()
+    // The built-in VibeAgent transport owns a compact canonical activity state.
+    // Its detailed progress-node label stays in the transcript and must never
+    // replace Thinking/Working/Typing/Ready in the header.
+    let resolvedAgentProgress =
+      builtInAgentChatMode ? nil : resolvedAgentProgressSubtitle()
     // A History pick may briefly have no session metadata. Show Loading only during
     // that explicit fetch; once metadata arrives, model/repo replaces it—never topic.
     let historySessionLoading = chatListView.isBridgeHistorySessionLoading()
@@ -4855,7 +4862,7 @@ public final class ChatMainView: UIView,
 
   private func updateAvatarViews() {
     let descriptor = ChatAvatarDescriptor(
-      title: chatTitleText,
+      title: builtInAgentChatMode ? profileNameText : chatTitleText,
       rawAvatarURI: avatarUri,
       peerUserId: enginePeerUserIdRaw,
       chatId: engineChatId,
@@ -5182,10 +5189,9 @@ public final class ChatMainView: UIView,
     onNativeEvent(["type": "headerAvatarPressed"])
   }
 
-  /// Bridge chats repurpose the title/subtitle tap: instead of opening the profile (still
-  /// reachable via the avatar), it opens the session history sheet — live task or a picked
-  /// past session, or just a place to land when the header reads "Start session". Non-agent
-  /// chats keep the old behavior of the title opening the profile like the avatar does.
+  /// Bridge chats repurpose the title/subtitle tap for session history. The
+  /// built-in VibeAgent uses it for model selection. Avatar taps remain the
+  /// identity/profile route in both cases.
   @objc private func handleTitlePressed() {
     if selectionModeActive {
       chatListView.clearMessageSelection()
@@ -5195,6 +5201,8 @@ public final class ChatMainView: UIView,
     guard currentPage == .chat else { return }
     if !bridgeProvider.isEmpty {
       onNativeEvent(["type": "agentSessionPressed", "provider": bridgeProvider])
+    } else if builtInAgentChatMode {
+      onNativeEvent(["type": "agentModelPressed"])
     } else {
       onNativeEvent(["type": "headerAvatarPressed"])
     }

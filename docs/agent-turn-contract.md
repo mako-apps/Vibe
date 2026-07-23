@@ -85,6 +85,21 @@ the same agent when attached to a group or channel. Internal builder workers and
 the legacy one-per-room GroupAgent use their own runtime configuration and are
 not changed by an agent owner's selection.
 
+The built-in VibeAgent chat keeps its own device-persisted selection from the
+same server registry. Every normal `message` channel payload includes the exact
+`model_provider` and `model_id`; the channel validates the pair before
+truncating history, creating a conversation, or storing the user message.
+Its visible header title is the registry model name. The subtitle is deliberately
+bounded to `Thinking…`, `Working…`, `Typing…`, or `Ready`, never an arbitrary
+tool or node description.
+
+Agentic events expose that lifecycle as both `activityState` and
+`activity_state`: `chunk` is `typing`, `progress` is `working`, and terminal
+`done`/`error` is `ready`. Visible progress and node labels are whitespace
+normalized to one line and capped at 32 grapheme clusters with a trailing
+ellipsis. Detailed tool results and other non-display payload fields remain
+unchanged.
+
 Standalone invoke responses also carry `status` (`completed` or
 `waiting_for_user`) and `agent_turn_id`; the same turn id is copied into every
 finalized output part.

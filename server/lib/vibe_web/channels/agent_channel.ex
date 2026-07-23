@@ -11,6 +11,7 @@ defmodule VibeWeb.AgentChannel do
   alias Vibe.AI.Agent
   alias Vibe.AI.AgentBuilder
   alias Vibe.AI.AgenticEventShape
+  alias Vibe.AI.ModelRegistry
   alias Vibe.AI.StandaloneAgent
   alias Vibe.AgentConversation
 
@@ -38,80 +39,13 @@ defmodule VibeWeb.AgentChannel do
   Handle incoming messages to the AI agent.
   """
   def handle_in("message", %{"text" => text} = params, socket) do
-    images = params["images"] || []
-    conversation_id = params["conversation_id"] || socket.assigns[:active_conversation_id]
-    user_id = socket.assigns[:user_id]
-    truncate_id = params["truncate_at_id"]
+    case ModelRegistry.resolve_selection(params) do
+      {:ok, model_selection} ->
+        handle_message(text, params, model_selection, socket)
 
-    # Handle truncation if requested (for regeneration)
-    if truncate_id && conversation_id do
-      AgentConversation.truncate_history(conversation_id, user_id, truncate_id)
+      {:error, _reason} ->
+        {:reply, {:error, %{reason: "invalid_model_selection"}}, socket}
     end
-
-    # Get or create conversation
-    {conv_id, history} = get_or_create_conversation(user_id, conversation_id, text)
-
-    # Store conversation ID in socket
-    socket =
-      socket
-      |> assign(:active_conversation_id, conv_id)
-      |> reset_stream_ui_state()
-
-    # Acknowledge receipt with conversation ID
-    push(socket, "ack", %{status: "processing", conversation_id: conv_id})
-
-    # Add user message to database
-    AgentConversation.add_message(conv_id, %{
-      "role" => "user",
-      "content" => text,
-      "images" => images
-    })
-
-    # Start async task for AI response
-    channel_pid = self()
-
-    Task.start(fn ->
-      # Create placeholder assistant message
-      {:ok, _conv} =
-        AgentConversation.add_message(conv_id, %{
-          "role" => "assistant",
-          "content" => "",
-          "isStreaming" => true
-        })
-
-      callback = streaming_callback(channel_pid, conv_id)
-
-      case Agent.stream_response(text, callback,
-             history: history,
-             images: images,
-             user_id: user_id
-           ) do
-        {:ok, full_response, runtime_state} ->
-          # Update the assistant message in database
-          send(channel_pid, {:finalize_message, conv_id, full_response})
-
-          send(
-            channel_pid,
-            {:push, "done",
-             %{
-               success: true,
-               conversation_id: conv_id,
-               status: Map.get(runtime_state, :terminal_status, "completed")
-             }}
-          )
-
-        {:ok, full_response} ->
-          # Update the assistant message in database
-          send(channel_pid, {:finalize_message, conv_id, full_response})
-          send(channel_pid, {:push, "done", %{success: true, conversation_id: conv_id}})
-
-        {:error, reason} ->
-          Logger.error("Agent error: #{inspect(reason)}")
-          send(channel_pid, {:push, "error", %{message: to_string(reason)}})
-      end
-    end)
-
-    {:noreply, socket}
   end
 
   def handle_in("builder_ui_response", %{"ui_response" => ui_response} = params, socket)
@@ -288,8 +222,13 @@ defmodule VibeWeb.AgentChannel do
   end
 
   def handle_info({:push, "error", payload}, socket) do
-    push(socket, "error", payload)
+    push(socket, "error", AgenticEventShape.enrich("error", payload))
     {:noreply, reset_stream_ui_state(socket)}
+  end
+
+  def handle_info({:push, "done", payload}, socket) do
+    push(socket, "done", AgenticEventShape.enrich("done", payload))
+    {:noreply, socket}
   end
 
   def handle_info({:push, event, payload}, socket) do
@@ -354,6 +293,85 @@ defmodule VibeWeb.AgentChannel do
   end
 
   # Private helpers
+
+  defp handle_message(text, params, model_selection, socket) do
+    images = params["images"] || []
+    conversation_id = params["conversation_id"] || socket.assigns[:active_conversation_id]
+    user_id = socket.assigns[:user_id]
+    truncate_id = params["truncate_at_id"]
+
+    # Handle truncation if requested (for regeneration)
+    if truncate_id && conversation_id do
+      AgentConversation.truncate_history(conversation_id, user_id, truncate_id)
+    end
+
+    # Get or create conversation
+    {conv_id, history} = get_or_create_conversation(user_id, conversation_id, text)
+
+    # Store conversation ID in socket
+    socket =
+      socket
+      |> assign(:active_conversation_id, conv_id)
+      |> reset_stream_ui_state()
+
+    # Acknowledge receipt with conversation ID
+    push(socket, "ack", %{status: "processing", conversation_id: conv_id})
+
+    # Add user message to database
+    AgentConversation.add_message(conv_id, %{
+      "role" => "user",
+      "content" => text,
+      "images" => images
+    })
+
+    # Start async task for AI response
+    channel_pid = self()
+
+    Task.start(fn ->
+      # Create placeholder assistant message
+      {:ok, _conv} =
+        AgentConversation.add_message(conv_id, %{
+          "role" => "assistant",
+          "content" => "",
+          "isStreaming" => true
+        })
+
+      callback = streaming_callback(channel_pid, conv_id)
+
+      case Agent.stream_response(text, callback,
+             history: history,
+             images: images,
+             user_id: user_id,
+             model_provider: model_selection.provider,
+             model_id: model_selection.model_id
+           ) do
+        {:ok, full_response, runtime_state} ->
+          # Update the assistant message in database
+          send(channel_pid, {:finalize_message, conv_id, full_response})
+
+          send(
+            channel_pid,
+            {:push, "done",
+             %{
+               success: true,
+               conversation_id: conv_id,
+               status: Map.get(runtime_state, :terminal_status, "completed")
+             }}
+          )
+
+        {:ok, full_response} ->
+          # Update the assistant message in database
+          send(channel_pid, {:finalize_message, conv_id, full_response})
+          send(channel_pid, {:push, "done", %{success: true, conversation_id: conv_id}})
+
+        {:error, reason} ->
+          Logger.error("Agent error: #{inspect(reason)}")
+          send(channel_pid, {:push, "error", %{message: to_string(reason)}})
+      end
+    end)
+
+    {:noreply, socket}
+  end
 
   defp get_or_create_conversation(user_id, nil, first_message) do
     # Create new conversation with placeholder title

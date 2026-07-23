@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SwiftUI
 import UIKit
 
 final class ChatNativeAgentRegistry {
@@ -119,12 +120,18 @@ private struct ChatNativeAgentPersistedState: Codable {
 }
 
 private enum ChatNativeAgentPendingSend {
-  case message(conversationId: String, text: String, truncateAtId: String?)
+  case message(
+    conversationId: String,
+    text: String,
+    truncateAtId: String?,
+    modelProvider: String,
+    modelId: String
+  )
   case builderUiResponse(conversationId: String, uiResponse: [String: Any], summary: String?)
 
   var conversationId: String {
     switch self {
-    case .message(let conversationId, _, _):
+    case .message(let conversationId, _, _, _, _):
       return conversationId
     case .builderUiResponse(let conversationId, _, _):
       return conversationId
@@ -133,11 +140,13 @@ private enum ChatNativeAgentPendingSend {
 
   func withConversationId(_ updatedConversationId: String) -> ChatNativeAgentPendingSend {
     switch self {
-    case .message(_, let text, let truncateAtId):
+    case .message(_, let text, let truncateAtId, let modelProvider, let modelId):
       return .message(
         conversationId: updatedConversationId,
         text: text,
-        truncateAtId: truncateAtId
+        truncateAtId: truncateAtId,
+        modelProvider: modelProvider,
+        modelId: modelId
       )
     case .builderUiResponse(_, let uiResponse, let summary):
       return .builderUiResponse(
@@ -295,6 +304,12 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
   /// send/stop button.
   public var onStreamingStateChanged: ((Bool) -> Void)?
 
+  /// The visible built-in chat header is owned by the host, while this headless
+  /// transport owns the selected model and turn lifecycle.
+  public var onHeaderStateChanged: ((String, String) -> Void)? {
+    didSet { notifyHeaderStateChanged() }
+  }
+
   /// When true, this view is only the agent socket + row source for a host
   /// (`ChatMainView`). Skip local message rendering, full-screen layout work,
   /// and expensive blur effects so opening Vibe AI does not double the memory
@@ -366,9 +381,21 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
   private var builderLatestSecret: String?
   private var cachedAgentSecrets: [String: String] = [:]
   private var registeredSurfaceId: String = ""
+  private var modelRegistry: ChatAgentModelRegistry = .fallback
+  private var selectedModelProvider = ChatAgentModelRegistry.fallback.defaultProvider
+  private var selectedModelId = ChatAgentModelRegistry.fallback.defaultModelId
+  private var hasExplicitModelSelection = false
+  private var modelRegistryLoadInFlight = false
+  private var modelRegistryLoadCompleted = false
+  private var modelRegistryLoadWaiters: [() -> Void] = []
+  private var headerActivityState = "ready"
 
   private static let fallbackApiBaseURL = "https://api.vibegram.io"
   private static let persistenceKey = "vibe.native.agent.screen.v1"
+  private static let modelProviderPersistenceKey = "vibe.native.agent.model-provider.v1"
+  private static let modelIdPersistenceKey = "vibe.native.agent.model-id.v1"
+  private static let modelSelectionExplicitPersistenceKey =
+    "vibe.native.agent.model-selection-explicit.v1"
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -379,6 +406,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     setupHeader()
     setupPages()
     applyPersistedState()
+    applyPersistedModelSelection()
     applyAppearance([:])
     refreshHeader(animated: false)
     refreshHistoryList()
@@ -404,6 +432,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     if window != nil {
       transportEnabled = true
       connectIfNeeded()
+      loadModelRegistryIfNeeded()
       if let activeConversationId, conversation(for: activeConversationId)?.messages.isEmpty == true
       {
         loadConversation(id: activeConversationId)
@@ -570,6 +599,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
   func synchronizeHostState() {
     rebuildChatRows(scrollToBottom: false, animated: false)
     onStreamingStateChanged?(streamingConversationId != nil)
+    notifyHeaderStateChanged()
   }
 
   func handleHostEvent(_ event: [String: Any]) {
@@ -584,6 +614,31 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
   func setBuilderLatestSecret(_ latestSecret: String?) {
     builderLatestSecret = Self.normalizedString(latestSecret)
     cacheBuilderSecretIfPossible()
+  }
+
+  func presentModelPicker(from presenter: UIViewController) {
+    loadModelRegistryIfNeeded { [weak self, weak presenter] in
+      guard let self, let presenter else { return }
+      let picker = ChatProviderModelPickerView(
+        registry: self.modelRegistry,
+        currentProviderId: self.selectedModelProvider,
+        currentModelId: self.selectedModelId
+      ) { [weak self] providerId, modelId, completion in
+        guard let self else {
+          completion(false)
+          return
+        }
+        self.applyModelSelection(providerId: providerId, modelId: modelId, persist: true)
+        completion(true)
+      }
+      let host = UIHostingController(
+        rootView: NavigationStack {
+          picker
+        }
+      )
+      host.modalPresentationStyle = .pageSheet
+      presenter.present(host, animated: true)
+    }
   }
 
   func submitText(_ rawText: String, userMessageId: String? = nil) {
@@ -619,7 +674,9 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
         .message(
           conversationId: conversationId,
           text: text,
-          truncateAtId: serverTruncateAtId
+          truncateAtId: serverTruncateAtId,
+          modelProvider: selectedModelProvider,
+          modelId: selectedModelId
         ))
     }
   }
@@ -679,6 +736,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
 
     streamingConversationId = conversationId
     notifyStreamingStateChanged()
+    setHeaderActivityState(fallback: "thinking")
     currentSpacerHeight = 0.0
     persistState()
     refreshHistoryList()
@@ -1127,7 +1185,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
   }
 
   private func refreshHeader(animated: Bool) {
-    let title = currentPage == .chat ? "Vibe AI" : "History"
+    let title = currentPage == .chat ? selectedModelDisplayTitle : "History"
     let backSymbol = "chevron.left"
     let actionSymbol = currentPage == .chat ? "clock" : "plus"
     let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
@@ -1337,6 +1395,161 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     return (apiBaseURL, token, userId)
   }
 
+  private func loadModelRegistryIfNeeded(completion: (() -> Void)? = nil) {
+    if let completion {
+      modelRegistryLoadWaiters.append(completion)
+    }
+    if modelRegistryLoadCompleted {
+      flushModelRegistryLoadWaiters()
+      return
+    }
+    guard !modelRegistryLoadInFlight, let config = resolveAPIConfig() else {
+      if !modelRegistryLoadInFlight {
+        flushModelRegistryLoadWaiters()
+      }
+      return
+    }
+
+    modelRegistryLoadInFlight = true
+    ChatAgentModelRegistryService.load(
+      apiBaseURL: config.apiBaseURL,
+      token: config.token
+    ) { [weak self] registry in
+      guard let self else { return }
+      self.modelRegistryLoadInFlight = false
+      self.modelRegistryLoadCompleted = true
+      self.modelRegistry = registry
+      self.resolveModelSelectionAgainstRegistry()
+      self.flushModelRegistryLoadWaiters()
+    }
+  }
+
+  private func flushModelRegistryLoadWaiters() {
+    let waiters = modelRegistryLoadWaiters
+    modelRegistryLoadWaiters.removeAll()
+    waiters.forEach { $0() }
+  }
+
+  private func applyPersistedModelSelection() {
+    guard
+      let provider = Self.normalizedString(
+        UserDefaults.standard.string(forKey: Self.modelProviderPersistenceKey)),
+      let modelId = Self.normalizedString(
+        UserDefaults.standard.string(forKey: Self.modelIdPersistenceKey))
+    else {
+      UserDefaults.standard.set(
+        selectedModelProvider,
+        forKey: Self.modelProviderPersistenceKey)
+      UserDefaults.standard.set(selectedModelId, forKey: Self.modelIdPersistenceKey)
+      UserDefaults.standard.set(
+        false,
+        forKey: Self.modelSelectionExplicitPersistenceKey)
+      return
+    }
+    selectedModelProvider = provider
+    selectedModelId = modelId
+    hasExplicitModelSelection = UserDefaults.standard.bool(
+      forKey: Self.modelSelectionExplicitPersistenceKey)
+  }
+
+  private func resolveModelSelectionAgainstRegistry() {
+    if hasExplicitModelSelection,
+      let provider = modelRegistry.provider(id: selectedModelProvider),
+      provider.available,
+      let model = modelRegistry.model(providerId: provider.id, modelId: selectedModelId)
+    {
+      applyModelSelection(providerId: provider.id, modelId: model.id, persist: false)
+      return
+    }
+
+    let defaultProvider =
+      modelRegistry.provider(id: modelRegistry.defaultProvider).flatMap {
+        $0.available ? $0 : nil
+      }
+      ?? modelRegistry.providers.first(where: \.available)
+      ?? modelRegistry.providers.first
+    guard let defaultProvider else { return }
+    let defaultModel =
+      modelRegistry.model(
+        providerId: defaultProvider.id,
+        modelId: modelRegistry.defaultModelId)
+      ?? defaultProvider.models.first(where: \.recommended)
+      ?? defaultProvider.models.first
+    guard let defaultModel else { return }
+    applyModelSelection(
+      providerId: defaultProvider.id,
+      modelId: defaultModel.id,
+      persist: true,
+      explicit: false
+    )
+  }
+
+  private func applyModelSelection(
+    providerId: String,
+    modelId: String,
+    persist: Bool,
+    explicit: Bool = true
+  ) {
+    guard
+      let provider = modelRegistry.provider(id: providerId),
+      provider.available,
+      let model = modelRegistry.model(providerId: provider.id, modelId: modelId)
+    else {
+      return
+    }
+    selectedModelProvider = provider.id
+    selectedModelId = model.id
+    if persist {
+      hasExplicitModelSelection = explicit
+      UserDefaults.standard.set(provider.id, forKey: Self.modelProviderPersistenceKey)
+      UserDefaults.standard.set(model.id, forKey: Self.modelIdPersistenceKey)
+      UserDefaults.standard.set(
+        explicit,
+        forKey: Self.modelSelectionExplicitPersistenceKey)
+    }
+    refreshHeader(animated: true)
+    notifyHeaderStateChanged()
+  }
+
+  private var selectedModelDisplayTitle: String {
+    modelRegistry.model(providerId: selectedModelProvider, modelId: selectedModelId)?.name
+      ?? ChatAgentModelRegistry.fallback.model(
+        providerId: selectedModelProvider,
+        modelId: selectedModelId
+      )?.name
+      ?? selectedModelId
+  }
+
+  private func setHeaderActivityState(
+    from payload: [String: Any]? = nil,
+    fallback: String
+  ) {
+    let serverState = Self.normalizedString(
+      payload?["activityState"] ?? payload?["activity_state"]
+    )?.lowercased()
+    let nextState: String
+    switch serverState {
+    case "thinking", "working", "typing", "ready":
+      nextState = serverState ?? fallback
+    default:
+      nextState = fallback
+    }
+    guard headerActivityState != nextState else { return }
+    headerActivityState = nextState
+    notifyHeaderStateChanged()
+  }
+
+  private func notifyHeaderStateChanged() {
+    let subtitle: String
+    switch headerActivityState {
+    case "thinking": subtitle = "Thinking…"
+    case "working": subtitle = "Working…"
+    case "typing": subtitle = "Typing…"
+    default: subtitle = "Ready"
+    }
+    onHeaderStateChanged?(selectedModelDisplayTitle, subtitle)
+  }
+
   private func handlePhoenixFrame(_ frame: ChatPhoenixClient.EventFrame) {
     if frame.event == "phx_reply", let ref = frame.ref {
       let status = (frame.payload["status"] as? String) ?? "error"
@@ -1348,11 +1561,16 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
 
     guard frame.topic == topic else { return }
 
+    if frame.payload["activityState"] != nil || frame.payload["activity_state"] != nil {
+      setHeaderActivityState(from: frame.payload, fallback: headerActivityState)
+    }
+
     switch frame.event {
     case "chunk":
       let text = (frame.payload["text"] as? String) ?? ""
       NSLog("[ChatNativeAgent] chunk received len=%d total_segments=%d", text.count, conversation(for: streamingConversationId ?? activeConversationId ?? "")?.messages.last?.streamSegments.count ?? 0)
       scheduleStreamingTimeout()
+      setHeaderActivityState(from: frame.payload, fallback: "typing")
       appendChunk(text)
     case "progress":
       let label =
@@ -1361,6 +1579,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
       let status = (frame.payload["status"] as? String) ?? "running"
       NSLog("[ChatNativeAgent] progress tool=%@ status=%@ label=%@", tool ?? "nil", status, label)
       scheduleStreamingTimeout()
+      setHeaderActivityState(from: frame.payload, fallback: "working")
 
       guard let conversationId = streamingConversationId ?? activeConversationId else { break }
       updateConversation(conversationId) { conversation in
@@ -1392,6 +1611,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     case "subagent":
       NSLog("[ChatNativeAgent] subagent event=%@", (frame.payload["event"] as? String) ?? "unknown")
       scheduleStreamingTimeout()
+      setHeaderActivityState(from: frame.payload, fallback: "working")
       handleSubagentEvent(frame.payload)
     case "agent_cards":
       scheduleStreamingTimeout()
@@ -1411,11 +1631,13 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
         applyAcknowledgedConversationId(conversationId)
       }
     case "done":
+      setHeaderActivityState(from: frame.payload, fallback: "ready")
       finishStreaming(
         fallbackText: nil,
         forceErrorText: false
       )
     case "error":
+      setHeaderActivityState(from: frame.payload, fallback: "ready")
       let message = (frame.payload["message"] as? String)?.trimmingCharacters(
         in: .whitespacesAndNewlines)
       finishStreaming(
@@ -1789,6 +2011,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
 
     streamingConversationId = conversationId
     notifyStreamingStateChanged()
+    setHeaderActivityState(fallback: "thinking")
     currentSpacerHeight = 0.0
     persistState()
     refreshHistoryList()
@@ -1803,7 +2026,9 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
         .message(
           conversationId: conversationId,
           text: userText,
-          truncateAtId: assistantMessageId
+          truncateAtId: assistantMessageId,
+          modelProvider: selectedModelProvider,
+          modelId: selectedModelId
         ))
     }
   }
@@ -1834,11 +2059,19 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     }
   }
 
-  private func pushMessage(text: String, conversationId: String, truncateAtId: String?) {
+  private func pushMessage(
+    text: String,
+    conversationId: String,
+    truncateAtId: String?,
+    modelProvider: String? = nil,
+    modelId: String? = nil
+  ) {
     var payload: [String: Any] = [
       "text": text,
       "images": [],
       "conversation_id": conversationId,
+      "model_provider": modelProvider ?? selectedModelProvider,
+      "model_id": modelId ?? selectedModelId,
     ]
     if let truncateAtId, !truncateAtId.isEmpty {
       payload["truncate_at_id"] = truncateAtId
@@ -1856,11 +2089,19 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     pendingSends.removeAll()
     for pending in queued {
       switch pending {
-      case .message(let conversationId, let text, let truncateAtId):
+      case .message(
+        let conversationId,
+        let text,
+        let truncateAtId,
+        let modelProvider,
+        let modelId
+      ):
         pushMessage(
           text: text,
           conversationId: conversationId,
-          truncateAtId: truncateAtId
+          truncateAtId: truncateAtId,
+          modelProvider: modelProvider,
+          modelId: modelId
         )
 
       case .builderUiResponse(let conversationId, let uiResponse, let summary):
@@ -1960,6 +2201,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     markUserMessageFailed: Bool? = nil
   ) {
     streamingTimeoutWorkItem?.cancel()
+    setHeaderActivityState(fallback: "ready")
 
     guard let conversationId = streamingConversationId ?? activeConversationId else {
       NSLog("[ChatNativeAgent] finishStreaming: no active conversation")
@@ -2372,27 +2614,14 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
         }
       }
 
-      if isActiveStreaming && trimmedContent.isEmpty {
-        entries.append(
-          ChatNativeAgentRenderEntry(
-            id: "\(message.id)-thinking",
-            messageId: message.id,
-            role: .assistant,
-            text: "Thinking...",
-            timestampMs: max(message.timestampMs, Self.nowMs()),
-            messageType: "agent_progress_tree",
-            isStreaming: false,
-            isAgentMessage: true,
-            showTail: false,
-            progressNodes: [
-              ["id": "\(message.id)-thinking", "label": "Thinking...", "status": "running", "depth": 0]
-            ],
-            agentCard: nil,
-            actionSourceMessageId: nil,
-            actionSourceText: nil
-          ))
-        continue
-      }
+      // No placeholder "Thinking…" bubble. A streaming assistant turn with nothing
+      // renderable yet (no text, no running tool step, no cards) emits NO row — the cell
+      // is born only when real content arrives, and then it grows with the stream. The
+      // old full-width "Thinking…" shell was large and empty, and the moment the first
+      // chunk landed it re-measured and shifted the layout. Tool activity is unaffected:
+      // a running-progress segment makes `hasRenderableSegments` true above, so it still
+      // renders through appendSegmentedEntries. The guard below drops the empty turn.
+      if isActiveStreaming && trimmedContent.isEmpty { continue }
 
       guard !trimmedContent.isEmpty || message.role == .user else { continue }
 

@@ -3198,90 +3198,14 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
   // MARK: - Model registry
 
   private func loadModelRegistry(completion: @escaping (ChatAgentModelRegistry) -> Void) {
-    guard let url = apiRequestURL(path: "/api/agents/model_registry") else {
+    guard let apiContext else {
       completion(.fallback)
       return
     }
-    var request = URLRequest(url: url)
-    request.httpMethod = "GET"
-    apiHeaders(&request)
-
-    let task = ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
-      data, response, error in
-      DispatchQueue.main.async {
-        guard
-          error == nil,
-          (200..<300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
-          let data,
-          let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-          let registry = Self.parseModelRegistry(payload)
-        else {
-          completion(.fallback)
-          return
-        }
-        completion(registry)
-      }
-    }
-    task.resume()
-  }
-
-  private static func parseModelRegistry(
-    _ payload: [String: Any]
-  ) -> ChatAgentModelRegistry? {
-    guard
-      let defaultSelection = payload["default"] as? [String: Any],
-      let defaultProvider =
-        chatNativeAgentNormalizedString(defaultSelection["provider"]),
-      let defaultModelId =
-        chatNativeAgentNormalizedString(
-          defaultSelection["modelId"] ?? defaultSelection["model_id"]),
-      let rawProviders = payload["providers"] as? [[String: Any]]
-    else {
-      return nil
-    }
-
-    let providers: [ChatAgentModelProviderInfo] = rawProviders.compactMap { rawProvider in
-      guard
-        let id = chatNativeAgentNormalizedString(rawProvider["id"]),
-        let rawModels = rawProvider["models"] as? [[String: Any]]
-      else {
-        return nil
-      }
-      let models: [ChatAgentModelInfo] = rawModels.compactMap { rawModel in
-        guard let modelId = chatNativeAgentNormalizedString(rawModel["id"]) else {
-          return nil
-        }
-        return ChatAgentModelInfo(
-          id: modelId,
-          name: chatNativeAgentNormalizedString(rawModel["name"]) ?? modelId,
-          description: chatNativeAgentNormalizedString(rawModel["description"]) ?? "",
-          tier: chatNativeAgentNormalizedString(rawModel["tier"]) ?? "",
-          recommended: chatNativeAgentBoolean(rawModel["recommended"]) ?? false
-        )
-      }
-      let providerName: String
-      switch id.lowercased() {
-      case "anthropic":
-        providerName = "Anthropic"
-      case "openai":
-        providerName = "OpenAI"
-      default:
-        providerName = chatNativeAgentNormalizedString(rawProvider["name"]) ?? id
-      }
-      return ChatAgentModelProviderInfo(
-        id: id,
-        name: providerName,
-        available: chatNativeAgentBoolean(rawProvider["available"]) ?? false,
-        models: models
-      )
-    }
-
-    guard !providers.isEmpty else { return nil }
-    return ChatAgentModelRegistry(
-      defaultProvider: defaultProvider,
-      defaultModelId: defaultModelId,
-      providers: providers,
-      isFallback: false
+    ChatAgentModelRegistryService.load(
+      apiBaseURL: apiContext.apiBaseURL,
+      token: apiContext.token,
+      completion: completion
     )
   }
 
