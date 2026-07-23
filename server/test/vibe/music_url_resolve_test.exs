@@ -3,6 +3,7 @@ defmodule Vibe.MusicUrlResolveTest do
 
   alias Vibe.AI.Tools.Music
   alias Vibe.AI.Tools.YtDlp
+  alias Vibe.MusicCache
 
   test "music_page_url? detects SoundCloud and YouTube" do
     assert YtDlp.music_page_url?("https://soundcloud.com/artist/track-name")
@@ -30,5 +31,17 @@ defmodule Vibe.MusicUrlResolveTest do
 
   test "search rejects empty params" do
     assert %{error: _} = Music.search(%{})
+  end
+
+  # Regression: yt-dlp reports SoundCloud durations as floats (e.g. 269.485). The
+  # cache column is :integer, so an un-coerced float failed the Ecto cast and aborted
+  # the whole write — leaving no row → /api/music/stream/sc_* 500. coerce_seconds
+  # rounds to whole seconds so the row lands and the track becomes playable.
+  test "coerce_seconds rounds float/string durations to integer" do
+    assert MusicCache.coerce_seconds(269.485) == 269
+    assert MusicCache.coerce_seconds("30.9") == 31
+    assert MusicCache.coerce_seconds(42) == 42
+    assert MusicCache.coerce_seconds(nil) == nil
+    assert MusicCache.coerce_seconds(:bogus) == nil
   end
 end

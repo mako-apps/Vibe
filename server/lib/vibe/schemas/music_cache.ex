@@ -125,7 +125,7 @@ defmodule Vibe.MusicCache do
           artist: artist,
           album: track[:album] || track["album"],
           duration: track[:duration] || track["duration"],
-          duration_seconds: track[:duration_seconds] || track["duration_seconds"],
+          duration_seconds: coerce_seconds(track[:duration_seconds] || track["duration_seconds"]),
           cover_url: track[:cover] || track[:cover_url] || track["cover"],
           stream_url: track[:stream_url] || track[:preview_url] || track["stream_url"],
           stream_expires_at: expires_at,
@@ -155,6 +155,23 @@ defmodule Vibe.MusicCache do
       end
     end)
   end
+
+  # yt-dlp reports durations as floats (e.g. SoundCloud "269.485"), but the column
+  # is :integer — an un-coerced float fails the Ecto cast and silently aborts the
+  # whole cache write (the SoundCloud-stream-500 root cause). Round to whole seconds.
+  @doc false
+  def coerce_seconds(nil), do: nil
+  def coerce_seconds(v) when is_integer(v), do: v
+  def coerce_seconds(v) when is_float(v), do: round(v)
+
+  def coerce_seconds(v) when is_binary(v) do
+    case Float.parse(v) do
+      {f, _} -> round(f)
+      :error -> nil
+    end
+  end
+
+  def coerce_seconds(_), do: nil
 
   @doc """
   Search cache by title and/or artist name.
