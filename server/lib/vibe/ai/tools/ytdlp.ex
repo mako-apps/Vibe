@@ -56,8 +56,11 @@ defmodule Vibe.AI.Tools.YtDlp do
   end
 
   @doc """
-  Get detailed info including stream URL for a specific video.
-  This extracts the actual playable audio URL.
+  Get detailed info including stream URL for a specific video or page URL
+  (YouTube, SoundCloud, and other yt-dlp extractors).
+
+  Returns a stable `video_id` used by `/api/music/stream/:id` plus `webpage_url`
+  so non-YouTube tracks can be re-downloaded without inventing a YouTube URL.
   """
   def get_stream_url(video_id_or_url) do
     url = normalize_url(video_id_or_url)
@@ -71,29 +74,21 @@ defmodule Vibe.AI.Tools.YtDlp do
       "--no-warnings",
       "--extractor-retries", "3",
       "--user-agent", random_user_agent(),
-      "--referer", "https://www.youtube.com/",
+      "--referer", referer_for(url),
       "--add-header", "Accept-Language:en-US,en;q=0.9"
     ]
 
-    args = case get_cookies_path() do
-      nil -> base_args ++ [url]
-      path -> base_args ++ ["--cookies", path, url]
-    end
+    args =
+      case get_cookies_path() do
+        nil -> base_args ++ ["--", url]
+        path -> base_args ++ ["--cookies", path, "--", url]
+      end
 
     case run_ytdlp(args) do
       {:ok, output} ->
-        case Jason.decode(output) do
+        case first_json_object(output) do
           {:ok, data} ->
-            {:ok, %{
-              video_id: data["id"],
-              title: data["title"],
-              artist: data["uploader"] || data["channel"],
-              duration: format_duration(data["duration"]),
-              duration_seconds: data["duration"],
-              cover: data["thumbnail"],
-              stream_url: data["url"],
-              formats: extract_formats(data["formats"])
-            }}
+            {:ok, track_from_ytdlp_data(data, url)}
 
           {:error, _} ->
             {:error, "Failed to parse response"}
@@ -101,6 +96,74 @@ defmodule Vibe.AI.Tools.YtDlp do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  @doc """
+  Resolve a share URL (SoundCloud, YouTube, …) into one playable track card.
+  Same as `get_stream_url/1` but named for the agent music tool path.
+  """
+  def resolve_url(url) when is_binary(url), do: get_stream_url(url)
+  def resolve_url(_), do: {:error, "invalid_url"}
+
+  @doc """
+  True when the string looks like a music page URL the agent should resolve
+  instead of running a YouTube text search.
+  """
+  def music_page_url?(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    with true <- String.starts_with?(trimmed, "http://") or String.starts_with?(trimmed, "https://"),
+         %URI{host: host} when is_binary(host) <- URI.parse(trimmed) do
+      host = String.downcase(host)
+
+      String.contains?(host, "soundcloud.com") or
+        String.contains?(host, "youtube.com") or
+        String.contains?(host, "youtu.be") or
+        String.contains?(host, "music.youtube.com") or
+        String.contains?(host, "on.soundcloud.com") or
+        String.contains?(host, "bandcamp.com") or
+        String.contains?(host, "vimeo.com") or
+        String.contains?(host, "mixcloud.com")
+    else
+      _ -> false
+    end
+  end
+
+  def music_page_url?(_), do: false
+
+  @doc """
+  Best URL to hand yt-dlp for a cached track id (YouTube id, sc_*, or stored webpage).
+  """
+  def download_url_for_track_id(track_id, opts \\ []) when is_binary(track_id) do
+    links = Keyword.get(opts, :links) || %{}
+    source = Keyword.get(opts, :source)
+
+    cond do
+      is_binary(links["webpage_url"]) and links["webpage_url"] != "" ->
+        links["webpage_url"]
+
+      is_binary(links[:webpage_url]) and links[:webpage_url] != "" ->
+        links[:webpage_url]
+
+      is_binary(links["soundcloud"]) and links["soundcloud"] != "" ->
+        links["soundcloud"]
+
+      is_binary(links["youtube"]) and links["youtube"] != "" ->
+        links["youtube"]
+
+      String.starts_with?(track_id, "sc_") ->
+        # Cannot rebuild SoundCloud without cache; callers should pass links.
+        track_id
+
+      String.starts_with?(track_id, "http") ->
+        track_id
+
+      source == "soundcloud" ->
+        track_id
+
+      true ->
+        "https://www.youtube.com/watch?v=#{track_id}"
     end
   end
 
@@ -263,11 +326,117 @@ defmodule Vibe.AI.Tools.YtDlp do
     end)
   end
 
-  defp normalize_url(input) when is_binary(input) do
+  defp track_from_ytdlp_data(data, fallback_url) when is_map(data) do
+    webpage =
+      data["webpage_url"] || data["original_url"] || data["url"] || fallback_url
+
+    extractor =
+      (data["extractor_key"] || data["extractor"] || "generic")
+      |> to_string()
+      |> String.downcase()
+
+    raw_id = to_string(data["id"] || "")
+    source = source_from_extractor(extractor, webpage)
+    video_id = stable_track_id(source, raw_id, webpage)
+    thumbnail = data["thumbnail"] || get_best_thumbnail(data["thumbnails"])
+
+    links =
+      %{
+        "webpage_url" => webpage
+      }
+      |> maybe_put_link(source, webpage)
+
+    %{
+      video_id: video_id,
+      title: data["title"],
+      artist: data["uploader"] || data["channel"] || data["creator"] || data["artist"],
+      duration: format_duration(data["duration"]),
+      duration_seconds: data["duration"],
+      cover: thumbnail,
+      stream_url: data["url"],
+      preview_url: data["url"],
+      formats: extract_formats(data["formats"]),
+      source: source,
+      extractor: extractor,
+      webpage_url: webpage,
+      links: links
+    }
+  end
+
+  defp stable_track_id("youtube", raw_id, _webpage) when raw_id != "", do: raw_id
+
+  defp stable_track_id("soundcloud", raw_id, _webpage) when raw_id != "",
+    do: "sc_" <> raw_id
+
+  defp stable_track_id(_source, raw_id, webpage) when is_binary(webpage) and webpage != "" do
+    hash =
+      :crypto.hash(:sha256, webpage)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 16)
+
+    if raw_id != "", do: "x_#{raw_id}_#{hash}", else: "x_#{hash}"
+  end
+
+  defp stable_track_id(_source, raw_id, _webpage) when raw_id != "", do: "x_#{raw_id}"
+  defp stable_track_id(_, _, _), do: "x_unknown"
+
+  defp source_from_extractor(extractor, webpage) do
     cond do
-      String.starts_with?(input, "http") -> input
-      String.length(input) == 11 -> "https://www.youtube.com/watch?v=#{input}"
-      true -> input
+      String.contains?(extractor, "soundcloud") -> "soundcloud"
+      String.contains?(extractor, "youtube") -> "youtube"
+      is_binary(webpage) and String.contains?(webpage, "soundcloud.com") -> "soundcloud"
+      is_binary(webpage) and (String.contains?(webpage, "youtube.com") or String.contains?(webpage, "youtu.be")) ->
+        "youtube"
+      String.contains?(extractor, "bandcamp") -> "bandcamp"
+      String.contains?(extractor, "vimeo") -> "vimeo"
+      true -> "web"
+    end
+  end
+
+  defp maybe_put_link(links, "soundcloud", url), do: Map.put(links, "soundcloud", url)
+  defp maybe_put_link(links, "youtube", url), do: Map.put(links, "youtube", url)
+  defp maybe_put_link(links, _, _), do: links
+
+  defp first_json_object(output) when is_binary(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.filter(&String.starts_with?(&1, "{"))
+    |> List.first()
+    |> case do
+      nil ->
+        case Jason.decode(output) do
+          {:ok, data} when is_map(data) -> {:ok, data}
+          _ -> {:error, :no_json}
+        end
+
+      line ->
+        Jason.decode(line)
+    end
+  end
+
+  defp referer_for(url) when is_binary(url) do
+    cond do
+      String.contains?(url, "soundcloud.com") -> "https://soundcloud.com/"
+      true -> "https://www.youtube.com/"
+    end
+  end
+
+  defp normalize_url(input) when is_binary(input) do
+    trimmed = String.trim(input)
+
+    cond do
+      String.starts_with?(trimmed, "http") ->
+        trimmed
+
+      String.starts_with?(trimmed, "sc_") ->
+        # Stream endpoint may call us with a SoundCloud cache id; require full URL via cache.
+        trimmed
+
+      String.length(trimmed) == 11 and Regex.match?(~r/^[A-Za-z0-9_-]{11}$/, trimmed) ->
+        "https://www.youtube.com/watch?v=#{trimmed}"
+
+      true ->
+        trimmed
     end
   end
 

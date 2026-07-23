@@ -35,15 +35,24 @@ defmodule Vibe.AI.Agent do
     %{
       name: "search_music",
       description:
-        "Search for music tracks, albums, or artists. Returns streaming links from YouTube Music, Spotify, etc.",
+        "Search for music by name OR resolve a SoundCloud/YouTube (and similar) share URL into a playable audio card the user can listen to in chat. Prefer this whenever the user pastes a music link or asks to play a track.",
       input_schema: %{
         type: "object",
         properties: %{
-          query: %{type: "string", description: "Song name, artist, or album to search for"},
+          query: %{
+            type: "string",
+            description:
+              "Song name, artist, album, lyrics, OR a full music page URL (SoundCloud, YouTube, etc.)"
+          },
+          url: %{
+            type: "string",
+            description:
+              "Optional explicit track page URL (SoundCloud/YouTube). When set, the link is resolved to audio instead of text search."
+          },
           type: %{
             type: "string",
             enum: ["track", "album", "artist"],
-            description: "Type of search"
+            description: "Type of search (ignored for URL resolve)"
           },
           max_results: %{
             type: "integer",
@@ -467,11 +476,12 @@ defmodule Vibe.AI.Agent do
      - WRONG: "Sure, let me search for that..." then tool call
      - CORRECT: Just call the tool directly, no text before it
 
-  2. search_music: Use when user asks for songs, music, artists, or albums.
+  2. search_music: Use when user asks for songs, music, artists, albums, OR pastes a music link.
+     - SOUNDCLOUD / YOUTUBE / music page URLs: pass the full URL as `query` (or `url`). The tool resolves it and the app sends a playable audio card — do this immediately, do not only describe the link.
      - If the user provides lyrics (e.g., "music that says 'some part of music'"), search for the lyrics or the inferred song title.
      - If the user describes a vibe or sound, keyword search for it.
      - Correct typos intelligently (e.g., "tylor swift" → "Taylor Swift").
-     - ALWAYS provide the "query" parameter.
+     - ALWAYS provide the "query" parameter (use the URL itself when they shared a link).
      - RETURN ONE TRACK BY DEFAULT: omit max_results or set it to 1. The user asked for a song, not a list.
      - ASK BEFORE GUESSING: if the request is genuinely ambiguous — several well-known songs, versions (live/remix/cover), or artists could match — call ask_user with concrete options FIRST, instead of searching and dumping several tracks. Only skip the question when the intended track is clear.
      - Only set max_results > 1 when the user EXPLICITLY asks for multiple options, alternatives, "a few", or a playlist.

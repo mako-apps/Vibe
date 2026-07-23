@@ -109,8 +109,10 @@ defmodule VibeWeb.MusicController do
 
   # Get direct stream URL without downloading (for fallback)
   defp get_direct_stream_url(video_id) do
-    case YtDlp.get_stream_url(video_id) do
-      {:ok, %{stream_url: url}} when not is_nil(url) -> {:ok, url}
+    source = resolve_source_url(video_id)
+
+    case YtDlp.get_stream_url(source) do
+      {:ok, %{stream_url: url}} when not is_nil(url) and url != "" -> {:ok, url}
       _ -> {:error, "No stream URL available"}
     end
   end
@@ -129,6 +131,26 @@ defmodule VibeWeb.MusicController do
     end
   end
 
+  # Prefer stored webpage URL (SoundCloud/etc). Fall back to YouTube watch URL.
+  defp resolve_source_url(video_id) do
+    case MusicCache.get_by_video_id(video_id) do
+      %MusicCache{external_links: links, source: source} when is_map(links) ->
+        YtDlp.download_url_for_track_id(video_id, links: stringify_map(links), source: source)
+
+      %MusicCache{source: source} ->
+        YtDlp.download_url_for_track_id(video_id, source: source)
+
+      _ ->
+        YtDlp.download_url_for_track_id(video_id)
+    end
+  end
+
+  defp stringify_map(map) when is_map(map) do
+    Enum.into(map, %{}, fn {k, v} -> {to_string(k), v} end)
+  end
+
+  defp stringify_map(_), do: %{}
+
   defp download_and_upload(video_id) do
     Logger.info("[MusicController] Downloading audio for: #{video_id}")
 
@@ -140,65 +162,97 @@ defmodule VibeWeb.MusicController do
     temp_path = Path.join(@temp_dir, "#{safe_id}.m4a")
     remote_path = "#{safe_id}.m4a"
 
+    source_url = resolve_source_url(video_id)
+
+    if source_url == video_id and String.starts_with?(video_id, "sc_") do
+      Logger.error(
+        "[MusicController] SoundCloud track #{video_id} has no cached webpage_url — resolve via search_music first"
+      )
+
+      {:error, "Missing SoundCloud source URL in cache"}
+    else
+      do_download_and_upload(video_id, source_url, temp_path, remote_path)
+    end
+  end
+
+  defp do_download_and_upload(video_id, source_url, temp_path, remote_path) do
+    Logger.info("[MusicController] yt-dlp download source=#{source_url}")
+
     # Use yt-dlp to download the audio file
     # Use simplified format selector that works across all videos
-    args = [
-      "-f", "ba/b",  # best audio, or best overall if no audio-only
-      "-x",  # Extract audio
-      "--audio-format", "m4a",  # Convert to m4a
-      "--no-playlist",
-      "--no-warnings",
-      "-o", temp_path
-    ] ++ YtDlp.hardening_args() ++ [
-      "--",
-      "https://www.youtube.com/watch?v=#{video_id}"
-    ]
+    args =
+      [
+        "-f",
+        "ba/b",
+        # best audio, or best overall if no audio-only
+        "-x",
+        # Extract audio
+        "--audio-format",
+        "m4a",
+        # Convert to m4a
+        "--no-playlist",
+        "--no-warnings",
+        "-o",
+        temp_path
+      ] ++
+        YtDlp.hardening_args() ++
+        [
+          "--",
+          source_url
+        ]
 
     # Run yt-dlp with timeout
-    task = Task.async(fn ->
-      try do
-        case System.cmd("yt-dlp", args, stderr_to_stdout: true) do
-          {_output, 0} -> {:ok, temp_path}
-          {output, code} ->
-            Logger.warning("[MusicController] yt-dlp exit #{code}: #{String.slice(output, 0, 200)}")
-            {:error, "Download failed with code #{code}"}
+    task =
+      Task.async(fn ->
+        try do
+          case System.cmd("yt-dlp", args, stderr_to_stdout: true) do
+            {_output, 0} ->
+              {:ok, temp_path}
+
+            {output, code} ->
+              Logger.warning(
+                "[MusicController] yt-dlp exit #{code}: #{String.slice(output, 0, 200)}"
+              )
+
+              {:error, "Download failed with code #{code}"}
+          end
+        rescue
+          e -> {:error, "Exception: #{inspect(e)}"}
         end
-      rescue
-        e -> {:error, "Exception: #{inspect(e)}"}
-      end
-    end)
+      end)
 
     # 2 minute timeout for download
-    result = case Task.yield(task, 120_000) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {:ok, path}} ->
-        # Get file size
-        case File.stat(path) do
-          {:ok, stat} ->
-            # Upload to Supabase Storage
-            case SupabaseStorage.upload(path, remote_path) do
-              {:ok, public_url} ->
-                # Save URL to database
-                save_to_database(video_id, public_url, stat.size)
-                # Clean up temp file
-                File.rm(path)
-                {:ok, public_url}
+    result =
+      case Task.yield(task, 120_000) || Task.shutdown(task, :brutal_kill) do
+        {:ok, {:ok, path}} ->
+          # Get file size
+          case File.stat(path) do
+            {:ok, stat} ->
+              # Upload to Supabase Storage
+              case SupabaseStorage.upload(path, remote_path) do
+                {:ok, public_url} ->
+                  # Save URL to database
+                  save_to_database(video_id, public_url, stat.size)
+                  # Clean up temp file
+                  File.rm(path)
+                  {:ok, public_url}
 
-              {:error, reason} ->
-                Logger.error("[MusicController] Supabase upload failed: #{reason}")
-                # Fallback: Keep local file and serve directly for this session
-                {:error, "Supabase upload failed: #{reason}"}
-            end
+                {:error, reason} ->
+                  Logger.error("[MusicController] Supabase upload failed: #{reason}")
+                  # Fallback: Keep local file and serve directly for this session
+                  {:error, "Supabase upload failed: #{reason}"}
+              end
 
-          {:error, reason} ->
-            {:error, "Could not stat file: #{inspect(reason)}"}
-        end
+            {:error, reason} ->
+              {:error, "Could not stat file: #{inspect(reason)}"}
+          end
 
-      {:ok, {:error, reason}} ->
-        {:error, reason}
+        {:ok, {:error, reason}} ->
+          {:error, reason}
 
-      nil ->
-        {:error, "Download timeout"}
-    end
+        nil ->
+          {:error, "Download timeout"}
+      end
 
     # Clean up temp file if it exists
     File.rm(temp_path)

@@ -1,18 +1,14 @@
 defmodule Vibe.AI.Tools.Music do
   @moduledoc """
-  Music search tool using yt-dlp for free, full-length audio streaming.
+  Music search + URL resolve tool using yt-dlp for free, full-length audio streaming.
 
   Architecture:
-  1. Check database cache first (avoids refetching)
-  2. If not cached, use yt-dlp to search YouTube
-  3. Cache results for 6 hours (stream URLs expire)
-  4. Fallback to Deezer for metadata if yt-dlp fails
+  1. If the query is a music page URL (SoundCloud, YouTube, …), resolve it with yt-dlp
+  2. Else check database cache, then YouTube search via yt-dlp
+  3. Cache results (stream URLs expire; playback uses `/api/music/stream/:id`)
+  4. Agent turn pipeline turns tracks into playable `music` rich messages
 
-  This approach:
-  - No API keys needed (yt-dlp is free)
-  - Full audio, not 30-second previews
-  - Server stays light (results are cached)
-  - Non-blocking (yt-dlp runs in async Task)
+  Supported URL hosts include SoundCloud and YouTube (and other yt-dlp extractors).
   """
 
   require Logger
@@ -20,30 +16,100 @@ defmodule Vibe.AI.Tools.Music do
   alias Vibe.MusicCache
   alias Vibe.AI.Tools.YtDlp
 
-  @deezer_api "https://api.deezer.com"
-
   @doc """
-  Search for music across multiple sources.
-  Returns tracks with stream URLs and metadata.
+  Search for music or resolve a share URL into playable track(s).
+
+  Params:
+  - `query` (required for search) — song/artist text **or** a SoundCloud/YouTube URL
+  - `url` (optional) — explicit page URL; takes precedence over query when present
+  - `type` — track | album | artist (search only)
+  - `max_results` — 1..5 (default 1)
   """
-  def search(%{"query" => query} = params) do
-    type = params["type"] || "track"
+  def search(params) when is_map(params) do
+    url = extract_url(params)
+    query = extract_query(params)
     max_results = normalize_max_results(params["max_results"] || params[:max_results])
-    Logger.info("[Music] Searching for: #{query} (type: #{type}, max_results: #{max_results})")
+    type = params["type"] || "track"
 
-    # Step 1: Check cache first
-    result =
-      case check_cache(query) do
-        {:ok, cached_tracks} when cached_tracks != [] ->
-          Logger.info("[Music] Cache hit! Returning #{length(cached_tracks)} cached tracks")
-          format_cached_results(cached_tracks)
+    cond do
+      is_binary(url) ->
+        Logger.info("[Music] Resolving URL: #{url}")
+        resolve_page_url(url)
 
-        _ ->
-          # Step 2: Fresh search with yt-dlp
-          search_fresh(query, type)
-      end
+      is_binary(query) and YtDlp.music_page_url?(query) ->
+        Logger.info("[Music] Resolving music page from query: #{query}")
+        resolve_page_url(String.trim(query))
 
-    limit_tracks(result, max_results)
+      is_binary(query) ->
+        Logger.info("[Music] Searching for: #{query} (type: #{type}, max_results: #{max_results})")
+
+        result =
+          case check_cache(query) do
+            {:ok, cached_tracks} when cached_tracks != [] ->
+              Logger.info("[Music] Cache hit! Returning #{length(cached_tracks)} cached tracks")
+              format_cached_results(cached_tracks)
+
+            _ ->
+              search_fresh(query, type)
+          end
+
+        limit_tracks(result, max_results)
+
+      true ->
+        Logger.error("[Music] Called with invalid params: #{inspect(params)}")
+        %{error: "Missing search query or url"}
+    end
+  end
+
+  def search(params) do
+    Logger.error("[Music] Called with invalid params: #{inspect(params)}")
+    %{error: "Missing search query"}
+  end
+
+  # ── URL resolve (SoundCloud / YouTube / …) ──────────────────────────────
+
+  defp resolve_page_url(url) do
+    case YtDlp.resolve_url(url) do
+      {:ok, track} ->
+        Logger.info(
+          "[Music] Resolved #{track[:source]} track=#{track[:video_id]} title=#{inspect(track[:title])}"
+        )
+
+        spawn(fn -> cache_results(url, [track], track[:source] || "web") end)
+        format_resolved_track(track)
+
+      {:error, reason} ->
+        Logger.error("[Music] URL resolve failed: #{inspect(reason)}")
+
+        %{
+          error:
+            "Could not load audio from that link. Supported: SoundCloud, YouTube, and other yt-dlp music pages."
+        }
+    end
+  end
+
+  defp format_resolved_track(track) when is_map(track) do
+    formatted = %{
+      video_id: track[:video_id] || track[:id],
+      title: track[:title],
+      artist: track[:artist],
+      album: track[:album],
+      duration: track[:duration],
+      duration_seconds: track[:duration_seconds],
+      preview_url: track[:stream_url] || track[:preview_url],
+      cover: track[:cover],
+      links: track[:links] || %{}
+    }
+
+    source = track[:source] || "web"
+
+    %{
+      source: source,
+      count: 1,
+      primary: formatted,
+      alternatives: [],
+      tracks: [formatted]
+    }
   end
 
   # Default to a single best match; the agent opts into more only when the user
@@ -51,12 +117,17 @@ defmodule Vibe.AI.Tools.Music do
   defp normalize_max_results(value) do
     n =
       cond do
-        is_integer(value) -> value
-        is_binary(value) -> case Integer.parse(value) do
+        is_integer(value) ->
+          value
+
+        is_binary(value) ->
+          case Integer.parse(value) do
             {i, _} -> i
             :error -> 1
           end
-        true -> 1
+
+        true ->
+          1
       end
 
     n |> max(1) |> min(5)
@@ -70,16 +141,33 @@ defmodule Vibe.AI.Tools.Music do
 
   defp limit_tracks(result, _max_results), do: result
 
-  # Handle missing query parameter
-  def search(params) do
-    Logger.error("[Music] Called with invalid params: #{inspect(params)}")
-    %{error: "Missing search query"}
+  defp extract_url(params) do
+    raw = params["url"] || params[:url] || params["link"] || params[:link]
+
+    case normalize_string(raw) do
+      nil -> nil
+      value -> if YtDlp.music_page_url?(value) or String.starts_with?(value, "http"), do: value
+    end
   end
+
+  defp extract_query(params) do
+    normalize_string(params["query"] || params[:query])
+  end
+
+  defp normalize_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_string(_), do: nil
 
   # Check database cache for this query
   defp check_cache(query) do
     try do
       cached = MusicCache.get_cached(query)
+
       if cached != [] do
         {:ok, cached}
       else
@@ -104,7 +192,7 @@ defmodule Vibe.AI.Tools.Music do
         Logger.info("[Music] yt-dlp returned #{length(tracks)} results (fast mode)")
 
         # Cache metadata for future requests
-        spawn(fn -> cache_results(query, tracks) end)
+        spawn(fn -> cache_results(query, tracks, "youtube") end)
 
         format_ytdlp_results(tracks)
 
@@ -122,19 +210,18 @@ defmodule Vibe.AI.Tools.Music do
   defp retry_search(query) do
     case YtDlp.search(query, limit: 1) do
       {:ok, tracks} when tracks != [] ->
-        spawn(fn -> cache_results(query, tracks) end)
+        spawn(fn -> cache_results(query, tracks, "youtube") end)
         format_ytdlp_results(tracks)
+
       _ ->
         %{error: "No results found for music query"}
     end
   end
 
-  # Removed Deezer fallback as per user request to avoid 30s previews
-
   # Cache results to database
-  defp cache_results(query, tracks) do
+  defp cache_results(query, tracks, source) do
     try do
-      MusicCache.cache_results(query, tracks, "youtube")
+      MusicCache.cache_results(query, tracks, source || "youtube")
       Logger.info("[Music] Cached #{length(tracks)} tracks for query: #{query}")
     rescue
       e -> Logger.warning("[Music] Failed to cache results: #{inspect(e)}")
@@ -144,54 +231,68 @@ defmodule Vibe.AI.Tools.Music do
   # Format yt-dlp results (handles both flat-playlist and full extraction)
   # Returns primary track first, then alternatives
   defp format_ytdlp_results(tracks) do
-    formatted = Enum.map(tracks, fn track ->
-      video_id = track[:video_id] || track[:id]
+    formatted =
+      Enum.map(tracks, fn track ->
+        video_id = track[:video_id] || track[:id]
+        source = track[:source] || "youtube"
 
-      %{
-        video_id: video_id, # Critical for backend proxy to fetch stream on-demand
-        title: track[:title],
-        artist: track[:artist],
-        album: nil,
-        duration: track[:duration],
-        # For flat-playlist mode, stream_url is nil - will be fetched on-demand via /api/music/stream/:id
-        preview_url: track[:stream_url] || track[:preview_url],
-        cover: track[:cover],
-        links: track[:links] || %{
-          youtube: "https://www.youtube.com/watch?v=#{video_id}",
-          youtube_music: "https://music.youtube.com/watch?v=#{video_id}"
+        links =
+          track[:links] ||
+            %{
+              "webpage_url" => track[:webpage_url] || track[:url] ||
+                "https://www.youtube.com/watch?v=#{video_id}",
+              "youtube" => "https://www.youtube.com/watch?v=#{video_id}",
+              "youtube_music" => "https://music.youtube.com/watch?v=#{video_id}"
+            }
+
+        %{
+          # Critical for backend proxy to fetch stream on-demand
+          video_id: video_id,
+          title: track[:title],
+          artist: track[:artist],
+          album: nil,
+          duration: track[:duration],
+          # For flat-playlist mode, stream_url is nil — fetched via /api/music/stream/:id
+          preview_url: track[:stream_url] || track[:preview_url],
+          cover: track[:cover],
+          links: links,
+          source: source
         }
-      }
-    end)
+      end)
 
     # Split into primary and alternatives
-    {primary, alternatives} = case formatted do
-      [first | rest] -> {first, rest}
-      [] -> {nil, []}
-    end
+    {primary, alternatives} =
+      case formatted do
+        [first | rest] -> {first, rest}
+        [] -> {nil, []}
+      end
 
     %{
       source: "youtube",
       count: length(formatted),
       primary: primary,
       alternatives: alternatives,
-      tracks: formatted  # Keep full list for backwards compatibility
+      # Keep full list for backwards compatibility
+      tracks: formatted
     }
   end
 
   # Format cached results
   defp format_cached_results(cached_tracks) do
-    formatted = Enum.map(cached_tracks, fn track ->
-      %{
-        video_id: track.video_id,
-        title: track.title,
-        artist: track.artist,
-        album: track.album,
-        duration: track.duration,
-        preview_url: track.stream_url || track.preview_url,
-        cover: track.cover_url,
-        links: track.external_links || %{}
-      }
-    end)
+    formatted =
+      Enum.map(cached_tracks, fn track ->
+        %{
+          video_id: track.video_id,
+          title: track.title,
+          artist: track.artist,
+          album: track.album,
+          duration: track.duration,
+          preview_url: track.stream_url || track.preview_url,
+          cover: track.cover_url,
+          links: track.external_links || %{},
+          source: track.source
+        }
+      end)
 
     %{
       source: "cache",
@@ -199,48 +300,4 @@ defmodule Vibe.AI.Tools.Music do
       tracks: formatted
     }
   end
-
-  # Format Deezer results
-  defp format_deezer_results(results) do
-    tracks = Enum.map(results, fn item ->
-      %{
-        title: item["title"] || item["name"],
-        artist: get_in(item, ["artist", "name"]) || item["name"],
-        album: get_in(item, ["album", "title"]),
-        duration: format_duration(item["duration"]),
-        preview_url: item["preview"], # 30-second preview
-        cover: get_in(item, ["album", "cover_medium"]) || item["picture_medium"],
-        links: %{
-          deezer: item["link"],
-          spotify: build_spotify_link(item["title"], get_in(item, ["artist", "name"])),
-          youtube_music: build_ytmusic_link(item["title"], get_in(item, ["artist", "name"]))
-        }
-      }
-    end)
-
-    %{
-      source: "deezer",
-      count: length(tracks),
-      tracks: tracks
-    }
-  end
-
-  defp format_duration(nil), do: nil
-  defp format_duration(seconds) when is_integer(seconds) do
-    minutes = div(seconds, 60)
-    secs = rem(seconds, 60)
-    "#{minutes}:#{String.pad_leading(Integer.to_string(secs), 2, "0")}"
-  end
-
-  defp build_spotify_link(title, artist) when is_binary(title) do
-    query = if artist, do: "#{title} #{artist}", else: title
-    "https://open.spotify.com/search/#{URI.encode(query)}"
-  end
-  defp build_spotify_link(_, _), do: nil
-
-  defp build_ytmusic_link(title, artist) when is_binary(title) do
-    query = if artist, do: "#{title} #{artist}", else: title
-    "https://music.youtube.com/search?q=#{URI.encode(query)}"
-  end
-  defp build_ytmusic_link(_, _), do: nil
 end

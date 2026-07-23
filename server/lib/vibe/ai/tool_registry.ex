@@ -24,7 +24,8 @@ defmodule Vibe.AI.ToolRegistry do
     %{
       id: "search_music",
       name: "Music Search",
-      description: "Find tracks, albums, or artists with streaming links.",
+      description:
+        "Find tracks by name or resolve SoundCloud/YouTube links into playable audio cards.",
       category: "research",
       always_on: false,
       testability: "live_readonly"

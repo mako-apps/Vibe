@@ -670,10 +670,17 @@ defmodule Vibe.AI.StandaloneAgent do
   defp music_output(track, source) when is_map(track) do
     video_id = map_value(track, :video_id) || map_value(track, :videoId)
     preview_url = map_value(track, :preview_url) || map_value(track, :previewUrl)
+    track_source = map_value(track, :source) || source
 
+    # Prefer durable app stream proxy when we have a track id so SoundCloud/YouTube
+    # playback goes through /api/music/stream (cache + re-resolve). Fall back to a
+    # direct extractor URL only when no id is available.
     media_url =
-      normalize_string(preview_url) ||
-        if(is_binary(normalize_string(video_id)), do: public_music_stream_url(video_id))
+      cond do
+        is_binary(normalize_string(video_id)) -> public_music_stream_url(video_id)
+        is_binary(normalize_string(preview_url)) -> normalize_string(preview_url)
+        true -> nil
+      end
 
     if is_binary(media_url) do
       duration = map_value(track, :duration)
@@ -688,7 +695,7 @@ defmodule Vibe.AI.StandaloneAgent do
         "duration" => duration,
         "durationSeconds" => duration_seconds(duration),
         "cover" => map_value(track, :cover),
-        "source" => source,
+        "source" => track_source,
         "links" => map_value(track, :links) || %{}
       }
 
