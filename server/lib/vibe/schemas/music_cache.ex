@@ -60,21 +60,41 @@ defmodule Vibe.MusicCache do
   end
 
   @doc """
-  Get a specific track by video_id.
-  Best for exact lookups when replaying a song.
+  Get a specific track by video_id (identity lookup).
+
+  IMPORTANT: do NOT filter on `stream_expires_at` here. That timestamp only means
+  the *ephemeral extractor stream_url* is stale — the row still holds durable
+  fields we need forever:
+    - `cached_file_path` (Supabase public URL after first successful cache fill)
+    - `external_links["webpage_url"]` (SoundCloud/YouTube page to re-extract)
+    - title / artist / cover
+
+  Filtering on expiry hid SoundCloud `sc_*` rows after ~6h, so
+  `/api/music/stream/:id` lost the webpage URL and 500'd with
+  "Missing SoundCloud source URL in cache".
   """
   def get_by_video_id(video_id) when is_binary(video_id) do
-    now = DateTime.utc_now()
-
     from(m in __MODULE__,
       where: m.video_id == ^video_id,
-      where: is_nil(m.stream_expires_at) or m.stream_expires_at > ^now,
+      order_by: [desc: m.updated_at],
       limit: 1
     )
     |> Repo.one()
   end
 
   def get_by_video_id(_), do: nil
+
+  @doc """
+  True when the ephemeral extractor `stream_url` is still considered fresh.
+  Cached Supabase files (`cached_file_path`) are permanent and ignore this.
+  """
+  def stream_url_fresh?(%__MODULE__{stream_expires_at: nil}), do: true
+
+  def stream_url_fresh?(%__MODULE__{stream_expires_at: expires_at}) do
+    DateTime.compare(expires_at, DateTime.utc_now()) == :gt
+  end
+
+  def stream_url_fresh?(_), do: false
 
   @doc """
   Cache music search results.

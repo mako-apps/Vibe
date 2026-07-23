@@ -111,20 +111,49 @@ defmodule VibeWeb.MusicController do
   defp get_direct_stream_url(video_id) do
     source = resolve_source_url(video_id)
 
-    case YtDlp.get_stream_url(source) do
-      {:ok, %{stream_url: url}} when not is_nil(url) and url != "" -> {:ok, url}
-      _ -> {:error, "No stream URL available"}
+    # Never hand yt-dlp a bare sc_* id — that is not a resolvable page.
+    if is_binary(source) and String.starts_with?(source, "sc_") do
+      Logger.error(
+        "[MusicController] No webpage_url for #{video_id}; cannot extract a direct stream"
+      )
+
+      {:error, "Missing SoundCloud source URL in cache"}
+    else
+      case YtDlp.get_stream_url(source) do
+        {:ok, %{stream_url: url}} when not is_nil(url) and url != "" -> {:ok, url}
+        # Some extractors put the playable URL on the track map root as :stream_url only
+        {:ok, track} when is_map(track) ->
+          url = track[:stream_url] || track[:preview_url] || track["stream_url"] || track["url"]
+
+          if is_binary(url) and url != "" do
+            {:ok, url}
+          else
+            {:error, "No stream URL available"}
+          end
+
+        _ ->
+          {:error, "No stream URL available"}
+      end
     end
   end
 
   # Private functions
 
   defp get_cached_url(video_id) do
-    # Check database for cached entry with Supabase URL
+    # Prefer permanent Supabase cache (survives stream_url expiry).
     case MusicCache.get_by_video_id(video_id) do
-      %MusicCache{cached_file_path: url} when not is_nil(url) and url != "" ->
-        # cached_file_path stores the Supabase public URL
+      %MusicCache{cached_file_path: url} when is_binary(url) and url != "" ->
         {:ok, SupabaseStorage.rewrite_public_url(url)}
+
+      # Fresh ephemeral extractor URL is still usable when we have not yet
+      # uploaded a permanent copy (or upload previously failed).
+      %MusicCache{stream_url: url} = entry
+      when is_binary(url) and url != "" ->
+        if MusicCache.stream_url_fresh?(entry) do
+          {:ok, url}
+        else
+          :not_cached
+        end
 
       _ ->
         :not_cached
@@ -134,11 +163,28 @@ defmodule VibeWeb.MusicController do
   # Prefer stored webpage URL (SoundCloud/etc). Fall back to YouTube watch URL.
   defp resolve_source_url(video_id) do
     case MusicCache.get_by_video_id(video_id) do
-      %MusicCache{external_links: links, source: source} when is_map(links) ->
-        YtDlp.download_url_for_track_id(video_id, links: stringify_map(links), source: source)
+      %MusicCache{external_links: links, source: source, query: query} when is_map(links) ->
+        resolved =
+          YtDlp.download_url_for_track_id(video_id, links: stringify_map(links), source: source)
 
-      %MusicCache{source: source} ->
-        YtDlp.download_url_for_track_id(video_id, source: source)
+        # Last-resort: if the cache row only has the original share URL as `query`
+        # (agent resolved on.soundcloud.com/…), use that rather than bare sc_*.
+        if is_binary(resolved) and String.starts_with?(resolved, "sc_") and
+             is_binary(query) and YtDlp.music_page_url?(query) do
+          query
+        else
+          resolved
+        end
+
+      %MusicCache{source: source, query: query} ->
+        resolved = YtDlp.download_url_for_track_id(video_id, source: source)
+
+        if is_binary(resolved) and String.starts_with?(resolved, "sc_") and
+             is_binary(query) and YtDlp.music_page_url?(query) do
+          query
+        else
+          resolved
+        end
 
       _ ->
         YtDlp.download_url_for_track_id(video_id)
@@ -248,7 +294,8 @@ defmodule VibeWeb.MusicController do
   end
 
   defp save_to_database(video_id, url, size) do
-    # Update or create database entry
+    # Update or create database entry. Permanent Supabase path — clear stream
+    # expiry so future lookups keep treating the row as durable cache.
     now = DateTime.utc_now()
 
     case MusicCache.get_by_video_id(video_id) do
@@ -262,8 +309,12 @@ defmodule VibeWeb.MusicController do
           query_hash: hash_string(video_id),
           cached_file_path: url,
           file_size_bytes: size,
-          cached_at: now
-        }, [:video_id, :title, :query, :query_hash, :cached_file_path, :file_size_bytes, :cached_at])
+          cached_at: now,
+          stream_expires_at: nil
+        }, [
+          :video_id, :title, :query, :query_hash, :cached_file_path,
+          :file_size_bytes, :cached_at, :stream_expires_at
+        ])
         |> Repo.insert()
         |> log_result("Created")
 
@@ -273,8 +324,9 @@ defmodule VibeWeb.MusicController do
         |> Ecto.Changeset.cast(%{
           cached_file_path: url,
           file_size_bytes: size,
-          cached_at: now
-        }, [:cached_file_path, :file_size_bytes, :cached_at])
+          cached_at: now,
+          stream_expires_at: nil
+        }, [:cached_file_path, :file_size_bytes, :cached_at, :stream_expires_at])
         |> Repo.update()
         |> log_result("Updated")
     end
