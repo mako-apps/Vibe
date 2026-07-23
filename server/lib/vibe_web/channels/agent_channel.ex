@@ -43,6 +43,9 @@ defmodule VibeWeb.AgentChannel do
       {:ok, model_selection} ->
         handle_message(text, params, model_selection, socket)
 
+      {:error, :invalid_thinking_level} ->
+        {:reply, {:error, %{reason: "invalid_thinking_level"}}, socket}
+
       {:error, _reason} ->
         {:reply, {:error, %{reason: "invalid_model_selection"}}, socket}
     end
@@ -343,7 +346,8 @@ defmodule VibeWeb.AgentChannel do
              images: images,
              user_id: user_id,
              model_provider: model_selection.provider,
-             model_id: model_selection.model_id
+             model_id: model_selection.model_id,
+             thinking_level: model_selection.thinking_level
            ) do
         {:ok, full_response, runtime_state} ->
           # Update the assistant message in database

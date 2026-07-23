@@ -7,11 +7,17 @@ defmodule Vibe.AI.AgentRuntime do
   @openai_responses_api "https://api.openai.com/v1/responses"
   @default_openai_fallback_model "gpt-5.6-luna"
   @default_openai_reasoning_effort "medium"
+  @adaptive_claude_models [
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5"
+  ]
 
   defmodule Config do
     @enforce_keys [:model, :system_prompt, :tools, :execute_tools]
     defstruct provider: "anthropic",
               model: nil,
+              thinking_level: "medium",
               max_tokens: 1600,
               max_depth: 3,
               system_prompt: nil,
@@ -152,15 +158,7 @@ defmodule Vibe.AI.AgentRuntime do
   end
 
   defp request_claude_completion_stream(messages, %Config{} = config, api_key) do
-    body =
-      Jason.encode!(%{
-        model: config.model,
-        max_tokens: config.max_tokens,
-        system: resolve_system_prompt(config.system_prompt, config.state),
-        tools: config.tools,
-        messages: messages,
-        stream: true
-      })
+    body = messages |> claude_request_payload(config) |> Jason.encode!()
 
     headers = [
       {"content-type", "application/json"},
@@ -380,6 +378,26 @@ defmodule Vibe.AI.AgentRuntime do
   end
 
   @doc false
+  def claude_request_payload(messages, %Config{} = config) do
+    payload = %{
+      "model" => config.model,
+      "max_tokens" => config.max_tokens,
+      "system" => resolve_system_prompt(config.system_prompt, config.state),
+      "tools" => config.tools,
+      "messages" => messages,
+      "stream" => true
+    }
+
+    if config.model in @adaptive_claude_models do
+      payload
+      |> Map.put("thinking", %{"type" => "adaptive"})
+      |> Map.put("output_config", %{"effort" => config.thinking_level})
+    else
+      payload
+    end
+  end
+
+  @doc false
   def openai_request_payload(messages, %Config{} = config) do
     %{
       "model" => openai_model(config),
@@ -387,7 +405,7 @@ defmodule Vibe.AI.AgentRuntime do
       "input" => openai_input(messages),
       "tools" => openai_tools(config.tools),
       "max_output_tokens" => config.max_tokens,
-      "reasoning" => %{"effort" => config.openai_reasoning_effort},
+      "reasoning" => %{"effort" => openai_reasoning_effort(config)},
       "stream" => true,
       "store" => false
     }
@@ -657,6 +675,12 @@ defmodule Vibe.AI.AgentRuntime do
        do: model
 
   defp openai_model(%Config{} = config), do: config.openai_fallback_model
+
+  defp openai_reasoning_effort(%Config{provider: provider, thinking_level: thinking_level})
+       when provider in [:openai, "openai"],
+       do: thinking_level
+
+  defp openai_reasoning_effort(%Config{} = config), do: config.openai_reasoning_effort
 
   defp modern_gpt_family?(model) when is_binary(model) do
     String.starts_with?(model, "gpt-5.5") or String.starts_with?(model, "gpt-5.6")

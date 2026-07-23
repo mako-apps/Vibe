@@ -555,6 +555,7 @@ defmodule Vibe.AI.Agent do
     max_depth = Keyword.get(opts, :max_depth, 3)
     model_provider = Keyword.get(opts, :model_provider, "anthropic")
     model_id = Keyword.get(opts, :model_id, @claude_model)
+    thinking_level = Keyword.get(opts, :thinking_level, "medium")
     tools = filter_tools(enabled_tools)
 
     messages = build_messages(conversation_history, user_message, image_urls)
@@ -564,6 +565,7 @@ defmodule Vibe.AI.Agent do
       %AgentRuntime.Config{
         provider: model_provider,
         model: model_id,
+        thinking_level: thinking_level,
         max_tokens: max_tokens,
         max_depth: max_depth,
         system_prompt: system_prompt,
