@@ -4,26 +4,33 @@ defmodule Vibe.AI.SubagentRegistry do
   alias Vibe.AI.Agent, as: ChatAgent
   alias Vibe.AI.AgentBuilder
 
+  # Specialists are OPTIONAL. The primary agent should handle ordinary one-shot
+  # music/search/image/document work with its own tools. These ids exist for
+  # multi-step builder/integration work and rare multi-part research fan-out.
   @subagents %{
     "builder_assistant" => %{
       id: "builder_assistant",
       label: "Builder Assistant",
-      description: "Creates, updates, publishes, and explains Vibe standalone agents."
+      description:
+        "Multi-step agent creation, complex reconfiguration, publish/delete workflows — not simple one-field edits."
     },
     "integration_advisor" => %{
       id: "integration_advisor",
       label: "Integration Advisor",
-      description: "Prepares invoke URLs, events URLs, chat ids, and agent integration guidance."
+      description:
+        "Deep integration setup (invoke/events URLs, secrets, multi-room attach) when direct config tools are not enough."
     },
     "music_specialist" => %{
       id: "music_specialist",
       label: "Music Specialist",
-      description: "Handles music discovery and playback related tasks."
+      description:
+        "Complex multi-track / playlist-scale music research only. Single songs and share URLs stay on the primary agent."
     },
     "document_specialist" => %{
       id: "document_specialist",
       label: "Document Specialist",
-      description: "Handles document, web, and image analysis tasks."
+      description:
+        "Multi-document or multi-source research synthesis only. One web lookup or one file stays on the primary agent."
     }
   }
 
@@ -117,7 +124,7 @@ defmodule Vibe.AI.SubagentRegistry do
               wrap_callback(spec, callback),
               user_id,
               chat_id,
-              "You are the music specialist for Vibe AI. Focus only on music discovery and playback tasks. Use the smallest response necessary.",
+              "You are the music specialist for Vibe AI, used only for complex multi-track or playlist-scale work. Use search_music directly. Keep replies minimal; the UI renders playable cells.",
               ["search_music"]
             )
 
@@ -128,7 +135,7 @@ defmodule Vibe.AI.SubagentRegistry do
               wrap_callback(spec, callback),
               user_id,
               chat_id,
-              "You are the document and research specialist for Vibe AI. Focus on search, image analysis, and document analysis. Use the smallest response necessary.",
+              "You are the document/research specialist for Vibe AI, used only for multi-source synthesis. Prefer the fewest tool calls needed. One lookup tasks should already have been handled by the primary agent.",
               ["search_google", "analyze_image", "analyze_document"]
             )
         end
