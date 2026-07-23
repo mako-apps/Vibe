@@ -671,6 +671,7 @@ defmodule Vibe.AI.StandaloneAgent do
     video_id = map_value(track, :video_id) || map_value(track, :videoId)
     preview_url = map_value(track, :preview_url) || map_value(track, :previewUrl)
     track_source = map_value(track, :source) || source
+    links = map_value(track, :links) || %{}
 
     # Prefer durable app stream proxy when we have a track id so SoundCloud/YouTube
     # playback goes through /api/music/stream (cache + re-resolve). Fall back to a
@@ -685,6 +686,12 @@ defmodule Vibe.AI.StandaloneAgent do
     if is_binary(media_url) do
       duration = map_value(track, :duration)
       track_id = map_value(track, :track_id) || map_value(track, :trackId) || video_id
+      duration_secs =
+        case map_value(track, :duration_seconds) || duration_seconds(duration) do
+          n when is_float(n) -> round(n)
+          n when is_integer(n) -> n
+          _ -> nil
+        end
 
       metadata = %{
         "trackId" => track_id,
@@ -693,10 +700,14 @@ defmodule Vibe.AI.StandaloneAgent do
         "artist" => map_value(track, :artist),
         "album" => map_value(track, :album),
         "duration" => duration,
-        "durationSeconds" => duration_seconds(duration),
+        "durationSeconds" => duration_secs,
         "cover" => map_value(track, :cover),
         "source" => track_source,
-        "links" => map_value(track, :links) || %{}
+        "links" => links,
+        # Flatten keys list parsers also read
+        "previewUrl" => media_url,
+        "streamUrl" => media_url,
+        "mediaUrl" => media_url
       }
 
       %{
@@ -739,11 +750,38 @@ defmodule Vibe.AI.StandaloneAgent do
 
   defp public_music_stream_url(video_id) do
     path = "/api/music/stream/#{URI.encode_www_form(to_string(video_id))}"
+    String.trim_trailing(public_api_base_url(), "/") <> path
+  end
 
-    case System.get_env("PUBLIC_BASE_URL") || System.get_env("API_BASE_URL") do
-      base when is_binary(base) and base != "" -> String.trim_trailing(base, "/") <> path
-      _ -> path
+  # Always absolute — clients treat leading "/" as a local filesystem path
+  # (see VoiceBubble resolveAudioURL) and "Couldn't load" if we ship relative mediaUrl.
+  defp public_api_base_url do
+    cond do
+      base = present_env("PUBLIC_BASE_URL") -> normalize_api_base(base)
+      base = present_env("API_BASE_URL") -> normalize_api_base(base)
+      base = present_env("VIBE_PUBLIC_BASE_URL") -> normalize_api_base(base)
+      host = present_env("PHX_HOST") ->
+        if String.starts_with?(host, "http"), do: String.trim_trailing(host, "/"), else: "https://" <> host
+      true ->
+        "https://api.vibegram.io"
     end
+  end
+
+  defp present_env(name) do
+    case System.get_env(name) do
+      value when is_binary(value) ->
+        trimmed = String.trim(value)
+        if trimmed == "", do: nil, else: trimmed
+
+      _ ->
+        nil
+    end
+  end
+
+  defp normalize_api_base(base) do
+    base
+    |> String.trim()
+    |> String.trim_trailing("/")
   end
 
   defp map_value(map, key) when is_map(map) do

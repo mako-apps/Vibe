@@ -771,8 +771,7 @@ defmodule Vibe.AI.Agent do
       label =
         case tool_name do
           "search_music" ->
-            q = tool_input["query"] || "music"
-            "Searching for '#{q}'..."
+            music_progress_label(tool_input)
 
           "search_google" ->
             "Searching the web..."
@@ -861,7 +860,14 @@ defmodule Vibe.AI.Agent do
         label: label,
         tool: tool_name,
         tool_call_id: tool["id"],
-        status: "running"
+        status: "running",
+        # Codex-like item identity for list note rows
+        item: %{
+          type: "tool",
+          name: tool_name,
+          status: "running",
+          detail: label
+        }
       })
     end)
 
@@ -997,6 +1003,17 @@ defmodule Vibe.AI.Agent do
     duration_ms = System.monotonic_time(:millisecond) - start_time
     Logger.info("[Agent] Tool #{tool_name} completed in #{duration_ms}ms")
 
+    # Codex-like terminal item: running → done with a short human label
+    complete_label = tool_complete_label(tool_name, tool_input, result)
+
+    callback.(%{
+      type: :progress,
+      label: complete_label,
+      tool: tool_name,
+      tool_call_id: tool["id"],
+      status: "done"
+    })
+
     # Send tool result with completion status
     callback.(%{
       type: :tool_result,
@@ -1004,7 +1021,8 @@ defmodule Vibe.AI.Agent do
       tool_call_id: tool["id"],
       result: result,
       status: "complete",
-      duration_ms: duration_ms
+      duration_ms: duration_ms,
+      label: complete_label
     })
 
     %{
@@ -1013,6 +1031,55 @@ defmodule Vibe.AI.Agent do
       content: Jason.encode!(result)
     }
   end
+
+  defp music_progress_label(input) when is_map(input) do
+    url = input["url"] || input["link"]
+    query = input["query"] || ""
+
+    cond do
+      is_binary(url) and String.contains?(url, "soundcloud") ->
+        "Resolving SoundCloud…"
+
+      is_binary(query) and String.contains?(query, "soundcloud") ->
+        "Resolving SoundCloud…"
+
+      is_binary(url) and (String.starts_with?(url, "http://") or String.starts_with?(url, "https://")) ->
+        "Fetching track…"
+
+      is_binary(query) and (String.starts_with?(query, "http://") or String.starts_with?(query, "https://")) ->
+        "Fetching track…"
+
+      is_binary(query) and String.trim(query) != "" ->
+        "Searching music…"
+
+      true ->
+        "Searching music…"
+    end
+  end
+
+  defp music_progress_label(_), do: "Searching music…"
+
+  defp tool_complete_label("search_music", _input, result) when is_map(result) do
+    cond do
+      is_binary(Map.get(result, :error) || Map.get(result, "error")) ->
+        "Music not found"
+
+      true ->
+        tracks = Map.get(result, :tracks) || Map.get(result, "tracks") || []
+        title =
+          case List.first(List.wrap(tracks)) do
+            t when is_map(t) ->
+              Map.get(t, :title) || Map.get(t, "title")
+
+            _ ->
+              nil
+          end
+
+        if is_binary(title) and title != "", do: "Found · #{String.slice(title, 0, 40)}", else: "Music ready"
+    end
+  end
+
+  defp tool_complete_label(_name, _input, _result), do: "Done"
 
   defp waiting_for_user_result?(%{content: content}) when is_binary(content) do
     case Jason.decode(content) do
