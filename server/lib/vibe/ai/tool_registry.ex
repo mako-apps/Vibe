@@ -118,6 +118,23 @@ defmodule Vibe.AI.ToolRegistry do
       always_on: false
     },
     %{
+      id: "list_platform_connections",
+      name: "Platform Connections",
+      description:
+        "List OAuth platform connectors (GitHub, Excel, …) granted to this agent — capability names only, never tokens.",
+      category: "integrations",
+      always_on: false,
+      testability: "dry_run"
+    },
+    %{
+      id: "call_platform",
+      name: "Call Platform (GitHub PRs, …)",
+      description:
+        "Invoke a granted multi-platform action (GitHub PR review/comment/list, Excel later, Slack/Linear later) via server-proxied OAuth.",
+      category: "integrations",
+      always_on: false
+    },
+    %{
       id: "query_event_inbox",
       name: "Event Inbox & Analytics",
       description:

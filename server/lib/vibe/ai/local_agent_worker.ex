@@ -862,6 +862,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         #{repo_line}
 
         #{agent_operating_rules(worker)}
+        #{platform_connectors_guidance(requester_user_id, worker)}
 
         Shared conversation so far (you can see everyone's recent messages and the other agents' work; build on it and do not repeat completed work):
         #{context_or_empty(context)}
@@ -872,7 +873,13 @@ defmodule Vibe.AI.LocalAgentWorker do
         |> String.trim()
       end
     else
-      dispatch_text
+      with_platform =
+        case platform_connectors_guidance(requester_user_id, worker) do
+          nil -> dispatch_text
+          guidance -> guidance <> "\n\n" <> dispatch_text
+        end
+
+      with_platform
     end
   end
 
@@ -3531,11 +3538,34 @@ defmodule Vibe.AI.LocalAgentWorker do
       "- If work is not assigned, choose a non-overlapping slice that fits your strengths and say what you took.",
       handoff_line,
       "- If a teammate is offline, unavailable, or rate-limited, say that clearly and continue with useful work that will not conflict.",
-      "- Final replies should include what you completed, what was tested, what remains, and any handoff needed by the other teammate."
+      "- Final replies should include what you completed, what was tested, what remains, and any handoff needed by the other teammate.",
+      "- For GitHub PR review/comment when platforms are connected, prefer local `gh` / git with the user's machine credentials, or the Vibe platform API (`POST /api/platforms/tools/invoke`) — never invent tokens."
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
   end
+
+  defp platform_connectors_guidance(requester_user_id, worker)
+       when is_binary(requester_user_id) and is_map(worker) do
+    handle = worker[:handle] || worker["handle"] || "claude"
+
+    case Vibe.Platforms.prompt_guidance(requester_user_id, "bridge_agent", to_string(handle)) do
+      guidance when is_binary(guidance) and guidance != "" ->
+        """
+        Connected platform context (OAuth tokens stay on the Vibe server — never ask the user to paste secrets):
+        #{String.trim(guidance)}
+        Local coding agents may also use `gh` when the machine is already authenticated to GitHub.
+        """
+        |> String.trim()
+
+      _ ->
+        nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp platform_connectors_guidance(_, _), do: nil
 
   defp other_agents_label(worker) do
     list_workers()

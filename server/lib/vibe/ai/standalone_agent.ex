@@ -324,6 +324,12 @@ defmodule Vibe.AI.StandaloneAgent do
         do: Vibe.AI.Tools.ConnectedApp.prompt_guidance(agent),
         else: nil
       ),
+      if(
+        "call_platform" in (agent.enabled_tools || []) or
+          "list_platform_connections" in (agent.enabled_tools || []),
+        do: Vibe.AI.Tools.Platform.prompt_guidance(agent),
+        else: nil
+      ),
       prompt_variables_guidance(agent),
       if(agent.persona, do: "Persona: #{agent.persona}", else: nil),
       if(agent.welcome_message && !has_prior_messages,

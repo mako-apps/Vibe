@@ -286,6 +286,25 @@ defmodule Vibe.AI.Tools.YtDlp do
   end
   defp format_duration(_), do: "0:00"
 
+  @doc """
+  Common anti-bot hardening args (UA rotation, referer, cookies when configured).
+  Shared with MusicController's cache-fill download, which previously ran yt-dlp
+  bare and tripped bot checks that the extraction paths here survive.
+  """
+  def hardening_args do
+    base = [
+      "--extractor-retries", "3",
+      "--user-agent", random_user_agent(),
+      "--referer", "https://www.youtube.com/",
+      "--add-header", "Accept-Language:en-US,en;q=0.9"
+    ]
+
+    case get_cookies_path() do
+      nil -> base
+      path -> base ++ ["--cookies", path]
+    end
+  end
+
   # Random user agent to avoid detection
   defp random_user_agent do
     agents = [

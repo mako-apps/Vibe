@@ -28,19 +28,47 @@ defmodule Vibe.AI.Tools.Music do
   """
   def search(%{"query" => query} = params) do
     type = params["type"] || "track"
-    Logger.info("[Music] Searching for: #{query} (type: #{type})")
+    max_results = normalize_max_results(params["max_results"] || params[:max_results])
+    Logger.info("[Music] Searching for: #{query} (type: #{type}, max_results: #{max_results})")
 
     # Step 1: Check cache first
-    case check_cache(query) do
-      {:ok, cached_tracks} when cached_tracks != [] ->
-        Logger.info("[Music] Cache hit! Returning #{length(cached_tracks)} cached tracks")
-        format_cached_results(cached_tracks)
+    result =
+      case check_cache(query) do
+        {:ok, cached_tracks} when cached_tracks != [] ->
+          Logger.info("[Music] Cache hit! Returning #{length(cached_tracks)} cached tracks")
+          format_cached_results(cached_tracks)
 
-      _ ->
-        # Step 2: Fresh search with yt-dlp
-        search_fresh(query, type)
-    end
+        _ ->
+          # Step 2: Fresh search with yt-dlp
+          search_fresh(query, type)
+      end
+
+    limit_tracks(result, max_results)
   end
+
+  # Default to a single best match; the agent opts into more only when the user
+  # explicitly asks for options. Clamp to a sane 1..5 range.
+  defp normalize_max_results(value) do
+    n =
+      cond do
+        is_integer(value) -> value
+        is_binary(value) -> case Integer.parse(value) do
+            {i, _} -> i
+            :error -> 1
+          end
+        true -> 1
+      end
+
+    n |> max(1) |> min(5)
+  end
+
+  # Trim the emitted track list to the requested count without losing the
+  # source/primary metadata the rest of the pipeline expects.
+  defp limit_tracks(%{tracks: tracks} = result, max_results) when is_list(tracks) do
+    Map.put(result, :tracks, Enum.take(tracks, max_results))
+  end
+
+  defp limit_tracks(result, _max_results), do: result
 
   # Handle missing query parameter
   def search(params) do

@@ -283,6 +283,20 @@ defmodule Vibe.AI.AgentRuntime do
         )
 
         {:error, "AI request failed.", %{emitted_text?: emitted_text?}}
+
+      # Finch.stream/5 surfaces a mid-stream transport failure (e.g. a connection
+      # timeout after the request was accepted) as a 3-tuple {:error, reason, acc}
+      # carrying whatever was accumulated so far. This matched neither clause above
+      # and crashed the response Task with a CaseClauseError. Fold it into the same
+      # error contract as the caught case so the OpenAI fallback / clean error path
+      # can take over instead of the process dying.
+      {:error, reason, _partial_acc} ->
+        Logger.error(
+          "[#{config.request_label}] Claude streaming request errored mid-stream: " <>
+            inspect(reason)
+        )
+
+        {:error, "AI request failed.", %{emitted_text?: emitted_text?}}
     end
   end
 

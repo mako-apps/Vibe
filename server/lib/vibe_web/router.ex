@@ -55,6 +55,10 @@ defmodule VibeWeb.Router do
     get "/vapid-key", ApiController, :vapid_key
     get "/push/avatar/:user_id", PushAvatarController, :show
 
+    # Platform OAuth browser callback (provider redirects here; no user bearer yet —
+    # ownership is bound into the signed `state` token).
+    get "/platforms/oauth/:provider/callback", PlatformsController, :oauth_callback
+
     # Agent bridge daemon redeems a pairing code (no user auth — code-scoped).
     post "/agent-bridge/pair", AgentBridgeController, :pair
     # Scan-to-pair (desktop shows QR, phone scans): daemon starts a request and
@@ -151,6 +155,17 @@ defmodule VibeWeb.Router do
     # Business Settings
     get "/business/settings/:user_id", BusinessController, :show
     post "/business/settings", BusinessController, :update_settings
+
+    # Multi-platform connectors (GitHub OAuth, Excel/Slack/Linear catalog, agent grants)
+    get "/platforms/catalog", PlatformsController, :catalog
+    get "/platforms/connections", PlatformsController, :index
+    get "/platforms/connections/:id", PlatformsController, :show
+    post "/platforms/connections/:provider/authorize", PlatformsController, :authorize
+    delete "/platforms/connections/:id", PlatformsController, :revoke
+    post "/platforms/connections/:id/grants", PlatformsController, :upsert_grant
+    delete "/platforms/connections/:id/grants/:grant_id", PlatformsController, :revoke_grant
+    get "/platforms/usable", PlatformsController, :usable
+    post "/platforms/tools/invoke", PlatformsController, :invoke_tool
 
     # Standalone Agents
     get "/agents", AgentsController, :index

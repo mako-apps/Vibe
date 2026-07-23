@@ -45,9 +45,19 @@ defmodule VibeWeb.MusicController do
 
           {:error, reason} ->
             Logger.error("[MusicController] Download failed: #{reason}")
-            conn
-            |> put_status(500)
-            |> json(%{error: "Failed to stream audio", reason: reason})
+
+            # Cache fill failed (yt-dlp convert/upload/timeout) — a direct stream URL
+            # can often still be extracted; redirect there instead of 500ing.
+            case get_direct_stream_url(video_id) do
+              {:ok, direct_url} ->
+                Logger.info("[MusicController] Falling back to direct stream: #{video_id}")
+                redirect(conn, external: direct_url)
+
+              {:error, _} ->
+                conn
+                |> put_status(500)
+                |> json(%{error: "Failed to stream audio", reason: reason})
+            end
         end
     end
   end
@@ -138,7 +148,8 @@ defmodule VibeWeb.MusicController do
       "--audio-format", "m4a",  # Convert to m4a
       "--no-playlist",
       "--no-warnings",
-      "-o", temp_path,
+      "-o", temp_path
+    ] ++ YtDlp.hardening_args() ++ [
       "--",
       "https://www.youtube.com/watch?v=#{video_id}"
     ]

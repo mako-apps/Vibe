@@ -44,6 +44,11 @@ defmodule Vibe.AI.Agent do
             type: "string",
             enum: ["track", "album", "artist"],
             description: "Type of search"
+          },
+          max_results: %{
+            type: "integer",
+            description:
+              "How many tracks to return. Default 1 (a single best match). Only set higher when the user EXPLICITLY asks for multiple options/alternatives/a few. Max 5."
           }
         },
         required: ["query"]
@@ -248,6 +253,46 @@ defmodule Vibe.AI.Agent do
       }
     },
     %{
+      name: "list_platform_connections",
+      description:
+        "List OAuth platform connectors granted to this agent (GitHub, Microsoft Excel, Slack, Linear, Calendar). Returns provider, account login, and allowed capability ids — never tokens.",
+      input_schema: %{
+        type: "object",
+        properties: %{},
+        required: []
+      }
+    },
+    %{
+      name: "call_platform",
+      description:
+        "Call a granted multi-platform connector action. Primary use: GitHub PR workflows (list_pull_requests, get_pull_request, list_pr_files, create_pr_comment, list_issues, create_issue, list_repos, get_repo). Tokens stay on the server; only capability results are returned.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          provider: %{
+            type: "string",
+            description: "Platform id such as github (later: microsoft_excel, slack, linear, google_calendar)"
+          },
+          action: %{
+            type: "string",
+            description:
+              "Capability id, e.g. list_pull_requests, get_pull_request, create_pr_comment"
+          },
+          params: %{
+            type: "object",
+            description:
+              "Action parameters (e.g. owner, repo, number, body). Never include tokens or passwords.",
+            additionalProperties: true
+          },
+          connection_id: %{
+            type: "string",
+            description: "Optional connection id when multiple accounts are connected for one provider"
+          }
+        },
+        required: ["provider", "action"]
+      }
+    },
+    %{
       name: "get_current_agent_config",
       description:
         "Read the current standalone agent's live config for the owner, including prompt, ids, status, tools, output modes, destination chats, and endpoints. Prefer this for simple questions about the agent you are already talking to.",
@@ -425,17 +470,13 @@ defmodule Vibe.AI.Agent do
   2. search_music: Use when user asks for songs, music, artists, or albums.
      - If the user provides lyrics (e.g., "music that says 'some part of music'"), search for the lyrics or the inferred song title.
      - If the user describes a vibe or sound, keyword search for it.
-     - Examples:
-       * User: "play the song that goes 'is this the real life'" -> Tool: search_music(query: "Bohemian Rhapsody Queen")
-       * User: "I want that song about driving fast cars" -> Tool: search_music(query: "song about driving fast cars")
-       * User: "play some energetic workout music" -> Tool: search_music(query: "energetic workout music")
-     - Correct typos intelligently (e.g., "tylor swift" → "Taylor Swift")
+     - Correct typos intelligently (e.g., "tylor swift" → "Taylor Swift").
      - ALWAYS provide the "query" parameter.
-     - After results: Write a brief, natural response acknowledging the music.
-       Examples: "Here's that track for you 🎵", "Got it!", "Enjoy the music!"
-     - If multiple results returned, you can mention: "I also found some alternatives if you want something different."
-     - NEVER list track names, URLs, or links - the UI shows them automatically.
-     - NEVER write YouTube URLs or any links in your response.
+     - RETURN ONE TRACK BY DEFAULT: omit max_results or set it to 1. The user asked for a song, not a list.
+     - ASK BEFORE GUESSING: if the request is genuinely ambiguous — several well-known songs, versions (live/remix/cover), or artists could match — call ask_user with concrete options FIRST, instead of searching and dumping several tracks. Only skip the question when the intended track is clear.
+     - Only set max_results > 1 when the user EXPLICITLY asks for multiple options, alternatives, "a few", or a playlist.
+     - After results: acknowledge in ONE short, natural line, written in your own words for THIS request. Never reuse a fixed template phrase.
+     - NEVER list track names, artists, URLs, or links in your text — the UI shows them automatically.
 
   3. search_google: Use when user needs current info, facts, or web lookup.
      - ALWAYS provide the "query" parameter.
@@ -486,6 +527,12 @@ defmodule Vibe.AI.Agent do
       - Put request arguments inside `params` as a JSON object.
       - Only use actions explicitly listed in the connected-app section of the system prompt or returned by the tool itself.
       - If the user asks for website traffic, conversions, waitlist numbers, product counts, or to change something in the connected app, prefer this tool over guessing.
+
+  11b. list_platform_connections / call_platform: OAuth platforms (GitHub PRs, Excel later, Slack/Linear later).
+      - Use list_platform_connections to see what the user has connected and which actions are granted.
+      - Use call_platform with provider + action + params for live GitHub PR review, comments, issues, and repos.
+      - Never ask for or invent GitHub tokens; the server holds OAuth credentials.
+      - Prefer call_platform over guessing PR state from chat history when GitHub is connected.
 
   12. get_current_agent_config: Use for simple live questions about the agent you are already talking to.
       - Use this for requests like:
@@ -762,6 +809,12 @@ defmodule Vibe.AI.Agent do
           "call_connected_app" ->
             "Checking the connected app..."
 
+          "list_platform_connections" ->
+            "Checking connected platforms..."
+
+          "call_platform" ->
+            "Calling platform connector..."
+
           "get_current_agent_config" ->
             "Reading this agent's config..."
 
@@ -875,6 +928,12 @@ defmodule Vibe.AI.Agent do
 
         tool_name == "call_connected_app" ->
           Vibe.AI.Tools.ConnectedApp.invoke(tool_input, agent_id, requester_user_id)
+
+        tool_name == "list_platform_connections" ->
+          Vibe.AI.Tools.Platform.list_connections(tool_input, agent_id, requester_user_id)
+
+        tool_name == "call_platform" ->
+          Vibe.AI.Tools.Platform.invoke(tool_input, agent_id, requester_user_id)
 
         tool_name == "get_current_agent_config" ->
           get_current_agent_config(tool_input, agent_id, requester_user_id)
