@@ -71,12 +71,37 @@ defmodule Vibe.AI.Tools.Music do
   defp resolve_page_url(url) do
     case YtDlp.resolve_url(url) do
       {:ok, track} ->
+        # Guarantee a resolvable page URL survives into the payload + cache. A bare
+        # sc_* SoundCloud id is the ONLY id type /api/music/stream/:id cannot rebuild
+        # without a stored page URL, so if yt-dlp ever omits webpage_url, backfill the
+        # share `url` we just resolved from — it IS that page.
+        track = backfill_page_link(track, url)
+
         Logger.info(
           "[Music] Resolved #{track[:source]} track=#{track[:video_id]} title=#{inspect(track[:title])}"
         )
 
-        spawn(fn -> cache_results(url, [track], track[:source] || "web") end)
-        format_resolved_track(track)
+        # Persist SYNCHRONOUSLY (and read back to confirm) before the playable card
+        # ships. The old fire-and-forget spawn could lose the race or die on error,
+        # leaving no cache row — then the stream endpoint falls back to the bare sc_*
+        # id and 500s ("Missing SoundCloud source URL in cache"). For SoundCloud a
+        # committed row is mandatory for playback.
+        cached? = cache_track_now(url, track)
+
+        if streamable?(track, cached?) do
+          format_resolved_track(track)
+        else
+          # Never surface a SoundCloud card that can't stream (no committed row / no
+          # page URL) — it would 500 on the first tap. Fail the resolve cleanly.
+          Logger.error(
+            "[Music] Refusing unplayable track=#{track[:video_id]} source=#{track[:source]} cached?=#{cached?}"
+          )
+
+          %{
+            error:
+              "Could not load audio from that link. Supported: SoundCloud, YouTube, and other yt-dlp music pages."
+          }
+        end
 
       {:error, reason} ->
         Logger.error("[Music] URL resolve failed: #{inspect(reason)}")
@@ -110,6 +135,68 @@ defmodule Vibe.AI.Tools.Music do
       alternatives: [],
       tracks: [formatted]
     }
+  end
+
+  # Ensure the track carries a resolvable page URL in :links so /api/music/stream
+  # can re-extract later. Prefer what yt-dlp returned; fall back to the page we
+  # resolved from (only when that really is a music page URL).
+  defp backfill_page_link(track, source_url) when is_map(track) do
+    links = track[:links] || %{}
+
+    if has_page_link?(links) or not YtDlp.music_page_url?(source_url) do
+      track
+    else
+      Map.put(track, :links, Map.put(links, "webpage_url", source_url))
+    end
+  end
+
+  defp backfill_page_link(track, _source_url), do: track
+
+  # A cached row can re-extract audio only if it stores a real page URL.
+  defp has_page_link?(links) when is_map(links) do
+    (is_binary(links["webpage_url"]) and links["webpage_url"] != "") or
+      (is_binary(links[:webpage_url]) and links[:webpage_url] != "") or
+      (is_binary(links["soundcloud"]) and links["soundcloud"] != "") or
+      (is_binary(links["youtube"]) and links["youtube"] != "")
+  end
+
+  defp has_page_link?(_), do: false
+
+  # Would /api/music/stream/:id be able to play this track?
+  #  • SoundCloud (sc_*) — ONLY if a cache row committed AND it carries a page URL,
+  #    because a bare sc_* cannot be rebuilt from the id alone.
+  #  • YouTube/other — the id re-resolves to a watch URL with no cache row needed.
+  defp streamable?(track, cached?) when is_map(track) do
+    video_id = to_string(track[:video_id] || track[:id] || "")
+
+    cond do
+      String.starts_with?(video_id, "sc_") -> cached? and has_page_link?(track[:links] || %{})
+      video_id != "" -> true
+      true -> false
+    end
+  end
+
+  # Persist synchronously and confirm the row is really queryable before we let the
+  # card ship. MusicCache.cache_results swallows changeset errors (logs a warning),
+  # so a read-back is the only trustworthy signal that the write actually landed.
+  defp cache_track_now(query, track) do
+    video_id = track[:video_id] || track[:id]
+    cache_results(query, [track], track[:source] || "web")
+
+    committed? = is_binary(video_id) and not is_nil(MusicCache.get_by_video_id(video_id))
+
+    unless committed? do
+      Logger.error("[Music] Cache write did not land for #{inspect(video_id)}")
+    end
+
+    committed?
+  rescue
+    e ->
+      Logger.error(
+        "[Music] Sync cache write failed for #{inspect(track[:video_id])}: #{inspect(e)}"
+      )
+
+      false
   end
 
   # Default to a single best match; the agent opts into more only when the user
